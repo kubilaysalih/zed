@@ -13,6 +13,8 @@ use crate::{
 #[with_fallible_options]
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct WorkspaceSettingsContent {
+    /// Whether major panels are flat or separated by rounded frames in the folder color.
+    pub pane_layout: Option<PaneLayout>,
     /// Active pane styling settings.
     pub active_pane_modifiers: Option<ActivePaneModifiers>,
     /// The text rendering mode to use.
@@ -176,6 +178,29 @@ pub struct WorkspaceSettingsContent {
     /// Whether the focused panel follows the mouse location
     /// Default: false
     pub focus_follows_mouse: Option<FocusFollowsMouse>,
+}
+
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLayout {
+    /// Panels meet at straight edges.
+    #[default]
+    Flat,
+    /// Round panel corners and show the folder color between panels and along the window edges.
+    Separated,
 }
 
 #[with_fallible_options]

@@ -19,6 +19,7 @@ default = ["nightly"]
 stable = []
 preview = []
 nightly = []
+multirepo = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = ["Win32_Globalization", "Win32_System_SystemServices"] }

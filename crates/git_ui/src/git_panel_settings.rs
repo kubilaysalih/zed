@@ -16,6 +16,7 @@ pub struct ScrollbarSettings {
 
 #[derive(Debug, Clone, PartialEq, RegisterSetting)]
 pub struct GitPanelSettings {
+    pub repository_excluded_directories: Vec<String>,
     pub button: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
@@ -60,6 +61,9 @@ impl Settings for GitPanelSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let git_panel = content.git_panel.clone().unwrap();
         Self {
+            repository_excluded_directories: git_panel
+                .repository_excluded_directories
+                .unwrap_or_default(),
             button: git_panel.button.unwrap(),
             dock: git_panel.dock.unwrap().into(),
             default_width: git_panel.default_width.unwrap().into_gpui(),

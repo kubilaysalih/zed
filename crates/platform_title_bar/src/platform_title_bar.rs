@@ -84,6 +84,17 @@ impl PlatformTitleBar {
     }
 
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
+        if let Some(color) = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+            .and_then(|workspace| {
+                let project = workspace.read(cx).workspace().read(cx).project();
+                workspace::folder_colors::for_project(project.read(cx), cx)
+            })
+        {
+            return color;
+        }
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background

@@ -731,6 +731,9 @@ pub struct CallSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct GitPanelSettingsContent {
+    /// Directory names to exclude from repository discovery in the panel.
+    /// Explicitly opened folders are always included.
+    pub repository_excluded_directories: Option<Vec<String>>,
     /// Whether to show the panel button in the status bar.
     ///
     /// Default: true

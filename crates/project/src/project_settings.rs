@@ -1383,6 +1383,19 @@ impl SettingsObserver {
                     }
                 })
             {
+                if kind == LocalSettingsKind::Settings {
+                    // Only this visual preference may apply before project settings are trusted.
+                    match restricted_folder_color_settings(file_content.as_deref()) {
+                        Ok(color_settings) => apply_local_settings(
+                            worktree_id,
+                            directory_path.clone(),
+                            kind,
+                            &color_settings,
+                            cx,
+                        ),
+                        Err(error) => log::error!("Failed to read folder color: {error:#}"),
+                    }
+                }
                 if let LocalSettingsPath::InWorktree(directory) = directory_path {
                     self.pending_local_settings
                         .entry(PathTrust::Worktree(worktree_id))
@@ -1573,6 +1586,17 @@ impl SettingsObserver {
             }
         })
     }
+}
+
+fn restricted_folder_color_settings(content: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(content) = content else {
+        return Ok(None);
+    };
+    let settings: serde_json::Value = parse_json_with_comments(content)?;
+    Ok(settings
+        .get("folder_color")
+        .and_then(serde_json::Value::as_str)
+        .map(|color| serde_json::json!({ "folder_color": color }).to_string()))
 }
 
 fn apply_local_settings(

@@ -42,6 +42,10 @@ impl RootUserSettings for ProjectSettingsContent {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Clone, Default, Serialize, JsonSchema, MergeFrom)]
 pub struct ProjectSettingsContent {
+    /// Folder accent color as #RRGGBB. Empty uses the theme colors.
+    /// Set in project settings to color only that folder.
+    #[schemars(regex(pattern = "^$|^#?[0-9a-fA-F]{6}$"))]
+    pub folder_color: Option<String>,
     #[serde(flatten)]
     pub all_languages: AllLanguageSettingsContent,
 
@@ -90,7 +94,7 @@ pub struct ProjectSettingsContent {
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
-        terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        folder_color, terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
     },
     defaults: { lsp, dap, context_servers },
 });

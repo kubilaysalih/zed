@@ -175,6 +175,7 @@ impl ApplicationMenu {
 
     fn render_application_menu(&self, entry: &MenuEntry) -> impl IntoElement {
         let handle = entry.handle.clone();
+        let is_open = handle.is_deployed();
 
         let menu_name = entry.menu.name.clone();
         let entry = entry.clone();
@@ -183,6 +184,10 @@ impl ApplicationMenu {
         div()
             .id(format!("{}-menu-item", menu_name))
             .occlude()
+            .rounded_sm()
+            .when(is_open, |this| this.bg(gpui::white().opacity(0.18)))
+            .hover(move |this| this.bg(gpui::white().opacity(if is_open { 0.24 } else { 0.12 })))
+            .active(|this| this.bg(gpui::white().opacity(0.28)))
             .child(
                 PopoverMenu::new(format!("{}-menu-popover", menu_name))
                     .menu(move |window, cx| {
@@ -193,7 +198,10 @@ impl ApplicationMenu {
                             SharedString::from(format!("{}-menu-trigger", menu_name)),
                             ui::IconName::Menu,
                         )
-                        .style(ButtonStyle::Subtle)
+                        .style(ButtonStyle::Transparent)
+                        .selected_style(ButtonStyle::Transparent)
+                        .selected_icon_color(Color::Default)
+                        .hover_color(Color::Default)
                         .icon_size(IconSize::Small)
                         .tab_index(0isize)
                         .aria_label("Application menu"),
@@ -205,6 +213,7 @@ impl ApplicationMenu {
 
     fn render_standard_menu(&self, entry: &MenuEntry) -> impl IntoElement {
         let current_handle = entry.handle.clone();
+        let is_open = current_handle.is_deployed();
 
         let menu_name = entry.menu.name.clone();
         let entry = entry.clone();
@@ -218,6 +227,10 @@ impl ApplicationMenu {
         div()
             .id(format!("{}-menu-item", menu_name))
             .occlude()
+            .rounded_sm()
+            .when(is_open, |this| this.bg(gpui::white().opacity(0.18)))
+            .hover(move |this| this.bg(gpui::white().opacity(if is_open { 0.24 } else { 0.12 })))
+            .active(|this| this.bg(gpui::white().opacity(0.28)))
             .child(
                 PopoverMenu::new(format!("{}-menu-popover", menu_name))
                     .menu(move |window, cx| {
@@ -228,7 +241,9 @@ impl ApplicationMenu {
                             SharedString::from(format!("{}-menu-trigger", menu_name)),
                             menu_name,
                         )
-                        .style(ButtonStyle::Subtle)
+                        .style(ButtonStyle::Transparent)
+                        .selected_style(ButtonStyle::Transparent)
+                        .selected_label_color(Color::Default)
                         .label_size(LabelSize::Small)
                         .tab_index(0isize),
                     )

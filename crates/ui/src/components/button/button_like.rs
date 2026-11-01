@@ -72,8 +72,8 @@ impl TintColor {
     fn button_like_style(self, cx: &mut App) -> ButtonLikeStyles {
         match self {
             TintColor::Accent => ButtonLikeStyles {
-                background: cx.theme().status().info_background,
-                border_color: cx.theme().status().info_border,
+                background: cx.theme().colors().element_selected,
+                border_color: transparent_black(),
                 label_color: cx.theme().colors().text,
                 icon_color: cx.theme().colors().text,
             },
@@ -102,7 +102,7 @@ impl TintColor {
 impl From<TintColor> for Color {
     fn from(tint: TintColor) -> Self {
         match tint {
-            TintColor::Accent => Color::Accent,
+            TintColor::Accent => Color::Default,
             TintColor::Error => Color::Error,
             TintColor::Warning => Color::Warning,
             TintColor::Success => Color::Success,
@@ -256,21 +256,22 @@ impl ButtonStyle {
 
     pub(crate) fn hovered(
         self,
-        elevation: Option<ElevationIndex>,
+        _elevation: Option<ElevationIndex>,
         cx: &mut App,
     ) -> ButtonLikeStyles {
         match self {
-            ButtonStyle::Filled => {
-                let mut filled_background = element_bg_from_elevation(elevation, cx);
-                filled_background.fade_out(0.5);
-
-                ButtonLikeStyles {
-                    background: filled_background,
-                    border_color: transparent_black(),
-                    label_color: Color::Default.color(cx),
-                    icon_color: Color::Default.color(cx),
-                }
-            }
+            ButtonStyle::Filled => ButtonLikeStyles {
+                background: cx.theme().colors().element_hover,
+                border_color: transparent_black(),
+                label_color: Color::Default.color(cx),
+                icon_color: Color::Default.color(cx),
+            },
+            ButtonStyle::Tinted(TintColor::Accent) => ButtonLikeStyles {
+                background: cx.theme().colors().element_hover.opacity(0.24),
+                border_color: transparent_black(),
+                label_color: Color::Default.color(cx),
+                icon_color: Color::Default.color(cx),
+            },
             ButtonStyle::Tinted(tint) => {
                 let mut styles = tint.button_like_style(cx);
                 let theme = cx.theme();
@@ -314,7 +315,7 @@ impl ButtonStyle {
 
     pub(crate) fn active(self, cx: &mut App) -> ButtonLikeStyles {
         match self {
-            ButtonStyle::Filled => ButtonLikeStyles {
+            ButtonStyle::Filled | ButtonStyle::Tinted(TintColor::Accent) => ButtonLikeStyles {
                 background: cx.theme().colors().element_active,
                 border_color: transparent_black(),
                 label_color: Color::Default.color(cx),
@@ -573,6 +574,11 @@ impl ButtonLike {
 
     pub fn auto_height(mut self) -> Self {
         self.height = Some(Length::Auto);
+        self
+    }
+
+    pub fn without_rounding(mut self) -> Self {
+        self.rounding = None;
         self
     }
 

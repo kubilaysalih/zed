@@ -16,10 +16,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
 use std::sync::Arc;
-use ui::{
-    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
-    right_click_menu,
-};
+use ui::{ContextMenu, CountBadge, IconButton, TintColor, Tooltip, prelude::*, right_click_menu};
 use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
@@ -1352,11 +1349,14 @@ impl Render for Dock {
                     Axis::Horizontal => this.w_full().h_full().flex_row(),
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
-                })
+                .when(
+                    WorkspaceSettings::get_global(cx).pane_layout == settings::PaneLayout::Flat,
+                    |this| match self.position() {
+                        DockPosition::Left => this.border_r_1(),
+                        DockPosition::Right => this.border_l_1(),
+                        DockPosition::Bottom => this.border_t_1(),
+                    },
+                )
                 .child(
                     div()
                         .map(|this| match self.position().axis() {
@@ -1399,19 +1399,35 @@ impl Render for PanelButtons {
         let active_index = dock.active_panel_index;
         let is_open = dock.is_open;
         let dock_position = dock.position;
+        let vertical = dock_position == DockPosition::Left;
+        let folder_color = dock.workspace.upgrade().and_then(|workspace| {
+            crate::folder_colors::for_project(workspace.read(cx).project().read(cx), cx)
+        });
+        let activity_colors = folder_color.filter(|_| vertical).map(|background| {
+            crate::folder_colors::ActivityBarColors::new(background, cx.theme().appearance())
+        });
 
         let (menu_anchor, menu_attach) = match dock.position {
-            DockPosition::Left => (Anchor::BottomLeft, Anchor::TopLeft),
+            DockPosition::Left => (Anchor::TopLeft, Anchor::TopRight),
             DockPosition::Bottom | DockPosition::Right => (Anchor::BottomRight, Anchor::TopRight),
         };
 
         let dock_entity = self.dock.clone();
         let workspace = dock.workspace.clone();
-        let mut buttons: Vec<_> = dock
-            .panel_entries
-            .iter()
-            .enumerate()
+        let mut entries: Vec<_> = dock.panel_entries.iter().enumerate().collect();
+        if vertical {
+            entries.sort_by_key(|(_, entry)| match entry.panel.persistent_name() {
+                "Project Panel" => 0,
+                "GitPanel" => 1,
+                _ => 2,
+            });
+        }
+        let mut buttons: Vec<_> = entries
+            .into_iter()
             .filter_map(|(i, entry)| {
+                if entry.panel.persistent_name() == "AgentPanel" {
+                    return None;
+                }
                 let icon = entry.panel.icon(window, cx)?;
                 let icon_tooltip = entry
                     .panel
@@ -1536,12 +1552,39 @@ impl Render for PanelButtons {
                         })
                         .anchor(menu_anchor)
                         .attach(menu_attach)
-                        .trigger(move |is_active, _window, _cx| {
+                        .trigger(move |is_active, window, cx| {
                             // Include active state in element ID to invalidate the cached
                             // tooltip when panel state changes (e.g., via keyboard shortcut)
                             let button = IconButton::new((name, is_active_button as u64), icon)
-                                .icon_size(IconSize::Small)
+                                .icon_size(if vertical {
+                                    IconSize::Medium
+                                } else {
+                                    IconSize::Small
+                                })
+                                .when(vertical, |button| {
+                                    button.size(ButtonSize::Large).width(px(48.)).when(
+                                        activity_colors.is_none(),
+                                        |button| {
+                                            button.selected_style(ButtonStyle::Tinted(
+                                                TintColor::Accent,
+                                            ))
+                                        },
+                                    )
+                                })
                                 .toggle_state(is_active_button)
+                                .when_some(activity_colors, |button, colors| {
+                                    button
+                                        .style(ButtonStyle::Transparent)
+                                        .icon_color(Color::Custom(colors.foreground))
+                                        .selected_icon_color(Color::Custom(colors.foreground))
+                                        .hover_color(Color::Custom(colors.foreground))
+                                        .hover_background(if is_active_button {
+                                            colors.pressed
+                                        } else {
+                                            colors.hover
+                                        })
+                                        .active_background(colors.pressed)
+                                })
                                 .tab_index(0isize)
                                 .aria_label(icon_tooltip)
                                 .on_click({
@@ -1555,16 +1598,28 @@ impl Render for PanelButtons {
                                     this.tooltip(move |_window, cx| {
                                         Tooltip::for_action(tooltip.clone(), &*action, cx)
                                     })
+                                })
+                                .render(window, cx)
+                                .when(vertical, |button| {
+                                    button.height(px(44.).into()).without_rounding()
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
-                        }),
+                            div()
+                                .relative()
+                                .child(button)
+                                .when_some(
+                                    activity_colors.filter(|_| is_active_button),
+                                    |this, colors| this.bg(colors.selected),
+                                )
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_active_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
+                        })
+                        .into_any_element(),
                 )
             })
             .collect();
@@ -1572,21 +1627,74 @@ impl Render for PanelButtons {
         if dock_position == DockPosition::Right {
             buttons.reverse();
         }
+        if vertical {
+            buttons.insert(
+                buttons.len().min(2),
+                div()
+                    .child(
+                        IconButton::new("activity-project-search", IconName::MagnifyingGlass)
+                            .size(ButtonSize::Large)
+                            .width(px(48.))
+                            .icon_size(IconSize::Medium)
+                            .when_some(activity_colors, |button, colors| {
+                                button
+                                    .style(ButtonStyle::Transparent)
+                                    .icon_color(Color::Custom(colors.foreground))
+                                    .hover_color(Color::Custom(colors.foreground))
+                                    .hover_background(colors.hover)
+                                    .active_background(colors.pressed)
+                            })
+                            .aria_label("Project Search")
+                            .tab_index(0isize)
+                            .tooltip(|_, cx| {
+                                Tooltip::for_action(
+                                    "Project Search",
+                                    &crate::DeploySearch::default(),
+                                    cx,
+                                )
+                            })
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(crate::DeploySearch::default()), cx)
+                            })
+                            .render(window, cx)
+                            .height(px(44.).into())
+                            .without_rounding(),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         let has_buttons = !buttons.is_empty();
 
         h_flex()
             .gap_1()
+            .when(vertical, |bar| {
+                bar.flex_col()
+                    .gap_0()
+                    .h_full()
+                    .w(px(48.))
+                    .flex_none()
+                    .bg(folder_color.unwrap_or(cx.theme().colors().editor_background))
+            })
             .when(
                 has_buttons
-                    && (dock.position == DockPosition::Bottom
-                        || dock.position == DockPosition::Right),
-                |this| this.child(Divider::vertical().color(DividerColor::Border)),
+                    && (dock_position == DockPosition::Bottom
+                        || dock_position == DockPosition::Right),
+                |this| {
+                    let separator_color = folder_color
+                        .map(|background| {
+                            crate::folder_colors::ActivityBarColors::new(
+                                background,
+                                cx.theme().appearance(),
+                            )
+                            .foreground
+                            .opacity(0.3)
+                        })
+                        .unwrap_or(cx.theme().colors().border);
+                    this.child(div().min_w_0().w_px().h_4().bg(separator_color))
+                },
             )
             .children(buttons)
-            .when(has_buttons && dock.position == DockPosition::Left, |this| {
-                this.child(Divider::vertical().color(DividerColor::Border))
-            })
     }
 }
 

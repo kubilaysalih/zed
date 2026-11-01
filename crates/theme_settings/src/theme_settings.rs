@@ -179,7 +179,24 @@ fn configured_theme(cx: &mut App) -> Arc<Theme> {
                 .unwrap_or_else(|_| themes.get(DEFAULT_DARK_THEME).unwrap())
         }
     };
+    let mut theme = theme;
+    let appearance = theme.appearance;
+    neutral_interaction_colors(&mut Arc::make_mut(&mut theme).styles.colors, appearance);
     theme_settings.apply_theme_overrides(theme)
+}
+
+fn neutral_interaction_colors(colors: &mut ThemeColors, appearance: Appearance) {
+    let overlay = if appearance.is_light() {
+        gpui::black()
+    } else {
+        gpui::white()
+    };
+    colors.element_hover = overlay.opacity(0.12);
+    colors.ghost_element_hover = colors.element_hover;
+    colors.element_active = overlay.opacity(0.28);
+    colors.ghost_element_active = colors.element_active;
+    colors.element_selected = overlay.opacity(0.18);
+    colors.ghost_element_selected = colors.element_selected;
 }
 
 fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {
@@ -444,4 +461,39 @@ pub fn increase_buffer_font_size(cx: &mut App) {
 /// This will be effective until the app is restarted.
 pub fn decrease_buffer_font_size(cx: &mut App) {
     adjust_buffer_font_size(cx, |size| size - px(1.0));
+}
+
+#[cfg(test)]
+mod interaction_color_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_hover_blends_with_colored_and_plain_surfaces() {
+        for (appearance, background, expected) in [
+            (Appearance::Dark, 0xff6600, [1.0, 0.472, 0.12]),
+            (Appearance::Dark, 0x000000, [0.12, 0.12, 0.12]),
+            (Appearance::Light, 0xffffff, [0.88, 0.88, 0.88]),
+        ] {
+            let mut colors = ThemeColors::dark();
+            let editor_background = colors.editor_background;
+            let git_added = colors.version_control_added;
+            let accent = colors.text_accent;
+            neutral_interaction_colors(&mut colors, appearance);
+
+            let background: gpui::Hsla = gpui::rgb(background).into();
+            for hover in [colors.element_hover, colors.ghost_element_hover] {
+                let blended = background.blend(hover).to_rgb();
+                for (actual, expected) in
+                    [blended.r, blended.g, blended.b].into_iter().zip(expected)
+                {
+                    assert!((actual - expected).abs() < 0.0001);
+                }
+            }
+            assert_ne!(colors.element_hover, colors.element_selected);
+            assert_ne!(colors.element_selected, colors.element_active);
+            assert_eq!(colors.editor_background, editor_background);
+            assert_eq!(colors.version_control_added, git_added);
+            assert_eq!(colors.text_accent, accent);
+        }
+    }
 }

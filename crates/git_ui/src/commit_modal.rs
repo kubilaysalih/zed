@@ -129,6 +129,7 @@ impl CommitModal {
         let Some(git_panel) = workspace.panel::<GitPanel>(cx) else {
             return;
         };
+        let git_panel = git_panel.read(cx).active_section(cx).unwrap_or(git_panel);
 
         git_panel.update(cx, |git_panel, cx| {
             if let Some(force_mode) = force_mode {

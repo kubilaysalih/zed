@@ -124,6 +124,70 @@ async fn test_visible_list(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_hidden_folders_can_be_restored_without_hiding_siblings(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "parent": { "nested": { "file.txt": "keep" } },
+            "parent-other": { "other.txt": "keep too" }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [Path::new(path!("/root"))], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(&*cx, |workspace, _| workspace.workspace().clone());
+    cx.update(|_, cx| {
+        let settings = *ProjectPanelSettings::get_global(cx);
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                auto_fold_dirs: true,
+                ..settings
+            },
+            cx,
+        );
+    });
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+    for hidden in [true, false] {
+        cx.update(|_, cx| {
+            workspace::folder_visibility::set_hidden(
+                PathBuf::from(path!("/root")),
+                PathBuf::from(path!("/root/parent/nested")),
+                hidden,
+                workspace.downgrade(),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        panel.read_with(&*cx, |panel, _| {
+            let paths: Vec<_> = panel
+                .state
+                .visible_entries
+                .iter()
+                .flat_map(|worktree| &worktree.entries)
+                .map(|entry| entry.path.as_unix_str())
+                .collect();
+            assert!(paths.contains(&"parent-other"));
+            if hidden {
+                assert!(paths.contains(&"parent"));
+                assert!(!paths.iter().any(|path| path.starts_with("parent/nested")));
+            } else {
+                assert!(paths.contains(&"parent/nested"));
+            }
+        });
+    }
+    assert_eq!(
+        fs.load(Path::new(path!("/root/parent/nested/file.txt")))
+            .await
+            .unwrap(),
+        "keep"
+    );
+}
+
+#[gpui::test]
 async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 

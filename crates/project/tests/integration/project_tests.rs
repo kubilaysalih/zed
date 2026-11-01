@@ -1366,7 +1366,7 @@ async fn test_project_tasks_and_debug_scenarios_require_trust(cx: &mut gpui::Tes
         path!("/dir"),
         json!({
             ".zed": {
-                "settings.json": r#"{ "tab_size": 8 }"#,
+                "settings.json": r##"{ "folder_color": "#FF6600", "tab_size": 8 }"##,
                 "tasks.json": r#"[{ "label": "initial", "command": "echo initial", "hooks": ["create_worktree"] }]"#,
                 "debug.json": r#"[{ "label": "debug", "adapter": "Debugpy", "request": "launch" }]"#,
             },
@@ -1381,6 +1381,47 @@ async fn test_project_tasks_and_debug_scenarios_require_trust(cx: &mut gpui::Tes
     let worktree_id = worktree_store.read_with(cx, |store, cx| {
         store.worktrees().next().unwrap().read(cx).id()
     });
+    cx.read(|cx| {
+        let store = cx.global::<SettingsStore>();
+        let (_, color) = store.get_value_from_file(
+            settings::SettingsFile::Project((worktree_id, rel_path("").into())),
+            |settings| settings.project.folder_color.as_ref(),
+        );
+        assert_eq!(color.map(String::as_str), Some("#FF6600"));
+        for (_, settings) in store.local_settings(worktree_id) {
+            let mut remaining = settings.clone();
+            remaining.folder_color = None;
+            assert_eq!(remaining, Default::default());
+        }
+    });
+    for color in [Some("FF5B42"), None, Some("#FF6600")] {
+        fs.save(
+            path!("/dir/.zed/settings.json").as_ref(),
+            &json!({ "folder_color": color, "tab_size": 8 })
+                .to_string()
+                .into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let store = cx.global::<SettingsStore>();
+            let (_, saved_color) = store.get_value_from_file(
+                settings::SettingsFile::Project((worktree_id, rel_path("").into())),
+                |settings| settings.project.folder_color.as_ref(),
+            );
+            assert_eq!(
+                saved_color.map(String::as_str).unwrap_or_default(),
+                color.unwrap_or_default()
+            );
+            for (_, settings) in store.local_settings(worktree_id) {
+                let mut remaining = settings.clone();
+                remaining.folder_color = None;
+                assert_eq!(remaining, Default::default());
+            }
+        });
+    }
     let inventory = project.read_with(cx, |project, cx| {
         project
             .task_store()
@@ -1434,6 +1475,18 @@ async fn test_project_tasks_and_debug_scenarios_require_trust(cx: &mut gpui::Tes
 
     let templates = inventory.read_with(cx, |inventory, _| {
         inventory.templates_with_hooks(&hooks, worktree_id)
+    });
+    cx.read(|cx| {
+        let settings = cx
+            .global::<SettingsStore>()
+            .get_content_for_file(settings::SettingsFile::Project((
+                worktree_id,
+                rel_path("").into(),
+            )))
+            .expect("trusted project settings");
+        assert_eq!(settings.project.folder_color.as_deref(), Some("#FF6600"));
+        let settings = serde_json::to_value(&settings.project).unwrap();
+        assert_eq!(settings.get("tab_size"), Some(&json!(8)));
     });
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].1.label, "updated");

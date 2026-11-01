@@ -105,7 +105,7 @@ impl Color {
             Color::Accent => cx.theme().colors().text_accent,
             Color::Player(i) => cx.theme().styles.player.color_for_participant(*i).cursor,
             Color::Error => cx.theme().status().error,
-            Color::Selected => cx.theme().colors().text_accent,
+            Color::Selected => cx.theme().colors().text,
             Color::Success => cx.theme().status().success,
             Color::VersionControlAdded => cx.theme().colors().version_control_added,
             Color::VersionControlConflict => cx.theme().colors().version_control_conflict,

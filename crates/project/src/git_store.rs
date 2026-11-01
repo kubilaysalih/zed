@@ -451,7 +451,7 @@ impl language::File for IndexTextFile {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitAccess {
     /// Either:
     /// - the user owns `.git`
@@ -464,6 +464,25 @@ pub enum GitAccess {
     /// - the directory is not marked as safe (git config safe.directory)
     /// - the user does not have OS-level read permissions to `.git`
     No,
+
+    /// The discovered `.git` entry does not identify a Git repository.
+    NotRepository,
+
+    /// Git could not check the repository for a reason other than ownership.
+    Unavailable,
+}
+
+impl GitAccess {
+    fn from_error(error: &anyhow::Error) -> Self {
+        let message = format!("{error:#}");
+        if message.contains("detected dubious ownership") {
+            Self::No
+        } else if message.contains("not a git repository") {
+            Self::NotRepository
+        } else {
+            Self::Unavailable
+        }
+    }
 }
 
 enum GitStoreState {
@@ -6932,6 +6951,12 @@ impl Repository {
                 let Some(this) = this.upgrade() else {
                     bail!("git store was dropped");
                 };
+                // Another queued request may have opened the shared buffer while this job waited.
+                if let Some(buffer) =
+                    this.read_with(&cx, |this, _| this.commit_message_buffer.clone())
+                {
+                    return Ok(buffer);
+                }
                 match state {
                     RepositoryState::Local(..) => {
                         this.update(&mut cx, |_, cx| {
@@ -10636,7 +10661,10 @@ impl Repository {
                 RepositoryState::Remote(..) => GitAccess::Yes,
                 RepositoryState::Local(state) => match state.backend.check_access().await {
                     Ok(_) => GitAccess::Yes,
-                    Err(_) => GitAccess::No,
+                    Err(error) => {
+                        log::warn!("Failed to check Git repository access: {error:#}");
+                        GitAccess::from_error(&error)
+                    }
                 },
             }
         })
@@ -11334,6 +11362,31 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_git_access_distinguishes_repository_errors() {
+        use super::GitAccess;
+
+        assert_eq!(
+            GitAccess::from_error(
+                &anyhow::anyhow!(
+                    "fatal: not a git repository (or any of the parent directories): .git"
+                )
+                .context("git rev-parse failed")
+            ),
+            GitAccess::NotRepository,
+        );
+        assert_eq!(
+            GitAccess::from_error(&anyhow::anyhow!(
+                "fatal: detected dubious ownership in repository at 'C:/repo'"
+            )),
+            GitAccess::No,
+        );
+        assert_eq!(
+            GitAccess::from_error(&anyhow::anyhow!("failed to launch git: Access is denied")),
+            GitAccess::Unavailable,
+        );
+    }
+
     use super::*;
     use crate::Project;
     use fs::{FakeBlobReadGate, FakeFs, Fs};

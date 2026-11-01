@@ -1,4 +1,5 @@
 mod components;
+mod folder_color_picker;
 mod page_data;
 pub mod pages;
 
@@ -74,6 +75,16 @@ const CONTENT_GROUP_TAB_INDEX: isize = 5;
 
 const SIDEBAR_WIDTH: Pixels = px(226.);
 const CONTENT_MIN_WIDTH: Pixels = px(400.);
+
+actions!(
+    zed,
+    [
+        /// Opens the folder color setting for the current project.
+        FolderColor,
+        /// Opens the panel layout setting.
+        PaneLayout
+    ]
+);
 
 actions!(
     settings_editor,
@@ -502,6 +513,37 @@ pub fn init(cx: &mut App) {
                     });
                 open_settings_editor(None, target_worktree_id, window_handle, cx);
             })
+            .register_action(|_, _: &PaneLayout, window, cx| {
+                open_settings_editor_at_target(
+                    Some("pane_layout"),
+                    Some(SettingsFileTarget::User),
+                    window.window_handle().downcast::<MultiWorkspace>(),
+                    cx,
+                );
+            })
+            .register_action(|workspace, _: &FolderColor, window, cx| {
+                let worktree_id =
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .find_map(|tree| {
+                            tree.read(cx)
+                                .root_entry()?
+                                .is_dir()
+                                .then_some(tree.read(cx).id())
+                        });
+                let Some(worktree_id) = worktree_id else {
+                    workspace.show_error(anyhow::anyhow!("Open a folder to set its color."), cx);
+                    return;
+                };
+                open_settings_editor_at_target(
+                    Some("folder_color"),
+                    Some(SettingsFileTarget::Project(worktree_id)),
+                    window.window_handle().downcast::<MultiWorkspace>(),
+                    cx,
+                );
+            })
             .register_action(
                 |_, _: &zed_actions::assistant::OpenSkillCreator, window, cx| {
                     let window_handle = window.window_handle().downcast::<MultiWorkspace>();
@@ -557,6 +599,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::RestoreOnStartupBehavior>(render_dropdown)
         .add_basic_renderer::<settings::OnNewWindow>(render_dropdown)
         .add_basic_renderer::<settings::BottomDockLayout>(render_dropdown)
+        .add_basic_renderer::<settings::PaneLayout>(render_dropdown)
         .add_basic_renderer::<settings::OnLastWindowClosed>(render_dropdown)
         .add_basic_renderer::<settings::CliDefaultOpenBehavior>(render_dropdown)
         .add_basic_renderer::<settings::DefaultOpenBehavior>(render_dropdown)
@@ -4854,7 +4897,10 @@ struct ProjectSettingsUpdateEntry {
 }
 
 struct ProjectSettingsUpdateQueue {
-    tx: mpsc::UnboundedSender<ProjectSettingsUpdateEntry>,
+    tx: mpsc::UnboundedSender<(
+        ProjectSettingsUpdateEntry,
+        Option<futures::channel::oneshot::Sender<Result<()>>>,
+    )>,
     _task: Task<()>,
 }
 
@@ -4862,11 +4908,20 @@ impl Global for ProjectSettingsUpdateQueue {}
 
 impl ProjectSettingsUpdateQueue {
     fn new(cx: &mut App) -> Self {
-        let (tx, mut rx) = mpsc::unbounded();
+        let (tx, mut rx) = mpsc::unbounded::<(
+            ProjectSettingsUpdateEntry,
+            Option<futures::channel::oneshot::Sender<Result<()>>>,
+        )>();
         let task = cx.spawn(async move |mut cx| {
-            while let Some(entry) = rx.next().await {
-                if let Err(err) = Self::process_entry(entry, &mut cx).await {
+            while let Some((entry, completion)) = rx.next().await {
+                let result = Self::process_entry(entry, &mut cx).await;
+                if let Err(err) = &result {
                     log::error!("Failed to update project settings: {err:?}");
+                }
+                if let Some(completion) = completion {
+                    if completion.send(result).is_err() {
+                        log::debug!("Settings save receiver was closed");
+                    }
                 }
             }
         });
@@ -4875,10 +4930,23 @@ impl ProjectSettingsUpdateQueue {
 
     fn enqueue(cx: &mut App, entry: ProjectSettingsUpdateEntry) {
         cx.update_global::<Self, _>(|queue, _cx| {
-            if let Err(err) = queue.tx.unbounded_send(entry) {
+            if let Err(err) = queue.tx.unbounded_send((entry, None)) {
                 log::error!("Failed to enqueue project settings update: {err}");
             }
         });
+    }
+
+    fn enqueue_with_completion(
+        cx: &mut App,
+        entry: ProjectSettingsUpdateEntry,
+    ) -> futures::channel::oneshot::Receiver<Result<()>> {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        cx.update_global::<Self, _>(|queue, _| {
+            if let Err(error) = queue.tx.unbounded_send((entry, Some(sender))) {
+                log::error!("Failed to enqueue project settings update: {error}");
+            }
+        });
+        receiver
     }
 
     async fn process_entry(entry: ProjectSettingsUpdateEntry, cx: &mut AsyncApp) -> Result<()> {
@@ -5033,6 +5101,9 @@ fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
     _window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    if field.json_path == Some("folder_color") {
+        return folder_color_picker::render(file, _window, cx);
+    }
     let (_, initial_text) =
         SettingsStore::global(cx).get_value_from_file(file.to_settings(), field.pick);
     let initial_text = if metadata.is_some_and(|metadata| metadata.treat_missing_text_as_empty) {
@@ -7734,6 +7805,42 @@ mod project_settings_update_tests {
             "Expected tab_size setting in: {}",
             text
         );
+    }
+
+    #[gpui::test]
+    async fn folder_color_picker_save_completion(cx: &mut TestAppContext) {
+        let setup = init_test(cx, Some(r#"{"tab_size":8}"#)).await;
+        let entry = ProjectSettingsUpdateEntry {
+            worktree_id: setup.worktree_id,
+            rel_path: setup.rel_path.clone(),
+            settings_window: WeakEntity::new_invalid(),
+            project: setup.project.downgrade(),
+            worktree: setup.worktree.clone(),
+            update: Box::new(|content, _| content.project.folder_color = Some("#FF6600".into())),
+        };
+        let completion =
+            cx.update(|cx| ProjectSettingsUpdateQueue::enqueue_with_completion(cx, entry));
+        completion.await.unwrap().unwrap();
+        let text = setup
+            .fs
+            .load(std::path::Path::new("/project/.zed/settings.json"))
+            .await
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["folder_color"], "#FF6600");
+        assert_eq!(saved["tab_size"], 8);
+
+        let invalid = ProjectSettingsUpdateEntry {
+            worktree_id: setup.worktree_id,
+            rel_path: setup.rel_path,
+            settings_window: WeakEntity::new_invalid(),
+            project: setup.project.downgrade(),
+            worktree: WeakEntity::new_invalid(),
+            update: Box::new(|_, _| {}),
+        };
+        let completion =
+            cx.update(|cx| ProjectSettingsUpdateQueue::enqueue_with_completion(cx, invalid));
+        assert!(completion.await.unwrap().is_err());
     }
 
     #[gpui::test]

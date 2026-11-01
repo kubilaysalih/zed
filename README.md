@@ -1,11 +1,32 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
+## Changes in this fork
+
+This fork builds on Zed's existing Rust and native GPUI architecture, with a focus on file browsing and working across multiple Git repositories.
+
+1. **Activity bar and file tree:** Files, Git, and Search controls have been moved into a vertical activity bar on the left. The Threads sidebar and the Agent panel's bottom-left button have been removed. Activity buttons are contiguous with square corners, and overlapping hover backgrounds have been fixed. The redundant project name has been removed from the title bar. When a single folder is open, the file tree shows its contents directly without an extra root row.
+
+2. **Source Control for multiple repositories:** Git repositories under the opened folder appear in separate collapsible sections. Each section keeps its changes, history, staging operations, and commit draft tied to its repository. Repository headers and section backgrounds are more distinct, and the active Changes / History tab is clearer. Unnecessary card borders and large gaps have been removed, while rows have more vertical padding. Duplicate repository entries have been fixed. Sections grow with their file lists, and long lists can be scrolled through the panel. Clicking a repository's branch name opens the branch selector for that repository. Invalid or empty `.git` directories are no longer misreported as ownership or trust errors; actual Git trust checks remain in place.
+
+3. **Hide and restore folders:** Right-click a folder in the file tree and select **Hide Folder** to hide it and its nested repositories from both the file tree and Git panel. Restore folders individually through **Hidden Folders**, or restore them together with **Show All Hidden Folders**. Visibility choices persist without deleting files or changing `.gitignore`.
+
+4. **Folder colors with live preview:** Open **Ctrl+Shift+P → Folder Color** to use the visual color picker. Choose a color using the color field, hue strip, presets, or a HEX value such as `#FF6600`. Changes preview immediately; **Apply** saves them, **Cancel** restores the previous color, and **Theme** returns to the theme's colors. The chosen color is applied to the title bar, activity bar, and status bar. Color saving and application in Restricted Mode have been fixed; choosing a color does not grant project trust.
+
+5. **Consistent hover states and readability:** Shared hover, active, and selected states use neutral colors. Menu controls, branch labels, and icons are more readable on colored bars. The unnecessary vertical border beside the activity bar has been removed. When a folder color is set, separators between the bottom-right panel button groups use translucent white in dark themes and translucent black in light themes.
+
+6. **Optional pane and diff layouts:** Open **Ctrl+Shift+P → Pane Layout** to choose **Flat** or **Separated**. Separated gives the left panel, editor, bottom terminal, and right panel rounded boundaries, with the folder color visible between them and along the editor's right edge. The Git panel's **View Options → Open Changed Files** menu exposes three choices: **All Changes in One Tab**, **Separate File Diffs (Side by Side)**, and **Open File Without Diff**. File clicks can open the combined changes view, a separate side-by-side diff tab for the selected file, or the file itself. These preferences persist; the defaults remain Flat and the combined diff view.
+
+The download links below point to upstream Zed. Custom Windows builds of this fork are distributed separately.
+
+---
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
 [![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
 
 Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
-
----
 
 ### Installation
 

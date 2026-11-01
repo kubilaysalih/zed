@@ -47,6 +47,26 @@ fn setup_multi_workspace<'a>(
 }
 
 #[gpui::test]
+async fn test_disabled_sidebar_cannot_be_restored_or_reopened(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.open_sidebar(cx);
+        multi_workspace.disable_sidebar(cx);
+        multi_workspace.restore_open_sidebar(cx);
+        multi_workspace.toggle_sidebar(window, cx);
+        multi_workspace.focus_sidebar(window, cx);
+        assert!(!multi_workspace.sidebar_open());
+        assert!(!multi_workspace.sidebar_render_state(cx).open);
+        assert!(multi_workspace.sidebar().is_none());
+    });
+}
+
+#[gpui::test]
 async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

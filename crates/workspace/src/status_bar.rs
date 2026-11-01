@@ -85,7 +85,7 @@ impl SidebarStatus {
             .and_then(|mw| mw.upgrade())
             .map(|mw| {
                 let mw = mw.read(cx);
-                let enabled = mw.multi_workspace_enabled(cx);
+                let enabled = mw.sidebar().is_some() && mw.multi_workspace_enabled(cx);
                 Self {
                     open: mw.sidebar_open() && enabled,
                     side: mw.sidebar_side(cx),
@@ -115,6 +115,15 @@ impl Focusable for StatusBar {
 impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let folder_color = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+            .and_then(|workspace| {
+                let project = workspace.read(cx).workspace().read(cx).project();
+                crate::folder_colors::for_project(project.read(cx), cx)
+            });
+        let background = folder_color.unwrap_or(cx.theme().colors().status_bar_background);
 
         h_flex()
             .id("status-bar")
@@ -151,7 +160,7 @@ impl Render for StatusBar {
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .p(DynamicSpacing::Base04.rems(cx))
-            .bg(cx.theme().colors().status_bar_background)
+            .bg(background)
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
                 Decorations::Client { tiling, .. } => el
@@ -179,7 +188,7 @@ impl Render for StatusBar {
                         if needs_gap_fix { px(-1.) } else { px(0.) }
                     })
                     .border_b(px(1.0))
-                    .border_color(cx.theme().colors().status_bar_background),
+                    .border_color(background),
             })
             .child(self.render_left_tools(&sidebar, cx))
             .child(self.render_right_tools(&sidebar, cx))

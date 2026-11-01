@@ -5230,9 +5230,39 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn window_section() -> [SettingsPageItem; 6] {
+    fn window_section() -> [SettingsPageItem; 8] {
         [
             SettingsPageItem::SectionHeader("Window"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Pane Layout",
+                description: "Flat keeps panels joined. Separated gives the file/Git panel, editor, terminal, and right panel rounded corners, with the folder color between them and along the right edge.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("pane_layout"),
+                    pick: |content| content.workspace.pane_layout.as_ref(),
+                    write: |content, value, _| content.workspace.pane_layout = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Folder Color",
+                description: "Drag to preview the window and activity bar color live. Apply saves it; Cancel restores the saved color. You can also enter a HEX color. Select Project settings to color only this folder, including in restricted mode.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("folder_color"),
+                    pick: |content| content.project.folder_color.as_ref(),
+                    write: |content, value, _| content.project.folder_color = value,
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    placeholder: Some("#f97316"),
+                    display_confirm_button: true,
+                    display_clear_button: true,
+                    confirm_on_focus_out: true,
+                    ..Default::default()
+                })),
+                files: USER | PROJECT,
+            }),
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Title Format",
                 description: "Window title template. Available variables are `${projectName}`, `${fileName}`, `${filePath}`, `${relativePath}`, `${fileStem}`, `${remoteName}`, `${remoteHost}`, `${appName}`, `${branch}`, and `${separator}`. `${separator}` is omitted when adjacent variables are empty, but literal text is preserved. The collaboration indicator, when present, is appended after the rendered template. If the template renders to nothing, the default template is used instead.",
@@ -6767,8 +6797,8 @@ fn panels_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Primary Click Behavior",
-                description: "Default action when clicking a changed file in the Git panel.",
+                title: "Open Changed Files",
+                description: "Choose Project Diff for all changes in one tab, File Diff for a separate tab containing only the clicked file, or View File to read the file without a diff. This is also available in the Git panel's View Options menu.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git_panel.entry_primary_click_action"),
@@ -6784,6 +6814,11 @@ fn panels_page() -> SettingsPage {
                             .git_panel
                             .get_or_insert_default()
                             .entry_primary_click_action = value;
+                        if value == Some(settings::GitPanelClickBehavior::FileDiff) {
+                            settings_content.editor.diff_view_style =
+                                Some(settings::DiffViewStyle::Split);
+                            settings_content.editor.minimum_split_diff_width = Some(0.0);
+                        }
                     },
                 }),
                 metadata: None,

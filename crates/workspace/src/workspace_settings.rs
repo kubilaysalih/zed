@@ -13,6 +13,8 @@ use settings::{CommandAliasTarget, SettingsStore};
 
 #[derive(RegisterSetting)]
 pub struct WorkspaceSettings {
+    pub pane_layout: settings::PaneLayout,
+    pub folder_color: String,
     pub active_pane_modifiers: ActivePanelModifiers,
     pub bottom_dock_layout: settings::BottomDockLayout,
     pub pane_split_direction_horizontal: settings::PaneSplitDirectionHorizontal,
@@ -98,6 +100,7 @@ impl Settings for WorkspaceSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let workspace = &content.workspace;
         Self {
+            pane_layout: workspace.pane_layout.unwrap_or_default(),
             active_pane_modifiers: ActivePanelModifiers {
                 border_size: Some(
                     *workspace
@@ -146,6 +149,7 @@ impl Settings for WorkspaceSettings {
                 .collect(),
             close_on_file_delete: workspace.close_on_file_delete.unwrap(),
             close_panel_on_toggle: workspace.close_panel_on_toggle.unwrap(),
+            folder_color: content.project.folder_color.clone().unwrap_or_default(),
             window_title_format: workspace.window_title_format.clone().unwrap(),
             window_title_separator: workspace.window_title_separator.clone().unwrap(),
             use_system_window_tabs: workspace.use_system_window_tabs.unwrap(),

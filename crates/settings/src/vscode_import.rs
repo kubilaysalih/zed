@@ -533,6 +533,7 @@ impl VsCodeSettings {
 
     fn project_settings_content(&self) -> ProjectSettingsContent {
         ProjectSettingsContent {
+            folder_color: None,
             all_languages: AllLanguageSettingsContent {
                 edit_predictions: self.edit_predictions_settings_content(),
                 defaults: self.default_language_settings_content(),
@@ -1050,6 +1051,7 @@ impl VsCodeSettings {
 
     fn workspace_settings_content(&self) -> WorkspaceSettingsContent {
         WorkspaceSettingsContent {
+            pane_layout: None,
             active_pane_modifiers: self.active_pane_modifiers(),
             accessible_mode: None,
             text_rendering_mode: None,

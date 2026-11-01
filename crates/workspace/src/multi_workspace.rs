@@ -315,6 +315,7 @@ pub struct MultiWorkspace {
     active_workspace_id: Rc<Cell<EntityId>>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
+    sidebar_disabled: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
@@ -376,6 +377,7 @@ impl MultiWorkspace {
             active_workspace_id,
             sidebar: None,
             sidebar_open: false,
+            sidebar_disabled: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
@@ -408,7 +410,15 @@ impl MultiWorkspace {
     }
 
     pub fn sidebar_open(&self) -> bool {
-        self.sidebar_open
+        self.sidebar_open && !self.sidebar_disabled
+    }
+
+    pub fn disable_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_disabled = true;
+        self.sidebar_open = false;
+        self.sidebar = None;
+        self.sidebar_overlay = None;
+        cx.notify();
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
@@ -428,7 +438,7 @@ impl MultiWorkspace {
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.multi_workspace_enabled(cx) {
+        if self.sidebar_disabled || !self.multi_workspace_enabled(cx) {
             return;
         }
 
@@ -455,7 +465,7 @@ impl MultiWorkspace {
     }
 
     pub fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.multi_workspace_enabled(cx) {
+        if self.sidebar_disabled || !self.multi_workspace_enabled(cx) {
             return;
         }
 
@@ -500,6 +510,9 @@ impl MultiWorkspace {
     }
 
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_disabled {
+            return;
+        }
         self.sidebar_open = true;
         self.retain_active_workspace(cx);
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));

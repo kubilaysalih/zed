@@ -1020,33 +1020,46 @@ impl TitleBar {
 
         let branch_picker = branch_name.and_then(|branch_name| {
             settings.show_branch_name.then(|| {
+                let branch_foreground =
+                    if workspace::folder_colors::for_project(self.project.read(cx), cx).is_some() {
+                        Color::Custom(if cx.theme().appearance.is_light() {
+                            gpui::black()
+                        } else {
+                            gpui::white()
+                        })
+                    } else {
+                        Color::Default
+                    };
                 let branch_tooltip_label = branch_name.clone();
-                let (branch_icon, branch_icon_color) = if settings.show_branch_status_icon {
-                    icon_info
+                let branch_icon = if settings.show_branch_status_icon {
+                    icon_info.0
                 } else {
-                    (IconName::GitBranch, Color::Muted)
+                    IconName::GitBranch
                 };
 
                 let trigger = if is_detached_head {
                     Button::new("project_branch_trigger", "Create Branch")
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .color(branch_foreground)
+                        .selected_label_color(branch_foreground)
                         .label_size(LabelSize::Small)
                         .tab_index(0isize)
                         .start_icon(
                             Icon::new(IconName::GitBranchPlus)
                                 .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                .color(branch_foreground),
                         )
                 } else {
                     Button::new("project_branch_trigger", branch_name)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
-                        .color(Color::Muted)
+                        .color(branch_foreground)
+                        .selected_label_color(branch_foreground)
                         .tab_index(0isize)
                         .start_icon(
                             Icon::new(branch_icon)
                                 .size(IconSize::XSmall)
-                                .color(branch_icon_color),
+                                .color(branch_foreground),
                         )
                 };
 
