@@ -55,6 +55,204 @@ pub struct Message {
     pub tool_input: String,
     pub tool_finished: bool,
     pub tool_error: bool,
+    pub question_answers: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageBodyPart {
+    Text(String),
+    File(String),
+}
+
+pub fn message_body_parts(text: &str) -> Vec<MessageBodyPart> {
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    let mut text_start = 0;
+    while offset < text.len() {
+        let remaining = &text[offset..];
+        if remaining.starts_with('`') || remaining.starts_with("~~~") {
+            let marker = remaining.chars().next().unwrap_or('`');
+            let count = remaining
+                .chars()
+                .take_while(|character| *character == marker)
+                .count();
+            let delimiter = marker.to_string().repeat(count);
+            offset += count;
+            if let Some(end) = text[offset..].find(&delimiter) {
+                offset += end + count;
+            } else {
+                break;
+            }
+            continue;
+        }
+        let prefix = ["::codex-file-citation{", ":codex-file-citation{"]
+            .into_iter()
+            .find(|prefix| remaining.starts_with(prefix));
+        if let Some(prefix) = prefix
+            && let Some((length, path)) = parse_file_citation(&remaining[prefix.len()..])
+        {
+            let prose = &text[text_start..offset];
+            if !prose.trim().is_empty() {
+                parts.push(MessageBodyPart::Text(prose.trim_matches('\n').to_owned()));
+            }
+            parts.push(MessageBodyPart::File(path));
+            offset += prefix.len() + length;
+            text_start = offset;
+            continue;
+        }
+        offset += remaining.chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    let prose = &text[text_start..];
+    if !prose.trim().is_empty() {
+        parts.push(MessageBodyPart::Text(prose.trim_matches('\n').to_owned()));
+    }
+    parts
+}
+
+fn parse_file_citation(input: &str) -> Option<(usize, String)> {
+    let mut offset = 0;
+    let mut path = None;
+    loop {
+        let remaining = input.get(offset..)?;
+        offset += remaining.len() - remaining.trim_start().len();
+        if input.get(offset..)?.starts_with('}') {
+            let path: String = path?;
+            let bytes = path.as_bytes();
+            let absolute = path.starts_with('/')
+                || path.starts_with("\\\\")
+                || (bytes.first().is_some_and(u8::is_ascii_alphabetic)
+                    && bytes.get(1) == Some(&b':')
+                    && bytes
+                        .get(2)
+                        .is_some_and(|byte| matches!(byte, b'/' | b'\\')));
+            return absolute.then_some((offset + 1, path));
+        }
+        let key_start = offset;
+        while input
+            .as_bytes()
+            .get(offset)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        {
+            offset += 1;
+        }
+        if offset == key_start {
+            return None;
+        }
+        let key = &input[key_start..offset];
+        let remaining = input.get(offset..)?;
+        offset += remaining.len() - remaining.trim_start().len();
+        if input.as_bytes().get(offset) != Some(&b'=') {
+            return None;
+        }
+        offset += 1;
+        let remaining = input.get(offset..)?;
+        offset += remaining.len() - remaining.trim_start().len();
+        let quote = input.get(offset..)?.chars().next()?;
+        let closing = match quote {
+            '"' => '"',
+            '\'' => '\'',
+            '“' => '”',
+            _ => return None,
+        };
+        offset += quote.len_utf8();
+        let start = offset;
+        loop {
+            let character = input.get(offset..)?.chars().next()?;
+            if character == closing {
+                break;
+            }
+            if character == '\\' {
+                let next = input.get(offset + 1..)?.chars().next()?;
+                if next == closing || next == '\\' {
+                    offset += 1 + next.len_utf8();
+                    continue;
+                }
+            }
+            offset += character.len_utf8();
+        }
+        let value = &input[start..offset];
+        if key == "path" {
+            path = Some(if quote == '"' {
+                serde_json::from_str::<String>(&format!("\"{value}\""))
+                    .ok()
+                    .filter(|path| !path.chars().any(char::is_control))
+                    .filter(|path| !value.starts_with("\\\\") || path.starts_with("\\\\"))
+                    .unwrap_or_else(|| value.to_owned())
+            } else {
+                value.to_owned()
+            });
+        }
+        offset += closing.len_utf8();
+    }
+}
+
+#[cfg(test)]
+mod file_citation_tests {
+    use super::{MessageBodyPart::*, message_body_parts};
+
+    #[test]
+    fn file_cards_preserve_message_order_and_unicode_paths() {
+        let parts = message_body_parts(
+            "Turkish:\n:codex-file-citation{path=\"C:/My Files/guide TR.pdf\" purpose=\"output\"}\nEnglish:\n::codex-file-citation{purpose=\"output\" path=\"C:/My Files/guide EN.pdf\"}\nDone.",
+        );
+        assert_eq!(
+            parts,
+            vec![
+                Text("Turkish:".into()),
+                File("C:/My Files/guide TR.pdf".into()),
+                Text("English:".into()),
+                File("C:/My Files/guide EN.pdf".into()),
+                Text("Done.".into())
+            ]
+        );
+        assert_eq!(
+            message_body_parts(":codex-file-citation{path=\"/tmp/çalışma {final}.pdf\"}"),
+            vec![File("/tmp/çalışma {final}.pdf".into())]
+        );
+    }
+
+    #[test]
+    fn file_cards_accept_windows_paths_and_typographic_quotes() {
+        for source in [
+            r#":codex-file-citation{path="C:\temp\test.pdf"}"#,
+            r#":codex-file-citation{path="C:\\temp\\test.pdf"}"#,
+        ] {
+            assert_eq!(
+                message_body_parts(source),
+                vec![File(r"C:\temp\test.pdf".into())]
+            );
+        }
+        assert_eq!(
+            message_body_parts(":codex-file-citation{path=“C:/test.pdf”}"),
+            vec![File("C:/test.pdf".into())]
+        );
+        assert_eq!(
+            message_body_parts(r#":codex-file-citation{path="\\server\share\test.pdf"}"#),
+            vec![File(r"\\server\share\test.pdf".into())]
+        );
+    }
+
+    #[test]
+    fn file_cards_leave_examples_invalid_and_partial_directives_unchanged() {
+        for source in [
+            "`::codex-file-citation{path=\"C:/test.pdf\"}`",
+            "```text\n::codex-file-citation{path=\"C:/test.pdf\"}\n```",
+            "~~~text\n::codex-file-citation{path=\"C:/test.pdf\"}\n~~~",
+            ":codex-file-citation{path=\"C:/test.pdf\"",
+            ":codex-file-citation{path=\"https://example.com/test.pdf\"}",
+            ":codex-file-citation{purpose=\"output\"}",
+            ":codex-file-citation{path=\"relative/test.pdf\"}",
+        ] {
+            assert_eq!(message_body_parts(source), vec![Text(source.into())]);
+        }
+    }
+}
+
+pub fn is_question_tool(name: &str) -> bool {
+    matches!(
+        name.rsplit('.').next().unwrap_or(name),
+        "request_user_input_async" | "request_user_input" | "AskUserQuestion"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -573,6 +771,7 @@ fn is_context(text: &str) -> bool {
         "<local-command-",
         "<command-name>",
         "<send_user_message_question_reply>",
+        "<external_codex_apps_open_page>",
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
@@ -1017,6 +1216,40 @@ pub fn compaction_message(finished: bool, timestamp: String) -> Message {
 }
 
 fn records(provider: Provider, value: &Value) -> Vec<Message> {
+    let payload = if provider == Provider::Codex {
+        &value["payload"]
+    } else {
+        &value["message"]
+    };
+    if payload["role"] == "user" {
+        let text = content_text(&payload["content"]);
+        if let Some(reply) = text
+            .trim()
+            .strip_prefix("<send_user_message_question_reply>")
+        {
+            let reply = reply
+                .split("</send_user_message_question_reply>")
+                .next()
+                .unwrap_or_default();
+            if let Ok(replies) = serde_json::from_str::<Vec<Value>>(reply) {
+                return replies
+                    .into_iter()
+                    .filter_map(|reply| {
+                        let identity =
+                            serde_json::from_str::<Vec<Value>>(reply["questionItemId"].as_str()?)
+                                .ok()?;
+                        Some(Message {
+                            role: "question_reply".into(),
+                            tool_id: identity.get(1)?.as_str()?.into(),
+                            tool_input: identity.get(2)?.as_u64()?.to_string(),
+                            text: reply["answer"].as_str().unwrap_or_default().into(),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+            }
+        }
+    }
     let compacted = match provider {
         Provider::Codex => {
             value["type"] == "compacted"
@@ -1050,7 +1283,12 @@ fn records(provider: Provider, value: &Value) -> Vec<Message> {
                 .or_else(|| block.get("input"))
                 .unwrap_or(&Value::Null);
             records.push(Message {
-                role: "activity".into(),
+                role: if is_question_tool(&string(block, "name")) {
+                    "question"
+                } else {
+                    "activity"
+                }
+                .into(),
                 timestamp: timestamp.clone(),
                 tool_id: if provider == Provider::Claude {
                     string(block, "id")
@@ -1271,12 +1509,22 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
                 continue;
             }
             for message in parsed {
-                if message.role == "tool_result" {
+                if message.role == "question_reply" {
                     if let Some(call) = messages
                         .iter_mut()
                         .rev()
-                        .find(|call| call.role == "activity" && call.tool_id == message.tool_id)
+                        .find(|call| call.role == "question" && call.tool_id == message.tool_id)
                     {
+                        call.question_answers
+                            .insert(message.tool_input, message.text);
+                    }
+                    continue;
+                }
+                if message.role == "tool_result" {
+                    if let Some(call) = messages.iter_mut().rev().find(|call| {
+                        matches!(call.role.as_str(), "activity" | "question")
+                            && call.tool_id == message.tool_id
+                    }) {
                         call.text = message.text;
                         call.tool_finished = true;
                         call.tool_error = message.tool_error;
@@ -1306,6 +1554,34 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn async_questions_are_cards_and_acknowledgement_is_not_an_answer() {
+        let fixture = Fixture::new();
+        let rows = vec![
+            json!({"type":"response_item","payload":{"type":"function_call","call_id":"question","name":"functions.request_user_input_async","arguments":json!({"questions":[{"title":"Theme?","options":["Dark","Light"]}]}).to_string()}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"question","output":"{\"accepted\":true}"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":"<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"}}),
+        ];
+        let path = fixture.write("questions.jsonl", &rows);
+        let chat = metadata(path, Provider::Codex, false, &HashMap::new()).expect("chat");
+        let pending = transcript(&chat, 200).expect("pending");
+        assert_eq!(pending.messages.len(), 1);
+        assert_eq!(pending.messages[0].role, "question");
+        assert!(pending.messages[0].question_answers.is_empty());
+        let mut answered = rows;
+        answered.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":format!("<send_user_message_question_reply>{}</send_user_message_question_reply>", json!([{"questionItemId":json!(["request_user_input_async","question",0]).to_string(),"answer":"Dark"}]))}}));
+        fixture.write("questions.jsonl", &answered);
+        let answered = transcript(&chat, 200).expect("answered");
+        assert_eq!(answered.messages.len(), 1);
+        assert_eq!(
+            answered.messages[0]
+                .question_answers
+                .get("0")
+                .map(String::as_str),
+            Some("Dark")
+        );
+    }
 
     #[test]
     fn context_uses_latest_request_and_includes_claude_cached_input() {
@@ -1587,13 +1863,16 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
+            static NEXT_FIXTURE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
             let path = std::env::temp_dir().join(format!(
-                "zed-chat-history-{}-{}",
+                "zed-chat-history-{}-{}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .expect("clock")
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).expect("fixture directory");
             Self(path)

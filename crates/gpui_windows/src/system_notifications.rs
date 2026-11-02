@@ -72,12 +72,12 @@ impl SystemNotificationState {
                     .and_then(|arguments| arguments.Arguments().ok())
                     .filter(|arguments| !arguments.is_empty())
                     .map(|arguments| SharedString::from(arguments.to_string()));
-                sender
-                    .unbounded_send(SystemNotificationResponse {
-                        tag: response_tag.clone(),
-                        action_id,
-                    })
-                    .ok();
+                if let Err(error) = sender.unbounded_send(SystemNotificationResponse {
+                    tag: response_tag.clone(),
+                    action_id,
+                }) {
+                    log::warn!("Cannot deliver notification activation: {error}");
+                }
                 Ok(())
             },
         ))?;
@@ -157,6 +157,7 @@ impl SystemNotificationState {
 fn toast_document(notification: &SystemNotification) -> windows::core::Result<XmlDocument> {
     let document = XmlDocument::new()?;
     let toast = document.CreateElement(h!("toast"))?;
+    toast.SetAttribute(h!("launch"), h!("view"))?;
     document.AppendChild(&toast)?;
 
     let visual = document.CreateElement(h!("visual"))?;

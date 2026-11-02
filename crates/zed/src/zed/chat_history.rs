@@ -20,7 +20,7 @@ use std::{
     sync::mpsc::Sender,
     time::{Duration, SystemTime},
 };
-use ui::{ContextMenu, PopoverMenu, SpinnerLabel, Tooltip, WithScrollbar, prelude::*};
+use ui::{ButtonLike, ContextMenu, PopoverMenu, SpinnerLabel, Tooltip, WithScrollbar, prelude::*};
 use util::ResultExt;
 use workspace::{
     Item, Workspace,
@@ -129,6 +129,7 @@ fn provider_icon(provider: Provider) -> IconName {
 #[derive(Default)]
 struct ChatNotificationRoutes {
     routes: HashMap<SharedString, (WeakEntity<ChatHistoryPanel>, gpui::AnyWindowHandle, Chat)>,
+    recent: HashMap<(String, &'static str), std::time::Instant>,
 }
 impl gpui::Global for ChatNotificationRoutes {}
 
@@ -138,6 +139,21 @@ fn install_system_notifications(cx: &mut App) {
     }
     cx.set_global(ChatNotificationRoutes::default());
     let channel = release_channel::ReleaseChannel::global(cx);
+    #[cfg(target_os = "windows")]
+    {
+        use std::hash::{Hash, Hasher};
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        paths::data_dir().hash(&mut identity);
+        match std::env::current_exe() {
+            Ok(path) => path.hash(&mut identity),
+            Err(error) => log::warn!("Cannot identify chat notification executable: {error}"),
+        }
+        cx.set_app_identity(
+            &format!("Zed.LocalChats.{:016x}", identity.finish()),
+            channel.display_name(),
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
     cx.set_app_identity(channel.app_id(), channel.display_name());
     cx.on_system_notification_response(|response, cx| {
         let route = cx.update_global::<ChatNotificationRoutes, _>(|routes, _| {
@@ -158,6 +174,68 @@ fn install_system_notifications(cx: &mut App) {
                 .log_err();
         }
     });
+}
+
+// Resolve at click time: tabs can move between panes/workspaces after the toast appeared.
+fn focus_open_chat(key: &str, preferred: gpui::WindowId, cx: &mut App) -> bool {
+    let mut windows = cx.windows();
+    windows.sort_by_key(|window| window.window_id() != preferred);
+    for handle in windows {
+        let Some(handle) = handle.downcast::<workspace::MultiWorkspace>() else {
+            continue;
+        };
+        let Ok(root) = handle.entity(cx) else {
+            continue;
+        };
+        let active = root.read(cx).workspace().clone();
+        let mut workspaces = root.read(cx).workspaces().cloned().collect::<Vec<_>>();
+        workspaces.sort_by_key(|workspace| workspace != &active);
+        for workspace in workspaces {
+            let right = workspace
+                .read(cx)
+                .panel::<RightChatPanel>(cx)
+                .and_then(|panel| {
+                    let state = panel.read(cx);
+                    let view = state
+                        .groups
+                        .iter()
+                        .flat_map(|group| &group.tabs)
+                        .filter_map(|index| state.views.get(*index))
+                        .find(|view| view.read(cx).chat.key() == key)
+                        .cloned();
+                    view.map(|view| (panel, view))
+                });
+            let editor = workspace.read(cx).panes().iter().find_map(|pane| {
+                pane.read(cx).items().enumerate().find_map(|(index, item)| {
+                    let view = item.to_any_view().downcast::<ChatHistoryView>().ok()?;
+                    (view.read(cx).chat.key() == key).then(|| (pane.clone(), index, view))
+                })
+            });
+            if right.is_none() && editor.is_none() {
+                continue;
+            }
+            return handle
+                .update(cx, |root, window, cx| {
+                    root.activate(workspace.clone(), None, window, cx);
+                    if let Some((panel, view)) = right {
+                        view.update(cx, |view, cx| view.set_unread(false, cx));
+                        panel.update(cx, |panel, cx| panel.open_view(view, window, cx));
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.focus_panel::<RightChatPanel>(window, cx)
+                        });
+                    } else if let Some((pane, index, view)) = editor {
+                        view.update(cx, |view, cx| view.set_unread(false, cx));
+                        pane.update(cx, |pane, cx| {
+                            pane.activate_item(index, true, true, window, cx)
+                        });
+                    }
+                    window.activate_window();
+                })
+                .log_err()
+                .is_some();
+        }
+    }
+    false
 }
 
 pub fn install(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -1290,23 +1368,28 @@ impl ChatHistoryPanel {
     }
 
     fn open_notification_chat(&mut self, chat: Chat, window: &mut Window, cx: &mut Context<Self>) {
-        cx.activate(true);
-        window.activate_window();
-        if let Some(root) = window
-            .window_handle()
-            .downcast::<workspace::MultiWorkspace>()
-        {
-            let workspace = self.workspace.clone();
-            cx.defer(move |cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    root.update(cx, |root, window, cx| {
-                        root.activate(workspace, None, window, cx);
-                    })
+        let handle = window.window_handle();
+        let panel = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            if focus_open_chat(&chat.key(), handle.window_id(), cx) {
+                return;
+            }
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            let Some(root) = handle.downcast::<workspace::MultiWorkspace>() else {
+                return;
+            };
+            root.update(cx, |root, window, cx| {
+                root.activate(workspace, None, window, cx);
+                panel
+                    .update(cx, |panel, cx| panel.open(chat, window, cx))
                     .log_err();
-                }
-            });
-        }
-        self.open(chat, window, cx);
+                window.activate_window();
+            })
+            .log_err();
+        });
     }
 
     fn notify_chat(
@@ -1328,11 +1411,31 @@ impl ChatHistoryPanel {
         let settings = AgentSettings::get_global(cx);
         let notification_setting = settings.notify_when_agent_waiting;
         let play_sound = settings.play_sound_when_agent_done.should_play(visible);
-        if play_sound {
-            audio::Audio::play_sound(audio::Sound::AgentDone, cx);
-        }
         if visible {
             return;
+        }
+        if notification_setting == NotifyWhenAgentWaiting::Never {
+            if play_sound {
+                audio::Audio::play_sound(audio::Sound::AgentDone, cx);
+            }
+            return;
+        }
+        // Each workspace watches the local catalog; one completion must not produce
+        // multiple competing notifications in the same process.
+        let duplicate = cx.update_global::<ChatNotificationRoutes, _>(|routes, _| {
+            routes
+                .recent
+                .retain(|_, at| at.elapsed() < Duration::from_secs(10));
+            routes
+                .recent
+                .insert((chat.key(), caption), std::time::Instant::now())
+                .is_some()
+        });
+        if duplicate {
+            return;
+        }
+        if play_sound {
+            audio::Audio::play_sound(audio::Sound::AgentDone, cx);
         }
         let screens = match notification_setting {
             NotifyWhenAgentWaiting::Never => return,
@@ -1345,7 +1448,13 @@ impl ChatHistoryPanel {
         window.request_attention();
         self.notified_chat = Some(chat.key());
         if self.library.notification_style == ChatNotificationStyle::System {
-            let tag: SharedString = format!("local-chat-{}-{}", cx.entity_id(), chat.key()).into();
+            let tag: SharedString = format!(
+                "local-chat-{}-{}-{}",
+                std::process::id(),
+                cx.entity_id(),
+                chat.key()
+            )
+            .into();
             let panel = cx.weak_entity();
             let window_handle = window.window_handle();
             cx.update_global::<ChatNotificationRoutes, _>(|routes, _| {
@@ -3473,21 +3582,69 @@ impl Render for ChatHistoryPanel {
 
 struct DisplayMessage {
     message: Message,
-    markdown: Option<Entity<Markdown>>,
+    markdown: Vec<Option<Entity<Markdown>>>,
+    body_parts: Vec<store::MessageBodyPart>,
     images: Option<Vec<gpui::ImageSource>>,
     expanded: bool,
+    delivery: Option<MessageDelivery>,
+    dirty: bool,
+}
+#[derive(Clone)]
+enum MessageDelivery {
+    Sending,
+    Failed(String),
 }
 impl DisplayMessage {
     fn new(message: Message) -> Self {
+        let body_parts = Self::body_parts(&message);
         Self {
+            markdown: vec![None; body_parts.len()],
+            body_parts,
             message,
-            markdown: None,
             images: None,
             expanded: false,
+            delivery: None,
+            dirty: true,
+        }
+    }
+
+    fn body_parts(message: &Message) -> Vec<store::MessageBodyPart> {
+        if message.role == "activity" {
+            vec![store::MessageBodyPart::Text(format!(
+                "```\n{}\n```\n\n```\n{}\n```",
+                message.tool_input,
+                message.text.chars().take(16000).collect::<String>()
+            ))]
+        } else {
+            store::message_body_parts(&message.text)
+        }
+    }
+
+    fn update_message(&mut self, message: Message, cx: &mut App) {
+        if self.message == message {
+            return;
+        }
+        if self.message.attachments != message.attachments {
+            self.images = None;
+        }
+        self.message = message;
+        self.dirty = true;
+        self.body_parts = Self::body_parts(&self.message);
+        self.markdown.resize_with(self.body_parts.len(), || None);
+        for (part, markdown) in self.body_parts.iter().zip(&mut self.markdown) {
+            if let store::MessageBodyPart::Text(source) = part {
+                if let Some(markdown) = markdown {
+                    if markdown.read(cx).source().as_ref() != source.as_str() {
+                        markdown.update(cx, |markdown, cx| markdown.replace(source.clone(), cx));
+                    }
+                }
+            } else {
+                *markdown = None;
+            }
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum ReaderRow {
     Message(usize),
     Work(std::ops::Range<usize>),
@@ -3515,6 +3672,7 @@ struct ChatAttentionEvent {
 struct PendingApproval {
     request: runtime::Approval,
     fields: Vec<Entity<Editor>>,
+    details_expanded: bool,
 }
 
 pub struct ChatHistoryView {
@@ -3538,6 +3696,8 @@ pub struct ChatHistoryView {
     busy: bool,
     fork_next: bool,
     approvals: VecDeque<PendingApproval>,
+    question_fields: HashMap<String, Vec<Entity<Editor>>>,
+    goal: Option<runtime::Goal>,
     controls: Option<Sender<Control>>,
     watch: Task<()>,
     load: Task<()>,
@@ -3574,6 +3734,28 @@ impl ChatHistoryView {
         // Keep the last message visible while Markdown, images and the viewport resize.
         list.set_follow_mode(gpui::FollowMode::Tail);
         let view = cx.weak_entity();
+        let measurement_view = view.clone();
+        list.set_item_measurement_readiness(move |index, cx| {
+            let Some(view) = measurement_view.upgrade() else {
+                return true;
+            };
+            let view = view.read(cx);
+            let Some(row) = view.rows.get(index) else {
+                return true;
+            };
+            match row {
+                ReaderRow::Work(_) => true,
+                ReaderRow::Message(source) | ReaderRow::Step(source) => {
+                    view.messages.get(*source).is_none_or(|entry| {
+                        entry
+                            .markdown
+                            .iter()
+                            .flatten()
+                            .all(|markdown| !markdown.read(cx).has_pending_render())
+                    })
+                }
+            }
+        });
         list.set_scroll_handler(move |event, _, cx| {
             if event.visible_range.start <= 1 && event.is_scrolled && !event.is_following_tail {
                 let view = view.clone();
@@ -3603,6 +3785,8 @@ impl ChatHistoryView {
             busy: false,
             fork_next: false,
             approvals: VecDeque::new(),
+            question_fields: HashMap::new(),
+            goal: None,
             controls: None,
             watch: Task::ready(()),
             load: Task::ready(()),
@@ -3699,10 +3883,15 @@ impl ChatHistoryView {
             .iter()
             .map(|entry| &entry.message)
             .collect::<Vec<_>>();
-        self.rows.clear();
+        let previous = std::mem::take(&mut self.rows);
         for part in store::conversation_parts(&messages) {
             match part {
-                ConversationPart::Message(index) => self.rows.push(ReaderRow::Message(index)),
+                ConversationPart::Message(index) => {
+                    // In-progress compaction is shown by the live status above the composer.
+                    if messages[index].role != "compaction" || messages[index].tool_finished {
+                        self.rows.push(ReaderRow::Message(index));
+                    }
+                }
                 ConversationPart::Work(range) => {
                     let expanded = self
                         .expanded_work
@@ -3717,7 +3906,39 @@ impl ChatHistoryView {
                 }
             }
         }
-        self.list.reset(self.rows.len());
+        let prefix = previous
+            .iter()
+            .zip(&self.rows)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = previous[prefix..]
+            .iter()
+            .rev()
+            .zip(self.rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        if prefix + suffix != previous.len() || previous.len() != self.rows.len() {
+            self.list.splice(
+                prefix..previous.len() - suffix,
+                self.rows.len() - prefix - suffix,
+            );
+        }
+        for (index, row) in self.rows.iter().enumerate() {
+            let dirty = match row {
+                ReaderRow::Message(source) | ReaderRow::Step(source) => {
+                    self.messages[*source].dirty
+                }
+                ReaderRow::Work(range) => {
+                    self.messages[range.clone()].iter().any(|entry| entry.dirty)
+                }
+            };
+            if dirty {
+                self.list.remeasure_items(index..index + 1);
+            }
+        }
+        for entry in &mut self.messages {
+            entry.dirty = false;
+        }
     }
     fn anchor(&self) -> (usize, gpui::ListOffset) {
         let offset = self.list.logical_scroll_top();
@@ -3838,8 +4059,17 @@ impl ChatHistoryView {
                             });
                         }
                         let new_start = transcript.total.saturating_sub(transcript.messages.len());
+                        let mut failed = Vec::new();
                         let mut previous = std::mem::take(&mut this.messages)
                             .into_iter()
+                            .filter_map(|entry| {
+                                if matches!(entry.delivery, Some(MessageDelivery::Failed(_))) {
+                                    failed.push(entry);
+                                    None
+                                } else {
+                                    Some(entry)
+                                }
+                            })
                             .map(Some)
                             .collect::<Vec<_>>();
                         this.running = transcript.running
@@ -3867,18 +4097,39 @@ impl ChatHistoryView {
                                     if old.message == message {
                                         return old;
                                     }
-                                    if !message.tool_id.is_empty()
-                                        && message.tool_id == old.message.tool_id
+                                    if (!message.tool_id.is_empty()
+                                        && message.tool_id == old.message.tool_id)
+                                        || (!message.timestamp.is_empty()
+                                            && message.timestamp == old.message.timestamp
+                                            && message.role == old.message.role)
                                     {
-                                        old.message = message;
-                                        old.markdown = None;
-                                        old.images = None;
+                                        old.update_message(message, cx);
                                         return old;
                                     }
                                 }
                                 DisplayMessage::new(message)
                             })
                             .collect();
+                        for entry in failed {
+                            let timestamp =
+                                DateTime::parse_from_rfc3339(&entry.message.timestamp).ok();
+                            let position = this
+                                .messages
+                                .iter()
+                                .position(|existing| {
+                                    timestamp
+                                        .zip(
+                                            DateTime::parse_from_rfc3339(
+                                                &existing.message.timestamp,
+                                            )
+                                            .ok(),
+                                        )
+                                        .is_some_and(|(failed, existing)| existing > failed)
+                                })
+                                .unwrap_or(this.messages.len());
+                            this.messages.insert(position, entry);
+                            this.total += 1;
+                        }
                         this.rebuild_rows();
                         if at_end && !this.loading_older {
                             this.list.scroll_to_end();
@@ -3924,6 +4175,33 @@ impl ChatHistoryView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).text(cx).trim().to_owned();
+        let goal_command = match runtime::GoalCommand::parse(&prompt) {
+            Ok(command) => command,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if goal_command.is_some() && self.chat.provider != Provider::Codex {
+            self.error = Some("/goal is available for Codex conversations.".into());
+            cx.notify();
+            return;
+        }
+        if self.busy
+            && let Some(command) = goal_command.clone()
+        {
+            if let Some(controls) = &self.controls {
+                match controls.send(Control::Goal(command)) {
+                    Ok(()) => self
+                        .composer
+                        .update(cx, |editor, cx| editor.set_text("", window, cx)),
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            cx.notify();
+            return;
+        }
         if self.busy
             || self.loading
             || self.pasting
@@ -3949,7 +4227,7 @@ impl ChatHistoryView {
         );
         self.fork_next = false;
         self.controls = Some(run.commands.clone());
-        self.messages.push(DisplayMessage::new(Message {
+        let pending_message = Message {
             role: "user".into(),
             text: prompt.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -3968,15 +4246,37 @@ impl ChatHistoryView {
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
             ..Default::default()
-        }));
-        self.total += 1;
+        };
         let sent_attachments = std::mem::take(&mut self.options.attachments);
+        let outgoing_index = if goal_command.is_none()
+            && !prompt.starts_with("<send_user_message_question_reply>")
+        {
+            let existing = self.messages.iter().rposition(|entry| {
+                matches!(entry.delivery, Some(MessageDelivery::Failed(_)))
+                    && entry.message.text == pending_message.text
+                    && entry.message.attachments == pending_message.attachments
+                    && entry.message.files == pending_message.files
+            });
+            let mut entry = DisplayMessage::new(pending_message.clone());
+            entry.delivery = Some(MessageDelivery::Sending);
+            if let Some(index) = existing {
+                self.messages.remove(index);
+            } else {
+                self.total += 1;
+            }
+            let index = self.messages.len();
+            self.messages.push(entry);
+            Some(index)
+        } else {
+            None
+        };
         self.rebuild_rows();
         self.list.scroll_to_end();
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.agent = cx.spawn_in(window, async move |this, cx| {
             let mut indices = HashMap::<String, usize>::new();
+            let mut pending_message = Some(pending_message);
             loop {
                 let events = run.events.try_iter().take(256).collect::<Vec<_>>();
                 if !events.is_empty() {
@@ -3989,6 +4289,37 @@ impl ChatHistoryView {
                             let (anchor, offset) = this.anchor();
                             for event in events {
                                 match event {
+                                    runtime::Event::Accepted => {
+                                        if let Some(entry) = outgoing_index.and_then(|index| this.messages.get_mut(index)) {
+                                            entry.delivery = None;
+                                        }
+                                        if let Some(message) = pending_message.take() {
+                                            if goal_command.is_none() {
+                                                if let Some(reply) = message.text.strip_prefix("<send_user_message_question_reply>") {
+                                                    let reply = reply.split("</send_user_message_question_reply>").next().unwrap_or_default();
+                                                    match serde_json::from_str::<Vec<serde_json::Value>>(reply) {
+                                                        Ok(replies) => for reply in replies {
+                                                            if let Some(id) = reply["questionItemId"].as_str()
+                                                                && let Ok(id) = serde_json::from_str::<Vec<serde_json::Value>>(id)
+                                                                && let (Some(call), Some(index)) = (id.get(1).and_then(|id| id.as_str()), id.get(2).and_then(|index| index.as_u64()))
+                                                                && let Some(entry) = this.messages.iter_mut().find(|entry| entry.message.role == "question" && entry.message.tool_id == call)
+                                                            {
+                                                                entry.message.question_answers.insert(index.to_string(), reply["answer"].as_str().unwrap_or_default().into());
+                                                                entry.dirty = true;
+                                                            }
+                                                        },
+                                                        Err(error) => log::warn!("Cannot display question reply: {error}"),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    runtime::Event::Goal(goal) => {
+                                        this.goal = goal;
+                                    }
+                                    runtime::Event::CommandError(error) => {
+                                        this.error = Some(error);
+                                    }
                                     runtime::Event::Metrics(metrics) => {
                                         if metrics.model.is_some() {
                                             this.metrics.model = metrics.model;
@@ -4039,9 +4370,7 @@ impl ChatHistoryView {
                                     runtime::Event::Item(id, message) => {
                                         if let Some(index) = indices.get(&id).copied() {
                                             if let Some(entry) = this.messages.get_mut(index) {
-                                                entry.message = message;
-                                                entry.markdown = None;
-                                                entry.images = None;
+                                                entry.update_message(message, cx);
                                             }
                                         } else {
                                             indices.insert(id, this.messages.len());
@@ -4071,10 +4400,17 @@ impl ChatHistoryView {
                                             })
                                             .collect();
                                         this.approvals
-                                            .push_back(PendingApproval { request, fields });
+                                            .push_back(PendingApproval { request, fields, details_expanded: false });
                                     }
                                     runtime::Event::Finished(error) => {
-                                        if error.as_deref() != Some("Stopped") {
+                                        if error.is_none()
+                                            && let Some(entry) = outgoing_index.and_then(|index| this.messages.get_mut(index))
+                                        {
+                                            entry.delivery = None;
+                                        }
+                                        if goal_command.as_ref().is_none_or(runtime::GoalCommand::starts_work)
+                                            && error.as_deref() != Some("Stopped")
+                                        {
                                             cx.emit(ChatAttentionEvent {
                                                 chat: this.chat.clone(),
                                                 caption: if error.is_some() {
@@ -4092,9 +4428,11 @@ impl ChatHistoryView {
                                                 entry.message.tool_error = true;
                                                 entry.message.text =
                                                     "Context compaction interrupted".into();
+                                                entry.dirty = true;
                                             }
                                         }
-                                        if error.is_none()
+                                        if goal_command.as_ref().is_none_or(runtime::GoalCommand::starts_work)
+                                            && error.is_none()
                                             && !(window.is_window_active()
                                                 && this.focus.contains_focused(window, cx))
                                         {
@@ -4106,11 +4444,23 @@ impl ChatHistoryView {
                                         this.approvals.clear();
                                         this.chat.modified = SystemTime::now();
                                         if let Some(error) = error {
-                                            if this.options.attachments.is_empty() {
+                                            let failed_bubble = pending_message.is_some() && outgoing_index.is_some();
+                                            if failed_bubble {
+                                                if let Some(entry) = outgoing_index.and_then(|index| this.messages.get_mut(index)) {
+                                                    entry.delivery = Some(MessageDelivery::Failed(error.clone()));
+                                                }
+                                            }
+                                            if !failed_bubble && pending_message.is_some()
+                                                && this.options.attachments.is_empty()
+                                            {
                                                 this.options.attachments = sent_attachments.clone();
                                             }
-                                            this.error = Some(error);
-                                            if this.composer.read(cx).text(cx).is_empty() {
+                                            if !failed_bubble {
+                                                this.error = Some(error);
+                                            }
+                                            if !failed_bubble && pending_message.is_some()
+                                                && this.composer.read(cx).text(cx).is_empty()
+                                            {
                                                 this.composer.update(cx, |editor, cx| {
                                                     editor.set_text(prompt.clone(), window, cx)
                                                 });
@@ -4124,9 +4474,7 @@ impl ChatHistoryView {
                                 }
                             }
                             this.rebuild_rows();
-                            if at_end {
-                                this.list.scroll_to_end();
-                            } else {
+                            if !at_end {
                                 this.restore_anchor(anchor, offset);
                             }
                             cx.notify();
@@ -4149,6 +4497,41 @@ impl ChatHistoryView {
         });
         cx.notify();
     }
+    fn retry_outgoing(
+        &mut self,
+        index: usize,
+        fork: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.loading || self.pasting {
+            return;
+        }
+        let Some(entry) = self.messages.get(index) else {
+            return;
+        };
+        if !matches!(entry.delivery, Some(MessageDelivery::Failed(_))) {
+            return;
+        }
+        let message = entry.message.clone();
+        let draft = self.composer.read(cx).text(cx);
+        let attachments = std::mem::take(&mut self.options.attachments);
+        self.options.attachments = message
+            .attachments
+            .iter()
+            .chain(&message.files)
+            .map(PathBuf::from)
+            .collect();
+        self.composer
+            .update(cx, |editor, cx| editor.set_text(message.text, window, cx));
+        self.fork_next = fork;
+        self.send(window, cx);
+        self.options.attachments = attachments;
+        self.composer
+            .update(cx, |editor, cx| editor.set_text(draft, window, cx));
+        cx.notify();
+    }
+
     fn answer(&mut self, allow: bool, cx: &mut Context<Self>) {
         let Some(pending) = self.approvals.front() else {
             return;
@@ -4176,6 +4559,223 @@ impl ChatHistoryView {
             }
         }
         cx.notify();
+    }
+
+    fn question_inputs(
+        questions: &[runtime::Question],
+        fields: &[Entity<Editor>],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_3()
+            .children(questions.iter().zip(fields).enumerate().map(
+                |(question_index, (question, field))| {
+                    let selected = field.read(cx).text(cx);
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(Label::new(question.text.clone()).weight(FontWeight::SEMIBOLD))
+                        .children(question.options.iter().enumerate().map(|(index, label)| {
+                            let field = field.clone();
+                            let label = label.clone();
+                            let is_selected = selected == label;
+                            ButtonLike::new(SharedString::from(format!(
+                                "question-{question_index}-option-{index}"
+                            )))
+                            .full_width()
+                            .size(ButtonSize::Large)
+                            .auto_height()
+                            .style(ButtonStyle::OutlinedGhost)
+                            .selected_style(ButtonStyle::Filled)
+                            .toggle_state(is_selected)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .py_2()
+                                    .gap_2()
+                                    .text_left()
+                                    .child(
+                                        h_flex()
+                                            .size(px(16.))
+                                            .flex_none()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(cx.theme().colors().text_muted)
+                                            .when(is_selected, |this| {
+                                                this.child(
+                                                    div()
+                                                        .size(px(8.))
+                                                        .rounded_full()
+                                                        .bg(cx.theme().colors().text),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div().flex_1().min_w_0().child(Label::new(label.clone())),
+                                    ),
+                            )
+                            .on_click(cx.listener(
+                                move |_, _, window, cx| {
+                                    field.update(cx, |field, cx| {
+                                        field.set_text(label.clone(), window, cx)
+                                    });
+                                    cx.notify();
+                                },
+                            ))
+                        }))
+                        .child(
+                            div()
+                                .p_2()
+                                .rounded_md()
+                                .bg(cx.theme().colors().editor_background)
+                                .child(field.clone()),
+                        )
+                },
+            ))
+            .into_any_element()
+    }
+
+    fn question_card(
+        &mut self,
+        message: Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let questions = runtime::message_questions(&message);
+        let fields = self
+            .question_fields
+            .entry(message.tool_id.clone())
+            .or_insert_with(|| {
+                questions
+                    .iter()
+                    .map(|question| {
+                        cx.new(|cx| {
+                            let mut editor = Editor::auto_height(1, 4, window, cx);
+                            editor.set_placeholder_text("Or write your own response…", window, cx);
+                            if let Some(answer) = message.question_answers.get(&question.id) {
+                                editor.set_text(answer.clone(), window, cx);
+                            }
+                            editor
+                        })
+                    })
+                    .collect()
+            })
+            .clone();
+        let answered = !questions.is_empty()
+            && questions
+                .iter()
+                .all(|question| message.question_answers.contains_key(&question.id));
+        let id = message.tool_id.clone();
+        let skip_id = id.clone();
+        v_flex()
+            .w_full()
+            .gap_3()
+            .p_4()
+            .rounded_lg()
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                Label::new(if answered {
+                    "Question · Answered"
+                } else {
+                    "Question"
+                })
+                .color(Color::Muted),
+            )
+            .when(answered, |this| {
+                this.children(questions.iter().map(|question| {
+                    v_flex()
+                        .gap_1()
+                        .child(Label::new(question.text.clone()))
+                        .child(
+                            Label::new(
+                                message
+                                    .question_answers
+                                    .get(&question.id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                            .color(Color::Muted),
+                        )
+                }))
+            })
+            .when(!answered, |this| {
+                this.child(Self::question_inputs(&questions, &fields, cx))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("skip-history-question", "Skip")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.answer_history_question(&skip_id, true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("answer-history-question", "Send")
+                                    .disabled(self.busy)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.answer_history_question(&id, false, window, cx)
+                                    })),
+                            ),
+                    )
+            })
+            .into_any_element()
+    }
+
+    fn answer_history_question(
+        &mut self,
+        id: &str,
+        skip: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let Some(entry) = self
+            .messages
+            .iter()
+            .find(|entry| entry.message.tool_id == id && entry.message.role == "question")
+        else {
+            return;
+        };
+        let message = entry.message.clone();
+        let Some(fields) = self.question_fields.get(id) else {
+            return;
+        };
+        let answers = runtime::message_questions(&message)
+            .iter()
+            .zip(fields)
+            .map(|(question, field)| {
+                (
+                    question.id.clone(),
+                    if skip {
+                        "Skipped".into()
+                    } else {
+                        field.read(cx).text(cx).trim().to_owned()
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        if answers.values().any(String::is_empty) {
+            self.error = Some("Choose an option or write an answer.".into());
+            cx.notify();
+            return;
+        }
+        if !self.composer.read(cx).text(cx).trim().is_empty() {
+            self.error =
+                Some("Send or clear your current draft before answering this question.".into());
+            cx.notify();
+            return;
+        }
+        let reply = runtime::history_question_reply(&message, &answers);
+        self.composer
+            .update(cx, |editor, cx| editor.set_text(reply, window, cx));
+        self.send(window, cx);
     }
 
     fn load_options(&mut self, cx: &mut Context<Self>) {
@@ -4328,6 +4928,13 @@ impl ChatHistoryView {
     fn working_label(&self) -> String {
         if !self.approvals.is_empty() {
             return "Waiting for you".into();
+        }
+        if self
+            .messages
+            .iter()
+            .any(|entry| matches!(entry.delivery, Some(MessageDelivery::Sending)))
+        {
+            return "Sending…".into();
         }
         self.messages
             .iter()
@@ -4748,6 +5355,193 @@ impl ChatHistoryView {
             })
     }
 
+    fn open_chat_file(
+        &mut self,
+        path: PathBuf,
+        in_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let check_path = path.clone();
+        let check = cx.background_spawn(async move { std::fs::metadata(check_path) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = check.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(metadata) if metadata.is_file() => {
+                    this.open_existing_chat_file(path, in_editor, window, cx);
+                }
+                result => {
+                    let reason = result
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "This path is not a file".into());
+                    this.error = Some(format!("Cannot open {}: {reason}", path.display()));
+                    cx.notify();
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
+    fn open_existing_chat_file(
+        &mut self,
+        path: PathBuf,
+        in_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !in_editor {
+            cx.open_with_system(&path);
+            return;
+        }
+        let Some(multi) = window.root::<workspace::MultiWorkspace>().flatten() else {
+            return;
+        };
+        let workspace = multi.read(cx).workspace().clone();
+        let task = workspace.update(cx, |workspace, cx| {
+            workspace.open_paths(
+                vec![path],
+                workspace::OpenOptions::default(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            for result in task.await.into_iter().flatten() {
+                if let Err(error) = result {
+                    this.update(cx, |this, cx| {
+                        this.error = Some(format!("Cannot open file: {error}"));
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn render_file_card(&self, source: String, id: String, cx: &mut Context<Self>) -> AnyElement {
+        let path = PathBuf::from(&source);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            PathBuf::from(&self.chat.cwd).join(path)
+        };
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let kind = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| "FILE".into());
+        let parent = path
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let menu_path = path.clone();
+        let menu_view = cx.weak_entity();
+        let open_view = cx.weak_entity();
+        let tooltip = path.to_string_lossy().into_owned();
+        let card = h_flex()
+            .id(SharedString::from(id.clone()))
+            .w(px(360.))
+            .max_w_full()
+            .min_w_0()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().panel_background)
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(tooltip))
+            .child(
+                Icon::new(IconName::File)
+                    .size(IconSize::Medium)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(Label::new(name).single_line().truncate())
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(Label::new(kind).size(LabelSize::XSmall).color(Color::Muted))
+                            .child(
+                                Label::new(parent)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line()
+                                    .truncate(),
+                            ),
+                    ),
+            )
+            .child(
+                Icon::new(IconName::ArrowUpRight)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(move |_, window, cx| {
+                open_view
+                    .update(cx, |this, cx| {
+                        this.open_chat_file(path.clone(), false, window, cx)
+                    })
+                    .log_err();
+            });
+        ui::right_click_menu(SharedString::from(format!("{id}-menu")))
+            .trigger(move |_, _, _| card)
+            .menu(move |window, cx| {
+                let open = menu_path.clone();
+                let editor = menu_path.clone();
+                let reveal = menu_path.clone();
+                let copy = menu_path.to_string_lossy().into_owned();
+                let name = menu_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let open_view = menu_view.clone();
+                let editor_view = menu_view.clone();
+                ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.entry("Open", None, move |window, cx| {
+                        open_view
+                            .update(cx, |this, cx| {
+                                this.open_chat_file(open.clone(), false, window, cx)
+                            })
+                            .log_err();
+                    })
+                    .entry("Open in Zed", None, move |window, cx| {
+                        editor_view
+                            .update(cx, |this, cx| {
+                                this.open_chat_file(editor.clone(), true, window, cx)
+                            })
+                            .log_err();
+                    })
+                    .entry("Show in File Explorer", None, move |_, cx| {
+                        cx.reveal_path(&reveal)
+                    })
+                    .separator()
+                    .entry("Copy path", None, move |_, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
+                    })
+                    .entry("Copy file name", None, move |_, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(name.clone()))
+                    })
+                })
+            })
+            .into_any_element()
+    }
+
     fn render_body(
         &mut self,
         index: usize,
@@ -4757,21 +5551,24 @@ impl ChatHistoryView {
         let Some(entry) = self.messages.get_mut(index) else {
             return div().into_any_element();
         };
-        let markdown = entry
-            .markdown
-            .get_or_insert_with(|| {
-                let text = if entry.message.role == "activity" {
-                    format!(
-                        "```\n{}\n```\n\n```\n{}\n```",
-                        entry.message.tool_input,
-                        entry.message.text.chars().take(16000).collect::<String>()
-                    )
-                } else {
-                    entry.message.text.clone()
-                };
-                cx.new(|cx| Markdown::new(text.into(), None, None, cx))
+        if entry.message.role == "question" {
+            let message = entry.message.clone();
+            return self.question_card(message, window, cx);
+        }
+        let body_parts = entry
+            .body_parts
+            .iter()
+            .zip(&mut entry.markdown)
+            .map(|(part, markdown)| {
+                if let store::MessageBodyPart::Text(source) = part {
+                    if markdown.is_none() {
+                        *markdown =
+                            Some(cx.new(|cx| Markdown::new(source.clone().into(), None, None, cx)));
+                    }
+                }
+                (part.clone(), markdown.clone())
             })
-            .clone();
+            .collect::<Vec<_>>();
         let images = entry
             .images
             .get_or_insert_with(|| {
@@ -4807,8 +5604,6 @@ impl ChatHistoryView {
             })
             .clone();
         let user = entry.message.role == "user";
-        let text = entry.message.text.clone();
-        let has_text = !text.trim().is_empty();
         let files = entry.message.files.clone();
         v_flex()
             .w_full()
@@ -4824,22 +5619,7 @@ impl ChatHistoryView {
                         .gap_1()
                         .when(user, |this| this.justify_end())
                         .children(files.into_iter().enumerate().map(|(file_index, path)| {
-                            let name = PathBuf::from(&path)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned();
-                            h_flex()
-                                .id(SharedString::from(format!("file-{index}-{file_index}")))
-                                .max_w(px(280.))
-                                .min_w_0()
-                                .gap_2()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().colors().panel_background)
-                                .tooltip(Tooltip::text(path))
-                                .child(Icon::new(IconName::File).size(IconSize::Small))
-                                .child(Label::new(name).single_line().truncate())
+                            self.render_file_card(path, format!("file-{index}-{file_index}"), cx)
                         })),
                 )
             })
@@ -4891,32 +5671,44 @@ impl ChatHistoryView {
                         })),
                 )
             })
-            .when(user && has_text, |this| {
-                this.child(
-                    div()
-                        .max_w(px(560.))
-                        .min_w_0()
-                        .px_4()
-                        .py_3()
-                        .rounded_xl()
-                        .bg(cx.theme().colors().panel_background)
-                        .child(text),
-                )
-            })
-            .when(!user && has_text, |this| {
-                this.child(MarkdownElement::new(
-                    markdown,
-                    MarkdownStyle {
-                        base_text_style: window.text_style(),
-                        selection_background_color: cx
-                            .theme()
-                            .colors()
-                            .element_selection_background,
-                        syntax: cx.theme().syntax().clone(),
-                        ..Default::default()
+            .children(
+                body_parts.into_iter().enumerate().map(
+                    |(part_index, (part, markdown))| match part {
+                        store::MessageBodyPart::File(path) => self.render_file_card(
+                            path,
+                            format!("citation-{index}-{part_index}"),
+                            cx,
+                        ),
+                        store::MessageBodyPart::Text(text) if user => div()
+                            .max_w(px(560.))
+                            .min_w_0()
+                            .px_4()
+                            .py_3()
+                            .rounded_xl()
+                            .bg(cx.theme().colors().panel_background)
+                            .child(text)
+                            .into_any_element(),
+                        store::MessageBodyPart::Text(_) => div()
+                            .w_full()
+                            .min_w_0()
+                            .children(markdown.map(|markdown| {
+                                MarkdownElement::new(
+                                    markdown,
+                                    MarkdownStyle {
+                                        base_text_style: window.text_style(),
+                                        selection_background_color: cx
+                                            .theme()
+                                            .colors()
+                                            .element_selection_background,
+                                        syntax: cx.theme().syntax().clone(),
+                                        ..Default::default()
+                                    },
+                                )
+                            }))
+                            .into_any_element(),
                     },
-                ))
-            })
+                ),
+            )
             .into_any_element()
     }
     fn render_row(
@@ -4929,63 +5721,65 @@ impl ChatHistoryView {
             return div().into_any_element();
         };
         let start = self.start_index();
-        let content =
-            match row {
-                ReaderRow::Message(source) => {
-                    let message = &self.messages[source].message;
-                    if message.role == "compaction" {
-                        let active = !message.tool_finished && (self.busy || self.running);
-                        return h_flex()
-                            .w_full()
-                            .px_10()
-                            .justify_center()
-                            .child(
-                                h_flex()
-                                    .max_w(px(800.))
-                                    .w_full()
-                                    .relative()
-                                    .py_3()
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left(px(-24.))
-                                            .when(active, |this| this.child(SpinnerLabel::new()))
-                                            .when(!active, |this| {
-                                                this.child(
-                                                    Icon::new(IconName::Check)
-                                                        .size(IconSize::Small)
-                                                        .color(Color::Muted),
-                                                )
-                                            }),
-                                    )
-                                    .child(div().flex_1().min_w_0().whitespace_normal().child(
+        let content = match row {
+            ReaderRow::Message(source) => {
+                let message = &self.messages[source].message;
+                if message.role == "compaction" {
+                    let active = !message.tool_finished && (self.busy || self.running);
+                    return h_flex()
+                        .w_full()
+                        .px_10()
+                        .justify_center()
+                        .child(
+                            h_flex()
+                                .max_w(px(800.))
+                                .w_full()
+                                .relative()
+                                .py_3()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(-24.))
+                                        .when(active, |this| this.child(SpinnerLabel::new()))
+                                        .when(!active, |this| {
+                                            this.child(
+                                                Icon::new(IconName::Check)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Muted),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div().flex_1().min_w_0().whitespace_normal().child(
                                         Label::new(message.text.clone()).color(Color::Muted),
-                                    )),
-                            )
-                            .into_any_element();
-                    }
-                    let user = message.role == "user";
-                    let copy = message.text.clone();
-                    let group: SharedString = format!("chat-message-{source}").into();
-                    let actions = div()
-                        .absolute()
-                        .left(px(-24.))
-                        .top_0()
-                        .w(px(24.))
-                        .visible_on_hover(group.clone())
-                        .when(!copy.is_empty(), |this| {
-                            this.child(
-                                IconButton::new(("copy", index), IconName::Copy)
-                                    .tooltip(Tooltip::text("Copy message"))
-                                    .on_click(move |_, _, cx| {
-                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                            copy.clone(),
-                                        ))
-                                    }),
-                            )
-                        });
-                    let body = self.render_body(source, window, cx);
-                    h_flex()
+                                    ),
+                                ),
+                        )
+                        .into_any_element();
+                }
+                let user = message.role == "user";
+                let delivery = self.messages[source].delivery.clone();
+                let copy = message.text.clone();
+                let group: SharedString = format!("chat-message-{source}").into();
+                let actions = div()
+                    .absolute()
+                    .left(px(-24.))
+                    .top_0()
+                    .w(px(24.))
+                    .visible_on_hover(group.clone())
+                    .when(!copy.is_empty(), |this| {
+                        this.child(
+                            IconButton::new(("copy", index), IconName::Copy)
+                                .tooltip(Tooltip::text("Copy message"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy.clone(),
+                                    ))
+                                }),
+                        )
+                    });
+                let body = self.render_body(source, window, cx);
+                h_flex()
                         .w_full()
                         .py_3()
                         .when(user, |this| this.justify_end())
@@ -4998,161 +5792,190 @@ impl ChatHistoryView {
                                 .relative()
                                 .items_start()
                                 .child(actions)
+                                .when_some(delivery, |this, delivery| {
+                                    this.child(div().absolute().right(px(-28.)).top_2().w(px(24.)).child(match delivery {
+                                        MessageDelivery::Sending => div().into_any_element(),
+                                        MessageDelivery::Failed(error) => {
+                                            let view = cx.weak_entity();
+                                            let retry_view = view.clone();
+                                            let copy_view = view.clone();
+                                            let conflict = error == runtime::WRITER_CONFLICT;
+                                            PopoverMenu::new(("failed-message", source))
+                                                .trigger(IconButton::new(("failed-message-button", source), IconName::Warning)
+                                                    .icon_color(Color::Error)
+                                                    .tooltip(Tooltip::text(format!("Not sent: {error}"))))
+                                                .menu(move |window, cx| {
+                                                    let retry = retry_view.clone();
+                                                    let copy = copy_view.clone();
+                                                    Some(ContextMenu::build(window, cx, |menu, _, _| {
+                                                        menu.entry("Retry sending", None, move |window, cx| {
+                                                            retry.update(cx, |this, cx| this.retry_outgoing(source, false, window, cx)).log_err();
+                                                        }).when(conflict, |menu| menu.entry("Send in a new copy", None, move |window, cx| {
+                                                            copy.update(cx, |this, cx| this.retry_outgoing(source, true, window, cx)).log_err();
+                                                        }))
+                                                    }))
+                                                }).into_any_element()
+                                        }
+                                    }))
+                                })
                                 .child(div().flex_1().min_w_0().overflow_hidden().child(body)),
                         )
                         .into_any_element()
-                }
-                ReaderRow::Work(range) => {
-                    let expanded = self
-                        .expanded_work
-                        .iter()
-                        .any(|anchor| (start + range.start..start + range.end).contains(anchor));
-                    let active = false;
-                    let failed = self.messages[range.clone()]
-                        .iter()
-                        .filter(|entry| entry.message.tool_error)
-                        .count();
-                    let steps = self.messages[range.clone()]
-                        .iter()
-                        .filter(|entry| entry.message.role == "activity")
-                        .count();
-                    let label = if failed > 0 {
-                        format!("Activity · {steps} steps · {failed} failed")
-                    } else {
-                        format!("Activity · {steps} steps")
-                    };
-                    let toggle = range.clone();
-                    v_flex()
-                        .w_full()
-                        .py_2()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .id(("work-group", index))
-                                .relative()
-                                .w_full()
-                                .py_1()
-                                .gap_2()
-                                .cursor_pointer()
-                                .when(!active || !self.approvals.is_empty(), |this| {
-                                    this.child(
-                                        div().absolute().left(px(-24.)).child(
-                                            Icon::new(if failed > 0 {
-                                                IconName::Warning
-                                            } else {
-                                                IconName::Check
-                                            })
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                        ),
-                                    )
-                                })
-                                .child(Label::new(label).color(Color::Muted))
-                                .child(
-                                    Icon::new(if expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    })
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let (anchor, offset) = this.anchor();
-                                    let first = start + toggle.start;
-                                    let end = start + toggle.end;
-                                    if expanded {
-                                        this.expanded_work
-                                            .retain(|anchor| !(first..end).contains(anchor));
-                                    } else {
-                                        this.expanded_work.insert(first);
-                                    }
-                                    this.rebuild_rows();
-                                    this.restore_anchor(anchor, offset);
-                                    cx.notify();
-                                })),
-                        )
-                        .into_any_element()
-                }
-                ReaderRow::Step(source) => {
-                    let message = &self.messages[source].message;
-                    let tool = message.role == "activity";
-                    let expanded = self.messages[source].expanded;
-                    let active = self.running
-                        && !message.tool_finished
-                        && tool
-                        && !self.messages[source + 1..]
-                            .iter()
-                            .any(|entry| entry.message.role == "user");
-                    let label = if tool {
-                        store::tool_label(message)
-                    } else {
-                        message.text.clone()
-                    };
-                    let failed = message.tool_error;
-                    let mut step =
-                        v_flex().w_full().min_w_0().pl_3().gap_1().child(
-                            h_flex()
-                                .id(("work-step", index))
-                                .w_full()
-                                .py_1()
-                                .gap_2()
-                                .when(tool, |this| this.cursor_pointer())
-                                .when(active, |this| this.child(SpinnerLabel::new()))
-                                .when(!active && tool, |this| {
-                                    this.child(
-                                        Icon::new(if failed {
+            }
+            ReaderRow::Work(range) => {
+                let expanded = self
+                    .expanded_work
+                    .iter()
+                    .any(|anchor| (start + range.start..start + range.end).contains(anchor));
+                let active = false;
+                let failed = self.messages[range.clone()]
+                    .iter()
+                    .filter(|entry| entry.message.tool_error)
+                    .count();
+                let steps = self.messages[range.clone()]
+                    .iter()
+                    .filter(|entry| entry.message.role == "activity")
+                    .count();
+                let label = if failed > 0 {
+                    format!("Activity · {steps} steps · {failed} failed")
+                } else {
+                    format!("Activity · {steps} steps")
+                };
+                let toggle = range.clone();
+                v_flex()
+                    .w_full()
+                    .py_2()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .id(("work-group", index))
+                            .relative()
+                            .w_full()
+                            .py_1()
+                            .gap_2()
+                            .cursor_pointer()
+                            .when(!active || !self.approvals.is_empty(), |this| {
+                                this.child(
+                                    div().absolute().left(px(-24.)).child(
+                                        Icon::new(if failed > 0 {
                                             IconName::Warning
                                         } else {
                                             IconName::Check
                                         })
                                         .size(IconSize::Small)
-                                        .color(if failed { Color::Error } else { Color::Muted }),
-                                    )
-                                })
-                                .child(div().flex_1().min_w_0().whitespace_normal().child(
-                                    Label::new(label).size(LabelSize::Small).color(if failed {
-                                        Color::Error
-                                    } else {
-                                        Color::Muted
-                                    }),
-                                ))
-                                .when(tool, |this| {
-                                    this.child(
-                                        Icon::new(if expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .size(IconSize::Small)
                                         .color(Color::Muted),
-                                    )
+                                    ),
+                                )
+                            })
+                            .child(Label::new(label).color(Color::Muted))
+                            .child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
                                 })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if tool {
-                                        if let Some(entry) = this.messages.get_mut(source) {
-                                            entry.expanded = !entry.expanded;
-                                        }
-                                        this.list.splice(index..index + 1, 1);
-                                        cx.notify();
-                                    }
-                                })),
-                        );
-                    if tool && expanded {
-                        step = step.child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().colors().panel_background)
-                                .child(self.render_body(source, window, cx)),
-                        );
-                    }
-                    step.into_any_element()
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (anchor, offset) = this.anchor();
+                                let first = start + toggle.start;
+                                let end = start + toggle.end;
+                                if expanded {
+                                    this.expanded_work
+                                        .retain(|anchor| !(first..end).contains(anchor));
+                                } else {
+                                    this.expanded_work.insert(first);
+                                }
+                                this.rebuild_rows();
+                                this.restore_anchor(anchor, offset);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element()
+            }
+            ReaderRow::Step(source) => {
+                let message = &self.messages[source].message;
+                let tool = message.role == "activity";
+                let expanded = self.messages[source].expanded;
+                let active = self.running
+                    && !message.tool_finished
+                    && tool
+                    && !self.messages[source + 1..]
+                        .iter()
+                        .any(|entry| entry.message.role == "user");
+                let label = if tool {
+                    store::tool_label(message)
+                } else {
+                    message.text.clone()
+                };
+                let failed = message.tool_error;
+                let mut step = v_flex().w_full().min_w_0().pl_3().gap_1().child(
+                    h_flex()
+                        .id(("work-step", index))
+                        .w_full()
+                        .py_1()
+                        .gap_2()
+                        .when(tool, |this| this.cursor_pointer())
+                        .when(active, |this| this.child(SpinnerLabel::new()))
+                        .when(!active && tool, |this| {
+                            this.child(
+                                Icon::new(if failed {
+                                    IconName::Warning
+                                } else {
+                                    IconName::Check
+                                })
+                                .size(IconSize::Small)
+                                .color(if failed {
+                                    Color::Error
+                                } else {
+                                    Color::Muted
+                                }),
+                            )
+                        })
+                        .child(div().flex_1().min_w_0().whitespace_normal().child(
+                            Label::new(label).size(LabelSize::Small).color(if failed {
+                                Color::Error
+                            } else {
+                                Color::Muted
+                            }),
+                        ))
+                        .when(tool, |this| {
+                            this.child(
+                                Icon::new(if expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if tool {
+                                if let Some(entry) = this.messages.get_mut(source) {
+                                    entry.expanded = !entry.expanded;
+                                }
+                                this.list.remeasure_items(index..index + 1);
+                                cx.notify();
+                            }
+                        })),
+                );
+                if tool && expanded {
+                    step = step.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .p_2()
+                            .rounded_md()
+                            .bg(cx.theme().colors().panel_background)
+                            .child(self.render_body(source, window, cx)),
+                    );
                 }
-            };
+                step.into_any_element()
+            }
+        };
         h_flex()
             .w_full()
             .px_10()
@@ -5197,26 +6020,71 @@ impl Render for ChatHistoryView {
             v_flex()
                 .w_full()
                 .max_w(px(800.))
-                .gap_2()
+                .gap_3()
                 .p_3()
                 .rounded_md()
                 .bg(cx.theme().colors().panel_background)
                 .child(Label::new(pending.request.title.clone()).weight(FontWeight::SEMIBOLD))
-                .child(
-                    div()
-                        .id("agent-permission-detail")
-                        .max_h(px(160.))
-                        .overflow_y_scroll()
-                        .child(Label::new(pending.request.detail.clone()).size(LabelSize::Small)),
-                )
-                .children(pending.request.questions.iter().zip(&pending.fields).map(
-                    |(question, field)| {
-                        v_flex()
-                            .gap_1()
-                            .child(Label::new(question.text.clone()))
-                            .child(field.clone())
-                    },
-                ))
+                .when(pending.request.questions.is_empty(), |this| {
+                    this.when_some(pending.request.reason.clone(), |this, reason| {
+                        this.child(Label::new(reason))
+                    })
+                    .when_some(pending.request.command.clone(), |this, command| {
+                        this.child(
+                            div()
+                                .id("approval-command")
+                                .w_full()
+                                .max_h(px(120.))
+                                .overflow_y_scroll()
+                                .p_2()
+                                .rounded_md()
+                                .bg(cx.theme().colors().editor_background)
+                                .child(Label::new(command).size(LabelSize::Small)),
+                        )
+                    })
+                    .when_some(pending.request.directory.clone(), |this, directory| {
+                        this.child(
+                            Label::new(format!("Directory: {directory}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .child(
+                        h_flex().child(
+                            Button::new("toggle-approval-details", "Technical details")
+                                .start_icon(Icon::new(if pending.details_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(pending) = this.approvals.front_mut() {
+                                        pending.details_expanded = !pending.details_expanded;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .when(pending.details_expanded, |this| {
+                        this.child(
+                            div()
+                                .id("agent-permission-detail")
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
+                                .child(
+                                    Label::new(pending.request.detail.clone())
+                                        .size(LabelSize::Small),
+                                ),
+                        )
+                    })
+                })
+                .when(!pending.request.questions.is_empty(), |this| {
+                    this.child(Self::question_inputs(
+                        &pending.request.questions,
+                        &pending.fields,
+                        cx,
+                    ))
+                })
                 .child(
                     h_flex()
                         .gap_2()
@@ -5226,14 +6094,23 @@ impl Render for ChatHistoryView {
                                 if pending.fields.is_empty() {
                                     "Allow once"
                                 } else {
-                                    "Submit"
+                                    "Send"
                                 },
                             )
+                            .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(|this, _, _, cx| this.answer(true, cx))),
                         )
                         .child(
-                            Button::new("deny-agent", "Decline")
-                                .on_click(cx.listener(|this, _, _, cx| this.answer(false, cx))),
+                            Button::new(
+                                "deny-agent",
+                                if pending.fields.is_empty() {
+                                    "Decline"
+                                } else {
+                                    "Skip"
+                                },
+                            )
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, _, cx| this.answer(false, cx))),
                         ),
                 )
         });
@@ -5345,41 +6222,128 @@ impl Render for ChatHistoryView {
                         )
                     }),
             )
-            .when(self.busy || self.running, |this| {
-                this.child(
-                    h_flex().w_full().justify_center().px_10().py_1().child(
-                        h_flex()
-                            .w_full()
-                            .max_w(px(800.))
-                            .relative()
-                            .child(div().absolute().left(px(-24.)).child(SpinnerLabel::new()))
-                            .child(
-                                Label::new(self.working_label())
-                                    .single_line()
-                                    .truncate()
-                                    .color(Color::Muted),
-                            ),
-                    ),
-                )
-            })
             .when_some(self.error.clone(), |this, error| {
                 this.child(
-                    div()
-                        .px_4()
-                        .py_2()
-                        .child(Label::new(error).color(Color::Error)),
+                    h_flex()
+                        .w_full()
+                        .px_8()
+                        .pt_2()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .min_w_0()
+                                .max_w(px(800.))
+                                .p_3()
+                                .rounded_lg()
+                                .bg(cx.theme().colors().panel_background)
+                                .gap_3()
+                                .child(Label::new(error.clone()).color(Color::Error))
+                                .when(error == runtime::WRITER_CONFLICT, |this| {
+                                    this.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .flex_wrap()
+                                            .child(
+                                                Button::new("retry-chat-connection", "Retry")
+                                                    .style(ButtonStyle::Outlined)
+                                                    .disabled(self.busy)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.send(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(
+                                                    "fork-locked-chat",
+                                                    "Send in a new copy",
+                                                )
+                                                .style(ButtonStyle::Outlined)
+                                                .disabled(self.busy)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.fork_next = true;
+                                                    this.send(window, cx);
+                                                })),
+                                            ),
+                                    )
+                                }),
+                        ),
                 )
             })
             .when_some(approval, |this, approval| {
-                this.child(h_flex().px_4().py_2().justify_center().child(approval))
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_8()
+                        .pt_2()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .child(approval),
+                )
+            })
+            .when_some(self.goal.as_ref(), |this, goal| {
+                let usage = goal
+                    .token_budget
+                    .map(|budget| format!("{} / {budget} tokens", goal.tokens_used))
+                    .unwrap_or_else(|| format!("{} tokens", goal.tokens_used));
+                this.child(
+                    h_flex().px_8().py_2().justify_center().child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(800.))
+                            .gap_1()
+                            .child(
+                                Label::new(format!("Goal · {} · {usage}", goal.status))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(goal.objective.clone()).single_line().truncate()),
+                    ),
+                )
             })
             .child(
                 h_flex()
                     .w_full()
+                    .relative()
                     .px_8()
-                    .py_3()
+                    .pt(px(36.))
+                    .pb_3()
                     .justify_center()
                     .flex_shrink_0()
+                    .when(self.busy || self.running, |this| {
+                        this.child(
+                            h_flex()
+                                .absolute()
+                                .top(px(4.))
+                                .left_0()
+                                .right_0()
+                                .px_10()
+                                .h(px(24.))
+                                .justify_center()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .max_w(px(800.))
+                                        .relative()
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(-24.))
+                                                .child(SpinnerLabel::new()),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w_0().child(
+                                                Label::new(self.working_label())
+                                                    .single_line()
+                                                    .truncate()
+                                                    .color(Color::Muted),
+                                            ),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(
                         v_flex()
                             .w_full()

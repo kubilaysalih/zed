@@ -3,11 +3,14 @@ use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Mutex, OnceLock,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -23,9 +26,15 @@ pub struct Approval {
     pub request: Value,
     pub title: String,
     pub detail: String,
+    pub reason: Option<String>,
+    pub command: Option<String>,
+    pub directory: Option<String>,
     pub questions: Vec<Question>,
 }
 pub enum Event {
+    Accepted,
+    Goal(Option<Goal>),
+    CommandError(String),
     Metrics(SessionMetrics),
     Quota(Vec<QuotaWindow>),
     Session(Chat),
@@ -33,8 +42,190 @@ pub enum Event {
     Approval(Approval),
     Finished(Option<String>),
 }
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Goal {
+    pub objective: String,
+    pub status: String,
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalCommand {
+    Status,
+    Clear,
+    Pause,
+    Resume,
+    Set {
+        objective: String,
+        budget: Option<i64>,
+    },
+}
+
+impl GoalCommand {
+    pub fn starts_work(&self) -> bool {
+        matches!(self, Self::Set { .. } | Self::Resume)
+    }
+    pub fn parse(prompt: &str) -> Result<Option<Self>> {
+        let mut words = prompt.trim().splitn(2, char::is_whitespace);
+        if words.next() != Some("/goal") {
+            return Ok(None);
+        }
+        let argument = words.next().unwrap_or_default().trim();
+        Ok(Some(match argument {
+            "" | "status" => Self::Status,
+            "clear" => Self::Clear,
+            "pause" => Self::Pause,
+            "resume" => Self::Resume,
+            _ => {
+                let (objective, budget) = if let Some(rest) = argument.strip_prefix("--budget ") {
+                    let (budget, objective) = rest
+                        .split_once(char::is_whitespace)
+                        .context("Use /goal --budget <tokens> <objective>")?;
+                    let budget = budget
+                        .parse::<i64>()
+                        .context("Token budget must be a positive integer")?;
+                    if budget <= 0 {
+                        bail!("Token budget must be a positive integer");
+                    }
+                    (objective.trim(), Some(budget))
+                } else {
+                    (argument, None)
+                };
+                if objective.is_empty() || objective.chars().count() > 4000 {
+                    bail!("Goal must contain between 1 and 4,000 characters");
+                }
+                Self::Set {
+                    objective: objective.into(),
+                    budget,
+                }
+            }
+        }))
+    }
+
+    pub fn request(&self, thread: &str, id: i64) -> Value {
+        let mut params = json!({"threadId":thread,"origin":"user"});
+        let method = match self {
+            Self::Status => {
+                params = json!({"threadId":thread});
+                "thread/goal/get"
+            }
+            Self::Clear => "thread/goal/clear",
+            Self::Pause => {
+                params["status"] = json!("paused");
+                "thread/goal/set"
+            }
+            Self::Resume => {
+                params["status"] = json!("active");
+                "thread/goal/set"
+            }
+            Self::Set { objective, budget } => {
+                params["objective"] = json!(objective);
+                params["status"] = json!("active");
+                if let Some(budget) = budget {
+                    params["tokenBudget"] = json!(budget);
+                }
+                "thread/goal/set"
+            }
+        };
+        json!({"id":id,"method":method,"params":params})
+    }
+}
+
+pub fn message_questions(message: &Message) -> Vec<Question> {
+    if !super::chat_history_store::is_question_tool(&message.tool_name) {
+        return Vec::new();
+    }
+    let Ok(input) = serde_json::from_str::<Value>(&message.tool_input) else {
+        return Vec::new();
+    };
+    input["questions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, question)| Question {
+            id: index.to_string(),
+            text: question["title"]
+                .as_str()
+                .or_else(|| question["question"].as_str())
+                .unwrap_or_default()
+                .into(),
+            options: question["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|option| {
+                    option
+                        .as_str()
+                        .or_else(|| option["label"].as_str())
+                        .map(str::to_owned)
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+pub fn history_question_reply(message: &Message, answers: &HashMap<String, String>) -> String {
+    let replies = message_questions(message).iter().enumerate().map(|(index, question)| {
+        json!({"questionItemId":json!([message.tool_name.rsplit('.').next().unwrap_or(&message.tool_name), message.tool_id,index]).to_string(),"question":question.text,"answer":answers.get(&question.id).cloned().unwrap_or_default()})
+    }).collect::<Vec<_>>();
+    format!(
+        "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+        json!(replies)
+    )
+}
+
+pub const WRITER_CONFLICT: &str = "This conversation is open for writing in another Codex connection. Close it there and retry, or send in a new copy. Your message has not been sent.";
+
+static ACTIVE_RUNS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+struct ActiveRun(String);
+
+impl ActiveRun {
+    fn acquire(key: String) -> Result<Self> {
+        let mut runs = ACTIVE_RUNS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cannot check active chat connections"))?;
+        if !runs.insert(key.clone()) {
+            bail!(
+                "This conversation is already responding in another Zed tab. Wait for it to finish before sending again."
+            );
+        }
+        Ok(Self(key))
+    }
+}
+
+impl Drop for ActiveRun {
+    fn drop(&mut self) {
+        match ACTIVE_RUNS.get_or_init(Default::default).lock() {
+            Ok(mut runs) => {
+                runs.remove(&self.0);
+            }
+            Err(error) => log::error!("Cannot release active chat connection: {error}"),
+        }
+    }
+}
+
+fn connection_error(provider: Provider, error: &str) -> String {
+    if provider == Provider::Codex && error.contains("already has an active writer") {
+        WRITER_CONFLICT.into()
+    } else if provider == Provider::Claude
+        && (error.contains("OAuth session expired") || error.contains("Failed to authenticate"))
+    {
+        format!(
+            "Claude sign-in has expired. Run `claude auth login` in a terminal, then send again.\n{error}"
+        )
+    } else {
+        error.into()
+    }
+}
 pub enum Control {
     Reply(Value),
+    Goal(GoalCommand),
     Stop,
 }
 pub struct Run {
@@ -426,16 +617,14 @@ pub fn start(chat: Chat, prompt: String, fork: bool, new: bool, options: RunOpti
     let (sender, events) = mpsc::channel();
     thread::spawn(move || {
         let provider = chat.provider;
-        let result = run(chat, prompt, fork, new, options, &sender, control);
+        let result = ActiveRun::acquire(chat.key())
+            .and_then(|_lease| run(chat, prompt, fork, new, options, &sender, control));
         if let Err(error) = emit(
             &sender,
             Event::Finished(result.err().map(|error| {
                 let error = format!("{error:#}");
-                if provider == Provider::Claude && (error.contains("OAuth session expired") || error.contains("Failed to authenticate")) {
-                    format!("Claude sign-in has expired. Run `claude auth login` in a terminal, then send again.\n{error}")
-                } else {
-                    error
-                }
+                log::warn!("Chat connection failed: {error}");
+                connection_error(provider, &error)
             })),
         ) {
             log::debug!("{error}");
@@ -471,12 +660,21 @@ pub fn approval(request: &Value, provider: Provider) -> Option<Approval> {
             } else {
                 text(question, "id")
             },
-            text: text(question, "question"),
+            text: question["question"]
+                .as_str()
+                .or_else(|| question["title"].as_str())
+                .unwrap_or_default()
+                .into(),
             options: question["options"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|option| option["label"].as_str().map(str::to_owned))
+                .filter_map(|option| {
+                    option
+                        .as_str()
+                        .or_else(|| option["label"].as_str())
+                        .map(str::to_owned)
+                })
                 .collect(),
         })
         .collect::<Vec<_>>();
@@ -484,14 +682,46 @@ pub fn approval(request: &Value, provider: Provider) -> Option<Approval> {
         "Your input is needed".into()
     } else if method == "can_use_tool" {
         format!("Allow {}?", text(params, "tool_name"))
+    } else if method.contains("commandExecution") || params["kind"] == "command" {
+        "Allow this command?".into()
+    } else if method.contains("fileChange") {
+        "Allow file changes?".into()
     } else {
         "Permission required".into()
     };
     let detail = serde_json::to_string_pretty(params).unwrap_or_default();
+    let nonempty = |value: &Value| {
+        value
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let reason = nonempty(&params["reason"]).or_else(|| nonempty(&params["input"]["description"]));
+    let command_value = if params["command"].is_null() {
+        &params["input"]["command"]
+    } else {
+        &params["command"]
+    };
+    let command = nonempty(command_value).or_else(|| {
+        command_value
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .filter(|command| !command.is_empty())
+    });
+    let directory = nonempty(&params["cwd"]).or_else(|| nonempty(&params["input"]["cwd"]));
     Some(Approval {
         request: request.clone(),
         title,
         detail,
+        reason,
+        command,
+        directory,
         questions,
     })
 }
@@ -625,7 +855,14 @@ impl StreamState {
                 ) {
                     message.role = "activity".into();
                     message.tool_id = id.clone();
-                    message.tool_name = kind;
+                    message.tool_name = item["tool"]
+                        .as_str()
+                        .or_else(|| item["name"].as_str())
+                        .unwrap_or(&kind)
+                        .into();
+                    if super::chat_history_store::is_question_tool(&message.tool_name) {
+                        message.role = "question".into();
+                    }
                     message.tool_input = item["command"]
                         .as_str()
                         .map(str::to_owned)
@@ -844,6 +1081,19 @@ fn run(
     sender: &Sender<Event>,
     controls: Receiver<Control>,
 ) -> Result<()> {
+    let goal_command = GoalCommand::parse(&prompt)?;
+    if goal_command.is_some() && chat.provider != Provider::Codex {
+        bail!("/goal is available for Codex conversations.");
+    }
+    if new
+        && goal_command
+            .as_ref()
+            .is_some_and(|command| !matches!(command, GoalCommand::Set { .. }))
+    {
+        bail!(
+            "Create a conversation before managing its goal. Use /goal <objective> to create one."
+        );
+    }
     let user_input = user_input(chat.provider, &prompt, &options.attachments)?;
     let cwd = Path::new(&chat.cwd);
     if !cwd.is_absolute() || !cwd.is_dir() {
@@ -937,15 +1187,38 @@ fn run(
     let mut turn_id = String::new();
     let mut errors = VecDeque::new();
     let mut begun = false;
+    let mut goal_running = goal_command.as_ref().is_some_and(GoalCommand::starts_work);
     let started = Instant::now();
     let mut stopping = None;
     loop {
         while let Ok(control) = controls.try_recv() {
             match control {
                 Control::Reply(value) => write_json(&mut input, &value)?,
+                Control::Goal(command) => {
+                    write_json(&mut input, &command.request(&chat.id, 30))?;
+                    if command.starts_work() {
+                        goal_running = true;
+                    }
+                    if command == GoalCommand::Clear {
+                        goal_running = false;
+                    }
+                    if command == GoalCommand::Pause {
+                        goal_running = false;
+                        if !turn_id.is_empty() {
+                            write_json(
+                                &mut input,
+                                &json!({"id":31,"method":"turn/interrupt","params":{"threadId":chat.id,"turnId":turn_id}}),
+                            )?;
+                        }
+                    }
+                }
                 Control::Stop => {
                     if stopping.is_none() {
                         stopping = Some(Instant::now());
+                        if goal_running {
+                            write_json(&mut input, &GoalCommand::Pause.request(&chat.id, 30))?;
+                            goal_running = false;
+                        }
                         if chat.provider == Provider::Codex && !turn_id.is_empty() {
                             write_json(
                                 &mut input,
@@ -1003,11 +1276,75 @@ fn run(
                         continue;
                     }
                     if !value["error"].is_null() {
+                        if value["id"] == 30 {
+                            emit(
+                                sender,
+                                Event::CommandError(
+                                    value["error"]["message"]
+                                        .as_str()
+                                        .unwrap_or("Goal command failed")
+                                        .into(),
+                                ),
+                            )?;
+                            continue;
+                        }
                         bail!("{}", value["error"]);
+                    }
+                    if value["id"] == 3
+                        || value["id"] == 4
+                        || value["id"] == 30
+                        || value["method"] == "thread/goal/updated"
+                        || value["method"] == "thread/goal/cleared"
+                    {
+                        let goal = if value.get("id").is_some() {
+                            &value["result"]["goal"]
+                        } else {
+                            &value["params"]["goal"]
+                        };
+                        let goal = if goal.is_null() {
+                            None
+                        } else {
+                            Some(
+                                serde_json::from_value(goal.clone())
+                                    .context("Invalid Codex goal response")?,
+                            )
+                        };
+                        let active = goal
+                            .as_ref()
+                            .is_some_and(|goal: &Goal| goal.status == "active");
+                        emit(sender, Event::Goal(goal))?;
+                        if value["id"] == 3 || value["id"] == 4 {
+                            if value["id"] == 3 {
+                                emit(sender, Event::Accepted)?;
+                            }
+                            if goal_running && active {
+                                let mut params = json!({"threadId":chat.id,"input":[{"type":"text","text":"Continue working towards the active goal. Update its status when the objective is complete or genuinely blocked."}]});
+                                if let Some(model) = &options.model {
+                                    params["model"] = json!(model);
+                                }
+                                if let Some(effort) = &options.effort {
+                                    params["effort"] = json!(effort);
+                                }
+                                write_json(
+                                    &mut input,
+                                    &json!({"id":2,"method":"turn/start","params":params}),
+                                )?;
+                            } else {
+                                break;
+                            }
+                        }
+                        continue;
                     }
                     match value["id"].as_i64() {
                         Some(0) => {
                             write_json(&mut input, &json!({"method":"initialized","params":{}}))?;
+                            if !new
+                                && let Some(command) = &goal_command
+                                && !command.starts_work()
+                            {
+                                write_json(&mut input, &command.request(&chat.id, 3))?;
+                                continue;
+                            }
                             let method = if new {
                                 "thread/start"
                             } else if fork {
@@ -1015,7 +1352,7 @@ fn run(
                             } else {
                                 "thread/resume"
                             };
-                            let mut params = json!({"cwd":chat.cwd,"approvalPolicy":"on-request","sandbox":"workspace-write"});
+                            let mut params = json!({"cwd":chat.cwd});
                             if !new {
                                 params["threadId"] = json!(chat.id);
                             }
@@ -1038,6 +1375,10 @@ fn run(
                             }
                             chat.modified = std::time::SystemTime::now();
                             emit(sender, Event::Session(chat.clone()))?;
+                            if let Some(command) = &goal_command {
+                                write_json(&mut input, &command.request(&chat.id, 3))?;
+                                continue;
+                            }
                             let mut params = json!({"threadId":chat.id,"input":user_input});
                             if let Some(model) = &options.model {
                                 params["model"] = json!(model);
@@ -1052,12 +1393,18 @@ fn run(
                         }
                         Some(2) => {
                             turn_id = text(&value["result"]["turn"], "id");
+                            if !begun {
+                                emit(sender, Event::Accepted)?;
+                            }
                             begun = true;
                         }
                         _ => {}
                     }
                     if value["method"] == "turn/started" {
                         turn_id = text(&value["params"]["turn"], "id");
+                        if !begun {
+                            emit(sender, Event::Accepted)?;
+                        }
                         begun = true;
                     }
                     if value["method"] == "turn/completed" {
@@ -1067,7 +1414,11 @@ fn run(
                         if value["params"]["turn"]["status"] == "interrupted" {
                             bail!("Stopped");
                         }
-                        break;
+                        if goal_running {
+                            write_json(&mut input, &GoalCommand::Status.request(&chat.id, 4))?;
+                        } else {
+                            break;
+                        }
                     }
                     if value["method"] == "error" && value["params"]["willRetry"] != true {
                         bail!("{}", value["params"]["error"]);
@@ -1095,6 +1446,7 @@ fn run(
                             &json!({"type":"user","message":{"role":"user","content":user_input},"parent_tool_use_id":null,"session_id":chat.id}),
                         )?;
                         begun = true;
+                        emit(sender, Event::Accepted)?;
                     }
                     if value["type"] == "system" && value["subtype"] == "init" {
                         chat.id = text(&value, "session_id");
@@ -1162,6 +1514,104 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_commands_use_native_methods_and_explicit_user_provenance() {
+        let command = GoalCommand::parse("/goal --budget 40000 Finish the migration")
+            .expect("command")
+            .expect("goal");
+        assert!(command.starts_work());
+        let request = command.request("thread", 3);
+        assert_eq!(request["method"], "thread/goal/set");
+        assert_eq!(request["params"]["tokenBudget"], 40000);
+        assert_eq!(request["params"]["origin"], "user");
+        let unbudgeted = GoalCommand::parse("/goal Finish tests")
+            .expect("parse")
+            .expect("goal")
+            .request("thread", 3);
+        assert!(unbudgeted["params"].get("tokenBudget").is_none());
+        assert_eq!(
+            GoalCommand::parse("/goal").expect("parse"),
+            Some(GoalCommand::Status)
+        );
+        assert_eq!(
+            GoalCommand::Pause.request("thread", 30)["params"]["status"],
+            "paused"
+        );
+        assert_eq!(
+            GoalCommand::Clear.request("thread", 30)["method"],
+            "thread/goal/clear"
+        );
+        assert!(GoalCommand::parse("/goal --budget -2 x").is_err());
+        assert!(GoalCommand::parse("/goal --budget 10").is_err());
+        assert!(
+            GoalCommand::parse("Please explain /goal")
+                .expect("normal message")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn desktop_async_questions_keep_labels_and_reply_identity() {
+        let message = Message {
+            tool_name: "functions.request_user_input_async".into(),
+            tool_id: "call_abc".into(),
+            tool_input: json!({"questions":[{"title":"Which theme?","options":["Dark","Light"]}]})
+                .to_string(),
+            ..Default::default()
+        };
+        let questions = message_questions(&message);
+        assert_eq!(questions[0].options, ["Dark", "Light"]);
+        let reply = history_question_reply(&message, &HashMap::from([("0".into(), "Dark".into())]));
+        assert!(reply.contains("call_abc"));
+        assert!(reply.contains("Which theme?"));
+        assert!(reply.contains("Dark"));
+    }
+
+    #[test]
+    fn native_question_answers_and_skip_use_request_id() {
+        let request = json!({"id":37,"method":"tool/requestUserInput","params":{"questions":[{"id":"theme","question":"Theme?","options":[{"label":"Dark","description":"Dark theme"}]}]}});
+        let card = approval(&request, Provider::Codex).expect("question card");
+        assert_eq!(card.questions[0].options, ["Dark"]);
+        let answers = HashMap::from([("theme".into(), "Dark".into())]);
+        assert_eq!(
+            approval_reply(Provider::Codex, &card, true, answers.clone()),
+            json!({"id":37,"result":{"answers":{"theme":{"answers":["Dark"]}}}})
+        );
+        assert_eq!(
+            approval_reply(Provider::Codex, &card, false, answers)["result"]["answers"]["theme"]["answers"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn active_writer_conflict_offers_recovery_without_raw_rpc_error() {
+        let error = json!({"code":-32600,"message":"thread abc already has an active writer"});
+        assert_eq!(
+            connection_error(Provider::Codex, &error.to_string()),
+            WRITER_CONFLICT
+        );
+        assert_eq!(
+            connection_error(Provider::Codex, "Connection refused"),
+            "Connection refused"
+        );
+    }
+
+    #[test]
+    fn simultaneous_views_cannot_start_two_writers_and_failure_releases_lease() {
+        let key = "codex:writer-regression".to_string();
+        let first = ActiveRun::acquire(key.clone()).expect("first writer");
+        let other_key =
+            ActiveRun::acquire("claude:writer-regression".into()).expect("another conversation");
+        assert!(ActiveRun::acquire(key.clone()).is_err());
+        drop(first);
+        let failure: Result<()> = ActiveRun::acquire(key.clone()).and_then(|_lease| {
+            bail!("connection failed before accepting input");
+        });
+        assert!(failure.is_err());
+        assert!(ActiveRun::acquire(key).is_ok());
+        drop(other_key);
+    }
 
     #[test]
     fn model_discovery_uses_each_providers_advertised_efforts() {
@@ -1273,6 +1723,24 @@ mod tests {
         assert_eq!(result[0].1.phase, "final_answer");
         assert_eq!(result[0].1.text, "Hi");
         assert_eq!(state.items.len(), 1);
+    }
+
+    #[test]
+    fn permission_summary_extracts_command_and_reason_without_internal_ids() {
+        let request = json!({"id":7,"method":"item/commandExecution/requestApproval","params":{
+            "threadId":"internal-thread", "reason":"Run the format checks", "command":["cargo","fmt","--check"], "cwd":"C:/project"
+        }});
+        let pending = approval(&request, Provider::Codex).expect("approval");
+        assert_eq!(pending.title, "Allow this command?");
+        assert_eq!(pending.reason.as_deref(), Some("Run the format checks"));
+        assert_eq!(pending.command.as_deref(), Some("cargo fmt --check"));
+        assert_eq!(pending.directory.as_deref(), Some("C:/project"));
+        assert!(pending.detail.contains("internal-thread"));
+
+        let request = json!({"request_id":"claude-request","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo test","description":"Run tests"}}});
+        let pending = approval(&request, Provider::Claude).expect("approval");
+        assert_eq!(pending.command.as_deref(), Some("cargo test"));
+        assert_eq!(pending.reason.as_deref(), Some("Run tests"));
     }
 
     #[test]
