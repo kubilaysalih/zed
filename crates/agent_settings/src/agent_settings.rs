@@ -1184,10 +1184,10 @@ mod tests {
                 "{content}"
             );
             assert_eq!(settings.default_width, px(640.), "{content}");
-            assert!(settings.threads_sidebar.auto_open, "{content}");
+            assert!(!settings.threads_sidebar.auto_open, "{content}");
         }
 
-        for (value, expected) in [("false", false), ("true", true), ("null", true)] {
+        for (value, expected) in [("false", false), ("true", true), ("null", false)] {
             SettingsStore::update_global(cx, |store, cx| {
                 store
                     .set_user_settings(
@@ -1303,7 +1303,6 @@ mod tests {
                 Field::DefaultWidth => px(300.),
                 Field::Position | Field::AutoOpen => px(360.),
             };
-            let expected_auto_open = matches!(field, Field::AutoOpen);
             for rewritten in [reset_text, reset_after_set_text] {
                 SettingsStore::update_global(cx, |store, cx| {
                     let result = store.set_user_settings(&rewritten, cx);
@@ -1312,7 +1311,7 @@ mod tests {
                 let settings = AgentSettings::get_global(cx);
                 assert_eq!(settings.threads_sidebar.position, SidebarDockPosition::Left);
                 assert_eq!(settings.threads_sidebar.default_width, expected_width);
-                assert_eq!(settings.threads_sidebar.auto_open, expected_auto_open);
+                assert!(!settings.threads_sidebar.auto_open);
             }
         }
     }

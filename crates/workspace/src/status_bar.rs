@@ -6,10 +6,10 @@ use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
-use settings::{SettingsContent, update_settings_file};
+use settings::{Settings, SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
-use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
+use ui::{ContextMenu, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
 /// Describes how a status-bar item can be hidden by the user.
 ///
@@ -159,7 +159,17 @@ impl Render for StatusBar {
             .w_full()
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
-            .p(DynamicSpacing::Base04.rems(cx))
+            .px(DynamicSpacing::Base04.rems(cx))
+            .pb(DynamicSpacing::Base04.rems(cx))
+            .pt(
+                if crate::workspace_settings::WorkspaceSettings::get_global(cx).pane_layout
+                    == settings::PaneLayout::Separated
+                {
+                    rems(0.)
+                } else {
+                    DynamicSpacing::Base04.rems(cx)
+                },
+            )
             .bg(background)
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
@@ -246,6 +256,20 @@ impl StatusBar {
         let on_right = sidebar.side == SidebarSide::Right;
         let has_notifications = sidebar.has_notifications;
         let indicator_border = cx.theme().colors().status_bar_background;
+        let separator_color = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.upgrade())
+            .and_then(|workspace| {
+                let project = workspace.read(cx).workspace().read(cx).project();
+                crate::folder_colors::for_project(project.read(cx), cx)
+            })
+            .map(|background| {
+                crate::folder_colors::ActivityBarColors::new(background, cx.theme().appearance())
+                    .foreground
+                    .opacity(0.3)
+            })
+            .unwrap_or(cx.theme().colors().border);
 
         let toggle = sidebar_side_context_menu("sidebar-status-toggle-menu", cx)
             .anchor(if on_right {
@@ -289,11 +313,11 @@ impl StatusBar {
         h_flex()
             .gap_0p5()
             .when(on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
+                this.child(div().w_px().h_4().flex_none().bg(separator_color))
             })
             .child(toggle)
             .when(!on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
+                this.child(div().w_px().h_4().flex_none().bg(separator_color))
             })
     }
 }

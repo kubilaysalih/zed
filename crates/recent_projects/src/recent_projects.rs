@@ -1693,6 +1693,19 @@ impl PickerDelegate for RecentProjectsDelegate {
                     .gap_1()
                     .border_t_1()
                     .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Button::new("general-chat-workspace", "General · All chats")
+                            .start_icon(Icon::new(IconName::Chat))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.defer(cx, |window, cx| {
+                                    window.dispatch_action(
+                                        workspace::OpenGlobalChats.boxed_clone(),
+                                        cx,
+                                    );
+                                });
+                            })),
+                    )
                     .child({
                         ButtonLike::new("open_local_folder")
                             .child(

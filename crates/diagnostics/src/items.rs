@@ -33,6 +33,17 @@ impl Render for DiagnosticIndicator {
             return indicator.hidden();
         }
 
+        let chrome_foreground = self.workspace.upgrade().and_then(|workspace| {
+            let project = workspace.read(cx).project();
+            workspace::folder_colors::for_project(project.read(cx), cx).map(|_| {
+                Color::Custom(if cx.theme().appearance().is_light() {
+                    gpui::black()
+                } else {
+                    gpui::white()
+                })
+            })
+        });
+
         let diagnostic_indicator = match (self.summary.error_count, self.summary.warning_count) {
             (0, 0) => h_flex().child(
                 Icon::new(IconName::Check)
@@ -45,7 +56,7 @@ impl Render for DiagnosticIndicator {
                     this.child(
                         Icon::new(IconName::XCircle)
                             .size(IconSize::Small)
-                            .color(Color::Error),
+                            .color(chrome_foreground.unwrap_or(Color::Error)),
                     )
                     .child(Label::new(error_count.to_string()).size(LabelSize::Small))
                 })
@@ -53,7 +64,7 @@ impl Render for DiagnosticIndicator {
                     this.child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::Small)
-                            .color(Color::Warning),
+                            .color(chrome_foreground.unwrap_or(Color::Warning)),
                     )
                     .child(Label::new(warning_count.to_string()).size(LabelSize::Small))
                 }),

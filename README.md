@@ -1,25 +1,79 @@
 > [!IMPORTANT]
 > Remove this line to confirm you've reviewed this PR before submitting.
 
-## Changes in this fork
+# Zed — local AI chats and multi-repository workspaces
 
-This fork builds on Zed's existing Rust and native GPUI architecture, with a focus on file browsing and working across multiple Git repositories.
+This fork extends Zed with a shared home for local **Codex and Claude Code conversations**, multi-repository Source Control, and configurable workspace layouts. It uses Zed's existing Rust and native GPUI architecture.
 
-1. **Activity bar and file tree:** Files, Git, and Search controls have been moved into a vertical activity bar on the left. The Threads sidebar and the Agent panel's bottom-left button have been removed. Activity buttons are contiguous with square corners, and overlapping hover backgrounds have been fixed. The redundant project name has been removed from the title bar. When a single folder is open, the file tree shows its contents directly without an extra root row.
+The features below describe changes in this fork. The original Zed README follows afterward.
 
-2. **Source Control for multiple repositories:** Git repositories under the opened folder appear in separate collapsible sections. Each section keeps its changes, history, staging operations, and commit draft tied to its repository. Repository headers and section backgrounds are more distinct, and the active Changes / History tab is clearer. Unnecessary card borders and large gaps have been removed, while rows have more vertical padding. Duplicate repository entries have been fixed. Sections grow with their file lists, and long lists can be scrolled through the panel. Clicking a repository's branch name opens the branch selector for that repository. Invalid or empty `.git` directories are no longer misreported as ownership or trust errors; actual Git trust checks remain in place.
+## Local Codex and Claude chats
 
-3. **Hide and restore folders:** Right-click a folder in the file tree and select **Hide Folder** to hide it and its nested repositories from both the file tree and Git panel. Restore folders individually through **Hidden Folders**, or restore them together with **Show All Hidden Folders**. Visibility choices persist without deleting files or changing `.gitignore`.
+- Browse local histories across folders in a native **Chats** panel, with provider icons, search, provider filters, pins, and Active / Archived / Trash / Background views. Background sessions are hidden by default.
+- Start a new conversation, resume an existing one, or **Continue in a copy**. Replies stream directly into the chat; permission requests and questions have explicit response controls. Sessions owned by another application are not forcibly taken over.
+- Rename, pin, archive, restore, and move chats to manually created projects. Trash is reversible. These organization changes are stored locally in this fork; they do not rename, archive, or delete chats in the original applications.
+- Group chats by date or by your own projects. Each project supports **Newest first** or **Custom · drag to reorder** sorting. Project-grouped rows omit the redundant project subtitle.
+- Existing conversations keep their provider fixed. Model and effort can be selected for the next turn using the options reported by the installed provider.
+- Attach images and local files using the attachment button, drag and drop, or clipboard paste. Images use provider image inputs; other files are referenced by their local paths and remain subject to the agent's normal permissions.
+- View Markdown, tables, and supported local or embedded images, including images in Claude tool results. Click an image to open the preview, zoom with the wheel or buttons, drag to pan, and use **Fit** to reset. Zoom has no fixed UI maximum.
+- Public progress updates and tool results appear in compact expandable activity groups. Background task notifications are rendered as activity rather than raw XML. Context compaction has its own aligned progress/completion row.
+- Conversations open at the latest messages; scrolling upward loads older history automatically while preserving the reading position. Image thumbnails, centered loading states, message-hover copy controls, and a growing composer keep the conversation readable.
+- Running chats show spinners in the sidebar and chat tabs. Completed, unread replies show persistent dots. The latest public activity is shown above the composer.
+- Context and account-quota indicators share the model/effort row. They use reported values rather than guessed limits; Claude account quota is currently unavailable through this connection.
+- Turn completion notifications on or off, choose native system notifications or Zed popups, and configure sound and auto-dismiss. Native notification presentation also follows the operating system's settings.
 
-4. **Folder colors with live preview:** Open **Ctrl+Shift+P → Folder Color** to use the visual color picker. Choose a color using the color field, hue strip, presets, or a HEX value such as `#FF6600`. Changes preview immediately; **Apply** saves them, **Cancel** restores the previous color, and **Theme** returns to the theme's colors. The chosen color is applied to the title bar, activity bar, and status bar. Color saving and application in Restricted Mode have been fixed; choosing a color does not grant project trust.
+**Requirements and scope:** Codex uses its local App Server; Claude uses the official CLI's streaming JSON transport. Sending messages requires the relevant installed, signed-in client. Chats checks for those clients when opened and provides setup links when missing; saved history remains readable without them. This is a local coding-chat integration, not synchronization with ChatGPT or Claude web Projects. A forked conversation shares earlier context, but subsequent messages are independent.
 
-5. **Consistent hover states and readability:** Shared hover, active, and selected states use neutral colors. Menu controls, branch labels, and icons are more readable on colored bars. The unnecessary vertical border beside the activity bar has been removed. When a folder color is set, separators between the bottom-right panel button groups use translucent white in dark themes and translucent black in light themes.
+## General view and persistent projects
 
-6. **Optional pane and diff layouts:** Open **Ctrl+Shift+P → Pane Layout** to choose **Flat** or **Separated**. Separated gives the left panel, editor, bottom terminal, and right panel rounded boundaries, with the folder color visible between them and along the editor's right edge. The Git panel's **View Options → Open Changed Files** menu exposes three choices: **All Changes in One Tab**, **Separate File Diffs (Side by Side)**, and **Open File Without Diff**. File clicks can open the combined changes view, a separate side-by-side diff tab for the selected file, or the file itself. These preferences persist; the defaults remain Flat and the combined diff view.
+- Choose **General** from the title-bar project picker to manage chats without an active code project. The Files / Git / Search activity bar is hidden in this mode.
+- Add local projects to the General workspace and return to individual projects for their files and Git state. Already-open chat views are retained when switching, avoiding unnecessary history reloads.
+- General saves its project list, chat tabs, pane arrangement, drafts, selected pane, and sidebar width for reopening the app.
+- Create your own chat projects and add existing Codex or Claude conversations through the project picker. **Workspace projects** uses your manual project assignments; provider working directories are separate, optional context and do not decide membership.
+- Chat-to-project assignments and per-folder project selections are stored in the profile's shared `chat-library.json`. Opening a folder separately preserves those assignments, so projects do not need to be linked again.
+- Pending **Trust and Continue** prompts remain visible when General becomes active, including prompts from projects restored later. Trust or Restricted Mode still applies to the original project; switching views never grants trust automatically.
 
-The download links below point to upstream Zed. Custom Windows builds of this fork are distributed separately.
+## Chat tabs and panes
+
+- Choose **Editor tabs** or **Separate chat panel** in Chats settings. The separate panel can sit beside the code editor, with the file tree on the left and independent code-editor splits in the center.
+- Open multiple chats as distinct tabs with editor-style appearance. Drag tabs to reorder or move between chat panes, split right/down, resize dividers, and zoom a pane.
+- Move the chat panel between supported dock positions. Chat-only layouts fill the available area when the window resizes, while the left sidebar remains accessible and resizable.
+- The duplicate conversation header is removed. The project-directory shortcut and conversation options are available in the composer.
+
+## Multi-repository Source Control
+
+- Repositories under an opened folder appear in separate collapsible sections, each with its own Changes / History view, staging controls, and commit draft.
+- Repository sections use distinct backgrounds and readable headers with compact spacing. Duplicate entries are removed, and changed-file totals include nested folders and repositories in the Git activity badge.
+- Click a repository's branch name to switch branches for that repository. Changes lists grow with their contents and scroll through the panel rather than being clipped to a small fixed height.
+- In **View Options → Open Changed Files**, choose **All Changes in One Tab**, **Separate File Diffs (Side by Side)**, or **Open File Without Diff**. Preferences persist; the combined diff view remains the default.
+- Right-click a folder and choose **Hide Folder** to hide it and nested repositories from both Files and Git. Use **Hidden Folders** or **Show All Hidden Folders** to restore them. This does not delete files or modify `.gitignore`.
+- Invalid or empty `.git` directories are no longer presented as ownership/trust failures. Actual Git ownership and project-trust checks remain in place.
+
+## Navigation and appearance
+
+- Files, Git, Search, and Chats use a vertical activity bar on the left. **Project Search** opens in the left dock with streamed results grouped by file; clicking a result opens the matching file and range in the editor. Case, whole-word, regex, ignored-file, and include/exclude controls are available.
+- A single-folder file tree shows the folder's contents directly. The title bar shows the project name before its branch, with readable text and icons on colored backgrounds.
+- The existing Threads sidebar opens on demand instead of automatically: **Ctrl+Alt+J** or **Ctrl+Shift+P → Toggle Workspace Sidebar**. Its visibility is restored. Zed's existing Agent panel remains available through **View → Agent Panel**.
+- Open **Ctrl+Shift+P → Folder Color** for a visual picker with live preview, hue, presets, and HEX input. **Apply** saves, **Cancel** restores the previous color, and **Theme** resets to theme colors. The title, activity, and status bars use the selected color. Color changes work in Restricted Mode without granting trust.
+- Open **Ctrl+Shift+P → Pane Layout** and choose **Flat** or **Separated**. Separated adds rounded panel boundaries and folder-colored spacing around the file panel, editor, bottom terminal, and right panel. Flat remains the default.
+- Activity buttons have square corners and no gaps. Hover states, branch labels, diagnostic icons, and status-bar separators have been adjusted for colored bars. Resize handles remain usable with separated panes and chat-only layouts.
+
+## Windows builds
+
+Custom Windows builds are distributed separately as a signed **Zed Setup** executable, with Start menu integration and **Open with Zed** Explorer integration. The installer keeps application settings separate from its binaries; personal chat histories and profiles are not bundled for distribution. The custom signing certificate is not Zed Industries' certificate.
+
+For a local optimized build, first follow the [Windows development prerequisites](./docs/src/development/windows.md), then run:
+
+```powershell
+cargo build --profile release-fast -p zed --bin zed -p cli --bin cli --locked
+```
+
+The resulting executables are in `target/release-fast`. A standalone distribution also needs the Windows terminal support files and license notices; an EXE alone is not the full installer.
+
+The download links in the original README below point to **upstream Zed**, not this fork.
 
 ---
+
 
 # Zed
 

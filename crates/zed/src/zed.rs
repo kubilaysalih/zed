@@ -1,4 +1,8 @@
 mod app_menus;
+mod chat_history;
+mod chat_history_store;
+mod chat_image_preview;
+mod chat_runtime;
 pub mod edit_prediction_registry;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
@@ -77,6 +81,7 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
+use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -440,7 +445,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     init_reduce_motion(cx);
     init_global_config_error_notifications(cx);
 
-    cx.observe_new(|multi_workspace: &mut MultiWorkspace, window, cx| {
+    cx.observe_new(|_multi_workspace: &mut MultiWorkspace, window, cx| {
         let Some(window) = window else {
             return;
         };
@@ -448,8 +453,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         #[cfg(feature = "track-project-leak")]
         {
             let multi_workspace_handle = cx.weak_entity();
-            let workspace_handle = multi_workspace.workspace().downgrade();
-            let project_handle = multi_workspace.workspace().read(cx).project().downgrade();
+            let workspace_handle = _multi_workspace.workspace().downgrade();
+            let project_handle = _multi_workspace.workspace().read(cx).project().downgrade();
             let window_id_2 = window.window_handle().window_id();
             cx.on_window_closed(move |cx, window_id| {
                 let multi_workspace_handle = multi_workspace_handle.clone();
@@ -500,8 +505,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
+        let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
-        multi_workspace.disable_sidebar(cx);
         cx.subscribe_in(
             &multi_workspace_handle,
             window,
@@ -533,6 +538,19 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             },
         )
         .detach();
+
+        cx.defer(move |cx| {
+            window_handle
+                .update(cx, |_, window, cx| {
+                    let sidebar =
+                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
+                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
+                        multi_workspace.register_sidebar(sidebar, cx);
+                        cx.notify();
+                    });
+                })
+                .log_err();
+        });
     })
     .detach();
 
@@ -795,8 +813,13 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
-        workspace_handle.update(cx, |workspace, cx| {
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            chat_history::install(workspace, window, cx);
+            search::project_search_panel::install(workspace, window, cx);
             workspace.finish_dock_restoration(cx);
+            if std::env::var_os("ZED_PREVIEW_CHAT_HISTORY").is_some() {
+                workspace.focus_panel::<chat_history::ChatHistoryPanel>(window, cx);
+            }
         })?;
 
         anyhow::Ok(())

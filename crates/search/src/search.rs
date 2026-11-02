@@ -19,6 +19,7 @@ use crate::project_search::ProjectSearchBar;
 
 pub mod buffer_search;
 pub mod project_search;
+pub mod project_search_panel;
 pub(crate) mod search_bar;
 pub mod search_status_button;
 pub mod text_finder;

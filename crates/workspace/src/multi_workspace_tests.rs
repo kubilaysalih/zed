@@ -47,7 +47,133 @@ fn setup_multi_workspace<'a>(
 }
 
 #[gpui::test]
-async fn test_disabled_sidebar_cannot_be_restored_or_reopened(cx: &mut TestAppContext) {
+async fn test_trust_prompt_survives_general_activation(cx: &mut TestAppContext) {
+    init_test(cx);
+    // Workspace deliberately does not depend on the concrete Editor crate.
+    // This field stand-in lets the real security modal render in the test window.
+    struct TrustInput {
+        text: std::cell::RefCell<String>,
+        focus: gpui::FocusHandle,
+    }
+    impl ui_input::ErasedEditor for TrustInput {
+        fn text(&self, _: &App) -> String {
+            self.text.borrow().clone()
+        }
+        fn set_text(&self, text: &str, _: &mut Window, _: &mut App) {
+            *self.text.borrow_mut() = text.into();
+        }
+        fn clear(&self, _: &mut Window, _: &mut App) {
+            self.text.borrow_mut().clear();
+        }
+        fn set_placeholder_text(&self, _: &str, _: &mut Window, _: &mut App) {}
+        fn move_selection_to_end(&self, _: &mut Window, _: &mut App) {}
+        fn select_all(&self, _: &mut Window, _: &mut App) {}
+        fn set_masked(&self, _: bool, _: &mut Window, _: &mut App) {}
+        fn set_read_only(&self, _: bool, _: &mut App) {}
+        fn set_multiline(&self, _: Option<usize>, _: &mut Window, _: &mut App) {}
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.focus.clone()
+        }
+        fn subscribe(
+            &self,
+            _: Box<dyn FnMut(ui_input::ErasedEditorEvent, &mut Window, &mut App)>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> gpui::Subscription {
+            gpui::Subscription::new(|| {})
+        }
+        fn render(&self, _: &mut Window, _: &App) -> gpui::AnyElement {
+            div().child(self.text.borrow().clone()).into_any_element()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    let _ = ui_input::ERASED_EDITOR_FACTORY.set(|_, cx| {
+        std::sync::Arc::new(TrustInput {
+            text: Default::default(),
+            focus: cx.focus_handle(),
+        })
+    });
+    cx.update(|cx| project::trusted_worktrees::init(Default::default(), cx));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/trust-project"), json!({"file.txt": "hello"}))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/trust-project").as_ref()], cx).await;
+    let general_project = Project::test(fs, [], cx).await;
+    let (multi, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    cx.update_global(|store: &mut SettingsStore, cx| {
+        store.update_user_settings(cx, |settings| {
+            settings.session.get_or_insert_default().trust_all_worktrees = Some(false);
+        });
+    });
+    let source = multi.read_with(cx, |multi, _| multi.workspace().clone());
+    let store = project.read_with(cx, |project, _| project.worktree_store().clone());
+    let worktree = project.read_with(cx, |project, cx| {
+        project
+            .visible_worktrees(cx)
+            .next()
+            .expect("worktree")
+            .read(cx)
+            .id()
+    });
+    cx.update(|_, cx| {
+        let trusted =
+            project::trusted_worktrees::TrustedWorktrees::try_get_global(cx).expect("trust store");
+        trusted.update(cx, |trusted, cx| {
+            assert!(!trusted.can_trust(&store, worktree, cx));
+        });
+    });
+    source.update_in(cx, |source, window, cx| {
+        source.show_worktree_trust_security_modal(false, window, cx)
+    });
+    let general = multi.update_in(cx, |multi, window, cx| {
+        multi.retain_active_workspace(cx);
+        let general = multi.test_add_workspace(general_project, window, cx);
+        general.update(cx, |workspace, cx| workspace.set_global_chat_mode(true, cx));
+        general
+    });
+    cx.run_until_parked();
+    multi.read_with(cx, |multi, cx| {
+        assert_eq!(multi.workspace(), &general);
+        assert_eq!(
+            multi.active_modal::<crate::SecurityModal>(cx),
+            source.read(cx).active_modal::<crate::SecurityModal>(cx)
+        );
+        assert!(multi.active_modal::<crate::SecurityModal>(cx).is_some());
+        assert!(project::trusted_worktrees::TrustedWorktrees::has_restricted_worktrees(&store, cx));
+    });
+    cx.update(|window, cx| window.dispatch_action(Box::new(crate::ToggleWorktreeSecurity), cx));
+    cx.run_until_parked();
+    multi.read_with(cx, |multi, cx| {
+        assert!(multi.active_modal::<crate::SecurityModal>(cx).is_none());
+        assert!(project::trusted_worktrees::TrustedWorktrees::has_restricted_worktrees(&store, cx));
+    });
+    // Restored folders can ask for trust after General is already visible.
+    source.update_in(cx, |source, window, cx| {
+        source.show_worktree_trust_security_modal(false, window, cx)
+    });
+    cx.run_until_parked();
+    multi.read_with(cx, |multi, cx| {
+        assert_eq!(
+            multi.active_modal::<crate::SecurityModal>(cx),
+            source.read(cx).active_modal::<crate::SecurityModal>(cx)
+        )
+    });
+    cx.update(|window, cx| window.dispatch_action(Box::new(menu::Confirm), cx));
+    cx.run_until_parked();
+    multi.read_with(cx, |multi, cx| {
+        assert_eq!(multi.workspace(), &general);
+        assert!(multi.active_modal::<crate::SecurityModal>(cx).is_none());
+        assert!(
+            !project::trusted_worktrees::TrustedWorktrees::has_restricted_worktrees(&store, cx)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_sidebar_starts_closed_and_can_be_opened_on_demand(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     let project = Project::test(fs, [], cx).await;
@@ -55,14 +181,16 @@ async fn test_disabled_sidebar_cannot_be_restored_or_reopened(cx: &mut TestAppCo
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
 
     multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.open_sidebar(cx);
-        multi_workspace.disable_sidebar(cx);
-        multi_workspace.restore_open_sidebar(cx);
-        multi_workspace.toggle_sidebar(window, cx);
-        multi_workspace.focus_sidebar(window, cx);
         assert!(!multi_workspace.sidebar_open());
-        assert!(!multi_workspace.sidebar_render_state(cx).open);
-        assert!(multi_workspace.sidebar().is_none());
+        multi_workspace.toggle_sidebar(window, cx);
+        assert!(multi_workspace.sidebar_render_state(cx).open);
+        multi_workspace.toggle_sidebar(window, cx);
+        assert!(!multi_workspace.sidebar_open());
+        multi_workspace.focus_sidebar(window, cx);
+        assert!(multi_workspace.sidebar_open());
+        multi_workspace.close_sidebar(window, cx);
+        multi_workspace.restore_open_sidebar(cx);
+        assert!(multi_workspace.sidebar_open());
     });
 }
 
@@ -337,10 +465,16 @@ async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut 
 }
 
 #[gpui::test]
-async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppContext) {
+async fn test_open_directory_in_existing_window_opens_sidebar_when_enabled(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
-
     let app_state = cx.update(AppState::test);
+    cx.update(|cx| {
+        let mut settings = AgentSettings::get_global(cx).clone();
+        settings.threads_sidebar.auto_open = true;
+        AgentSettings::override_global(settings, cx);
+    });
     let fs = app_state.fs.as_fake();
     fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
         .await;
@@ -366,7 +500,7 @@ async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppCo
         .read_with(cx, |mw, _cx| {
             assert!(
                 mw.sidebar_open(),
-                "adding a directory to an existing window opens the sidebar by default",
+                "adding a directory opens the sidebar when auto_open is enabled",
             );
             assert_eq!(mw.workspaces().count(), 2);
         })
@@ -374,7 +508,7 @@ async fn test_open_directory_in_existing_window_opens_sidebar(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-async fn test_open_directory_in_existing_window_respects_auto_open_setting(
+async fn test_open_directory_in_existing_window_keeps_sidebar_closed_by_default(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -386,10 +520,8 @@ async fn test_open_directory_in_existing_window_respects_auto_open_setting(
     fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
         .await;
 
-    cx.update(|cx| {
-        let mut settings = AgentSettings::get_global(cx).clone();
-        settings.threads_sidebar.auto_open = false;
-        AgentSettings::override_global(settings, cx);
+    cx.read(|cx| {
+        assert!(!AgentSettings::get_global(cx).threads_sidebar.auto_open);
     });
 
     let project = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;

@@ -80,7 +80,7 @@ actions!(
     ]
 );
 
-fn split_glob_patterns(text: &str) -> Vec<&str> {
+pub(crate) fn split_glob_patterns(text: &str) -> Vec<&str> {
     let mut patterns = Vec::new();
     let mut pattern_start = 0;
     let mut brace_depth: usize = 0;
@@ -219,7 +219,11 @@ pub fn init(cx: &mut App) {
                 cx.propagate();
                 return;
             }
-            ProjectSearchView::deploy_search(workspace, action, window, cx);
+            if action.replace_enabled {
+                ProjectSearchView::deploy_search(workspace, action, window, cx);
+            } else {
+                crate::project_search_panel::deploy(workspace, action, window, cx);
+            }
             cx.notify();
         });
         workspace.register_action(move |workspace, action: &NewSearch, window, cx| {
@@ -227,14 +231,26 @@ pub fn init(cx: &mut App) {
                 cx.propagate();
                 return;
             }
-            ProjectSearchView::new_search(workspace, action, window, cx);
+            let _ = action;
+            crate::project_search_panel::deploy(
+                workspace,
+                &DeploySearch {
+                    query: Some(String::new()),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
             cx.notify();
         });
         workspace.register_action(
             move |workspace, action: &zed_actions::search::NewSearchInDirectory, window, cx| {
-                ProjectSearchView::new_search_with_filter(
+                crate::project_search_panel::deploy(
                     workspace,
-                    action.directory.clone(),
+                    &DeploySearch {
+                        included_files: Some(action.directory.clone()),
+                        ..Default::default()
+                    },
                     window,
                     cx,
                 );

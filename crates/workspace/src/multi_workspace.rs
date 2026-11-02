@@ -315,7 +315,6 @@ pub struct MultiWorkspace {
     active_workspace_id: Rc<Cell<EntityId>>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
-    sidebar_disabled: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
@@ -377,7 +376,6 @@ impl MultiWorkspace {
             active_workspace_id,
             sidebar: None,
             sidebar_open: false,
-            sidebar_disabled: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
@@ -410,15 +408,7 @@ impl MultiWorkspace {
     }
 
     pub fn sidebar_open(&self) -> bool {
-        self.sidebar_open && !self.sidebar_disabled
-    }
-
-    pub fn disable_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_disabled = true;
-        self.sidebar_open = false;
-        self.sidebar = None;
-        self.sidebar_overlay = None;
-        cx.notify();
+        self.sidebar_open
     }
 
     pub fn sidebar_has_notifications(&self, cx: &App) -> bool {
@@ -438,7 +428,7 @@ impl MultiWorkspace {
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_disabled || !self.multi_workspace_enabled(cx) {
+        if !self.multi_workspace_enabled(cx) {
             return;
         }
 
@@ -465,7 +455,7 @@ impl MultiWorkspace {
     }
 
     pub fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_disabled || !self.multi_workspace_enabled(cx) {
+        if !self.multi_workspace_enabled(cx) {
             return;
         }
 
@@ -510,9 +500,6 @@ impl MultiWorkspace {
     }
 
     fn apply_open_sidebar(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_disabled {
-            return;
-        }
         self.sidebar_open = true;
         self.retain_active_workspace(cx);
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
@@ -597,6 +584,8 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) {
         let project = workspace.read(cx).project().clone();
+        let modal_layer = workspace.read(cx).modal_layer.clone();
+        cx.observe(&modal_layer, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&project, window, {
             let workspace = workspace.downgrade();
             move |this, _project, event, _window, cx| match event {
@@ -1531,8 +1520,33 @@ impl MultiWorkspace {
     }
 
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
+        if let Some(modal) = self
+            .modal_workspace(cx)
+            .read(cx)
+            .active_modal::<crate::SecurityModal>(cx)
+        {
+            modal.focus_handle(cx).focus(window, cx);
+            return;
+        }
         let focus_handle = self.workspace().read(cx).fallback_focus_handle(window, cx);
         window.focus(&focus_handle, cx);
+    }
+
+    fn modal_workspace(&self, cx: &App) -> &Entity<Workspace> {
+        // Trust belongs to its project, but must remain visible while General or
+        // another project owns the window's content. Never implicitly dismiss it.
+        std::iter::once(self.workspace())
+            .chain(
+                self.workspaces()
+                    .filter(|workspace| *workspace != self.workspace()),
+            )
+            .find(|workspace| {
+                workspace
+                    .read(cx)
+                    .active_modal::<crate::SecurityModal>(cx)
+                    .is_some()
+            })
+            .unwrap_or_else(|| self.workspace())
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {
@@ -1540,7 +1554,7 @@ impl MultiWorkspace {
     }
 
     pub fn active_modal<V: ManagedView + 'static>(&self, cx: &App) -> Option<Entity<V>> {
-        self.workspace().read(cx).active_modal::<V>(cx)
+        self.modal_workspace(cx).read(cx).active_modal::<V>(cx)
     }
 
     pub fn add_panel<T: Panel>(
@@ -2041,6 +2055,17 @@ impl MultiWorkspace {
 
 impl Render for MultiWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let modal_workspace = self.modal_workspace(cx);
+        let modal_layer = modal_workspace.read(cx).modal_layer.clone();
+        if let Some(modal) = modal_workspace
+            .read(cx)
+            .active_modal::<crate::SecurityModal>(cx)
+        {
+            let focus = modal.focus_handle(cx);
+            if !focus.contains_focused(window, cx) {
+                focus.focus(window, cx);
+            }
+        }
         let multi_workspace_enabled = self.multi_workspace_enabled(cx);
         let sidebar_side = self.sidebar_side(cx);
         let sidebar_on_right = sidebar_side == SidebarSide::Right;
@@ -2225,7 +2250,7 @@ impl Render for MultiWorkspace {
                         .child(self.workspace().clone()),
                 )
                 .children(right_sidebar)
-                .child(self.workspace().read(cx).modal_layer.clone())
+                .child(modal_layer)
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(
                         v_flex().h(px(0.0)).top_20().items_center().child(

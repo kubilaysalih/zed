@@ -629,7 +629,7 @@
     // Whether to show the worktree name button in the titlebar.
     "show_worktree_name": false,
     // Whether to show the project host and name in the titlebar.
-    "show_project_items": false,
+    "show_project_items": true,
     // Whether to show onboarding banners in the titlebar.
     "show_onboarding_banner": true,
     // Whether to show user picture in the titlebar.
@@ -1148,8 +1148,8 @@
     "starts_open": false,
     // Whether to show a badge on the git panel icon with the count of uncommitted changes.
     //
-    // Default: false
-    "show_count_badge": false,
+    // Default: true
+    "show_count_badge": true,
     "scrollbar": {
       // When to show the scrollbar in the git panel.
       //
@@ -1206,7 +1206,7 @@
       // Default width of the Threads Sidebar.
       "default_width": 300,
       // Automatically open the Threads Sidebar when opening a folder in an existing window.
-      "auto_open": true,
+      "auto_open": false,
     },
     // Default fixed width when the agent panel is docked to the left or right and
     // `flexible` is false.

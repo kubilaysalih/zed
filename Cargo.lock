@@ -22398,6 +22398,7 @@ dependencies = [
  "audio",
  "auto_update",
  "auto_update_ui",
+ "base64 0.22.1",
  "breadcrumbs",
  "call",
  "call_hierarchy",

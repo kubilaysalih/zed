@@ -2077,6 +2077,11 @@ impl GitPanel {
             );
         }
         let repository_count = sections.len();
+        let total_changes: usize = self
+            .repository_sections
+            .iter()
+            .map(|section| section.read(cx).changes_count)
+            .sum();
         v_flex()
             .id("git-repositories")
             .size_full()
@@ -2089,9 +2094,11 @@ impl GitPanel {
                     .gap_2()
                     .child(Label::new("Source Control").size(LabelSize::Small))
                     .child(
-                        Label::new(format!("{repository_count} repositories"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        Label::new(format!(
+                            "{repository_count} repos · {total_changes} changes"
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                     ),
             )
             .child(

@@ -393,6 +393,8 @@ actions!(
         ActivatePreviousPane,
         /// Activates the last pane in the workspace.
         ActivateLastPane,
+        /// Opens the project-independent chat workspace.
+        OpenGlobalChats,
         /// Moves focus to the next major region of the window (editor, open
         /// panels, status bar), cycling and wrapping around. Intended as a
         /// discoverable, screen-reader-friendly way to navigate the window.
@@ -1594,6 +1596,7 @@ pub struct Workspace {
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
     activity_bar: Entity<PanelButtons>,
+    global_chat_mode: bool,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -2101,6 +2104,7 @@ impl Workspace {
             last_active_view_id: None,
             status_bar,
             activity_bar: left_dock_buttons,
+            global_chat_mode: false,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -2900,6 +2904,15 @@ impl Workspace {
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
         self.multi_workspace.as_ref()
+    }
+
+    pub fn global_chat_mode(&self) -> bool {
+        self.global_chat_mode
+    }
+
+    pub fn set_global_chat_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.global_chat_mode = enabled;
+        cx.notify();
     }
 
     pub fn set_multi_workspace(
@@ -8916,6 +8929,29 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn filling_dock(&self, cx: &App) -> Option<DockPosition> {
+        if self
+            .center
+            .panes()
+            .iter()
+            .any(|pane| pane.read(cx).items_len() > 0)
+        {
+            return None;
+        }
+        [
+            (&self.right_dock, DockPosition::Right),
+            (&self.left_dock, DockPosition::Left),
+            (&self.bottom_dock, DockPosition::Bottom),
+        ]
+        .into_iter()
+        .find_map(|(dock, position)| {
+            dock.read(cx)
+                .visible_panel()
+                .filter(|panel| panel.fills_empty_workspace(cx))
+                .map(|_| position)
+        })
+    }
+
     fn render_dock(
         &self,
         position: DockPosition,
@@ -8950,6 +8986,7 @@ impl Workspace {
 
         let mut container = div()
             .id(dock_element_id)
+            .debug_selector(move || dock_element_id.into())
             .when(dock_is_open, |this| {
                 this.role(gpui::Role::Complementary)
                     .aria_label(dock_label)
@@ -8972,6 +9009,9 @@ impl Workspace {
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
         let dock = dock.read(cx);
         if let Some(panel) = dock.visible_panel() {
+            if self.filling_dock(cx) == Some(position) {
+                return Some(container.flex_1().min_w_0().min_h_0());
+            }
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
@@ -9272,10 +9312,19 @@ impl Workspace {
         let workspace_width = self.bounds.size.width;
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
 
+        let filling_right = self.filling_dock(cx) == Some(DockPosition::Right);
         self.right_dock.read_with(cx, |right_dock, cx| {
-            let right_dock_size = right_dock
-                .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
+            // A filling chat dock consumes the remainder, not its previous stored width.
+            let right_dock_size = if filling_right {
+                right_dock
+                    .visible_panel()
+                    .and_then(|panel| panel.min_size(window, cx))
+                    .unwrap_or(RESIZE_HANDLE_SIZE)
+            } else {
+                right_dock
+                    .stored_active_panel_size(window, cx)
+                    .unwrap_or(Pixels::ZERO)
+            };
             if right_dock_size + size > workspace_width {
                 size = workspace_width - right_dock_size
             }
@@ -9290,10 +9339,18 @@ impl Workspace {
     fn resize_right_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let workspace_width = self.bounds.size.width;
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
+        let filling_left = self.filling_dock(cx) == Some(DockPosition::Left);
         self.left_dock.read_with(cx, |left_dock, cx| {
-            let left_dock_size = left_dock
-                .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
+            let left_dock_size = if filling_left {
+                left_dock
+                    .visible_panel()
+                    .and_then(|panel| panel.min_size(window, cx))
+                    .unwrap_or(RESIZE_HANDLE_SIZE)
+            } else {
+                left_dock
+                    .stored_active_panel_size(window, cx)
+                    .unwrap_or(Pixels::ZERO)
+            };
             if left_dock_size + size > workspace_width {
                 size = workspace_width - left_dock_size
             }
@@ -9978,7 +10035,9 @@ impl Render for Workspace {
                         h_flex()
                             .flex_1()
                             .min_h_0()
-                            .child(self.activity_bar.clone())
+                            .when(!self.global_chat_mode, |this| {
+                                this.child(self.activity_bar.clone())
+                            })
                             .child(
                                 div()
                                     .id("workspace")
@@ -10081,7 +10140,73 @@ impl Render for Workspace {
                                         ))
                                     })
                                     .child({
-                                        match bottom_dock_layout {
+                                        if self.filling_dock(cx) == Some(DockPosition::Bottom) {
+                                            h_flex()
+                                                .items_stretch()
+                                                .size_full()
+                                                .min_h_0()
+                                                .min_w_0()
+                                                .children(self.render_dock(
+                                                    DockPosition::Left,
+                                                    &self.left_dock,
+                                                    window,
+                                                    cx,
+                                                ))
+                                                .child(
+                                                    v_flex()
+                                                        .flex_1()
+                                                        .h_full()
+                                                        .min_w_0()
+                                                        .min_h_0()
+                                                        .children(self.render_dock(
+                                                            DockPosition::Bottom,
+                                                            &self.bottom_dock,
+                                                            window,
+                                                            cx,
+                                                        )),
+                                                )
+                                                .children(self.render_dock(
+                                                    DockPosition::Right,
+                                                    &self.right_dock,
+                                                    window,
+                                                    cx,
+                                                ))
+                                                .into_any_element()
+                                        } else if let Some(position) = self.filling_dock(cx) {
+                                            v_flex()
+                                                .size_full()
+                                                .min_h_0()
+                                                .child(
+                                                    h_flex()
+                                                        .items_stretch()
+                                                        .min_h_0()
+                                                        .overflow_hidden()
+                                                        .when(
+                                                            position != DockPosition::Bottom,
+                                                            |row| row.flex_1(),
+                                                        )
+                                                        .children(self.render_dock(
+                                                            DockPosition::Left,
+                                                            &self.left_dock,
+                                                            window,
+                                                            cx,
+                                                        ))
+                                                        .children(self.render_dock(
+                                                            DockPosition::Right,
+                                                            &self.right_dock,
+                                                            window,
+                                                            cx,
+                                                        )),
+                                                )
+                                                .children(self.render_dock(
+                                                    DockPosition::Bottom,
+                                                    &self.bottom_dock,
+                                                    window,
+                                                    cx,
+                                                ))
+                                                .into_any_element()
+                                        } else {
+                                            match bottom_dock_layout {
                                     BottomDockLayout::Full => div()
                                         .flex()
                                         .flex_col()
@@ -10320,7 +10445,8 @@ impl Render for Workspace {
                                             window,
                                             cx,
                                         )),
-                                }
+                                }.into_any_element()
+                                        }
                                     })
                                     .children(self.zoomed.as_ref().and_then(|view| {
                                         let zoomed_view = view.upgrade()?;
@@ -16302,6 +16428,116 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_empty_editor_chat_dock_keeps_sidebar_visible_after_resize(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            let right = cx.new(|cx| {
+                let mut panel = TestPanel::new_flexible(DockPosition::Right, 200, cx);
+                panel.fills_empty_workspace = true;
+                panel
+            });
+            workspace.add_panel(left, window, cx);
+            workspace.add_panel(right, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+        for size in [
+            gpui::size(px(1000.), px(700.)),
+            gpui::size(px(1600.), px(1000.)),
+        ] {
+            cx.simulate_resize(size);
+            cx.run_until_parked();
+            let left = cx.debug_bounds("left-dock").expect("left dock rendered");
+            let right = cx.debug_bounds("right-dock").expect("chat dock rendered");
+            assert!(left.size.height > px(500.), "sidebar collapsed: {left:?}");
+            assert!(
+                right.size.height > px(500.),
+                "chat dock collapsed: {right:?}"
+            );
+            assert!(left.size.width > px(200.));
+            assert!(right.size.width > size.width - left.size.width - px(100.));
+            assert!(
+                (right.left() - left.right()).abs() < px(2.),
+                "unexpected empty editor gap"
+            );
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_dock(DockPosition::Left, window, cx);
+                workspace.toggle_dock(DockPosition::Left, window, cx);
+            });
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("left-dock")
+                    .expect("reopened sidebar")
+                    .size
+                    .height
+                    > px(500.)
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_chat_sidebar_resizes_with_framed_filling_dock(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.pane_layout = Some(settings::PaneLayout::Separated);
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            let right = cx.new(|cx| {
+                let mut panel = TestPanel::new_flexible(DockPosition::Right, 200, cx);
+                panel.default_size = px(900.);
+                panel.fills_empty_workspace = true;
+                panel
+            });
+            workspace.add_panel(left, window, cx);
+            workspace.add_panel(right, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let before = cx.debug_bounds("left-dock").expect("left dock");
+        let start = gpui::point(before.right() - px(5.), before.top() + px(100.));
+        let end = start + gpui::point(px(140.), px(0.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(10.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let after = cx.debug_bounds("left-dock").expect("resized left dock");
+        assert!(
+            after.size.width > before.size.width + px(100.),
+            "resize handle or stale chat width blocked dragging: {before:?} -> {after:?}"
+        );
+        cx.simulate_resize(gpui::size(px(1400.), px(800.)));
+        cx.run_until_parked();
+        assert!(
+            (cx.debug_bounds("left-dock")
+                .expect("restored width")
+                .size
+                .width
+                - after.size.width)
+                .abs()
+                < px(2.)
+        );
     }
 
     #[gpui::test]

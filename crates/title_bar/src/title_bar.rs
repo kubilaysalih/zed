@@ -294,6 +294,16 @@ impl Render for TitleBar {
             }
         }
 
+        if self
+            .workspace
+            .upgrade()
+            .is_some_and(|workspace| workspace.read(cx).global_chat_mode())
+        {
+            project_name = Some("General".into());
+            repository = None;
+            linked_worktree_name = None;
+        }
+
         children.push(
             h_flex()
                 .h_full()
@@ -789,6 +799,18 @@ impl TitleBar {
         let workspace = self.workspace.clone();
 
         let is_project_selected = name.is_some();
+        let foreground =
+            if workspace::folder_colors::for_project(self.project.read(cx), cx).is_some() {
+                Color::Custom(if cx.theme().appearance.is_light() {
+                    gpui::black()
+                } else {
+                    gpui::white()
+                })
+            } else if is_project_selected {
+                Color::Default
+            } else {
+                Color::Muted
+            };
 
         let display_name = if let Some(ref name) = name {
             util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)
@@ -843,16 +865,18 @@ impl TitleBar {
             .trigger_with_tooltip(
                 Button::new("project_name_trigger", display_name)
                     .label_size(LabelSize::Small)
+                    .color(foreground)
+                    .selected_label_color(foreground)
                     .tab_index(0isize)
                     .when(self.worktree_count(cx) > 1, |this| {
                         this.end_icon(
                             Icon::new(IconName::ChevronDown)
                                 .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                .color(foreground),
                         )
                     })
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .when(!is_project_selected, |s| s.color(Color::Muted)),
+                    .when(!is_project_selected, |s| s.color(foreground)),
                 move |_window, cx| {
                     Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
                 },

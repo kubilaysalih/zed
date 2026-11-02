@@ -52,6 +52,10 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
         PanelSizeState::default()
     }
     fn size_state_changed(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// Occupy the empty editor area when no center tabs are open.
+    fn fills_empty_workspace(&self) -> bool {
+        false
+    }
     fn supports_flexible_size(&self) -> bool {
         false
     }
@@ -116,6 +120,7 @@ pub trait PanelHandle: Send + Sync {
     fn min_size(&self, window: &Window, cx: &App) -> Option<Pixels>;
     fn initial_size_state(&self, window: &Window, cx: &App) -> PanelSizeState;
     fn size_state_changed(&self, window: &mut Window, cx: &mut App);
+    fn fills_empty_workspace(&self, cx: &App) -> bool;
     fn supports_flexible_size(&self, cx: &App) -> bool;
     fn has_flexible_size(&self, window: &Window, cx: &App) -> bool;
     fn set_flexible_size(&self, flexible: bool, window: &mut Window, cx: &mut App);
@@ -212,6 +217,9 @@ where
         self.update(cx, |this, cx| this.size_state_changed(window, cx))
     }
 
+    fn fills_empty_workspace(&self, cx: &App) -> bool {
+        self.read(cx).fills_empty_workspace()
+    }
     fn supports_flexible_size(&self, cx: &App) -> bool {
         self.read(cx).supports_flexible_size()
     }
@@ -1307,7 +1315,7 @@ impl Render for Dock {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(px(0.))
                             .top(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
@@ -1316,7 +1324,7 @@ impl Render for Dock {
                     DockPosition::Bottom => deferred(
                         handle
                             .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
+                            .top(px(0.))
                             .left(px(0.))
                             .w_full()
                             .h(RESIZE_HANDLE_SIZE)
@@ -1326,7 +1334,7 @@ impl Render for Dock {
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
                             .cursor_col_resize(),
@@ -1336,6 +1344,7 @@ impl Render for Dock {
 
             div()
                 .id("dock-panel")
+                .relative()
                 .key_context(dispatch_context)
                 .track_focus(&self.focus_handle(cx))
                 .focus_follows_mouse(WorkspaceSettings::get_global(cx).focus_follows_mouse, cx)
@@ -1419,7 +1428,8 @@ impl Render for PanelButtons {
             entries.sort_by_key(|(_, entry)| match entry.panel.persistent_name() {
                 "Project Panel" => 0,
                 "GitPanel" => 1,
-                _ => 2,
+                "Project Search Panel" => 2,
+                _ => 3,
             });
         }
         let mut buttons: Vec<_> = entries
@@ -1614,9 +1624,30 @@ impl Render for PanelButtons {
                                 .when_some(
                                     icon_label
                                         .clone()
-                                        .filter(|_| !is_active_button)
+                                        .filter(|_| vertical || !is_active_button)
                                         .and_then(|label| label.parse::<usize>().ok()),
-                                    |this, count| this.child(CountBadge::new(count)),
+                                    |this, count| {
+                                        if vertical {
+                                            this.child(
+                                                h_flex()
+                                                    .absolute()
+                                                    .bottom_0()
+                                                    .right_0()
+                                                    .px_1()
+                                                    .rounded_full()
+                                                    .bg(cx.theme().colors().editor_background)
+                                                    .child(
+                                                        Label::new(count.to_string())
+                                                            .size(LabelSize::Custom(rems_from_px(
+                                                                10_f32,
+                                                            )))
+                                                            .color(Color::Default),
+                                                    ),
+                                            )
+                                        } else {
+                                            this.child(CountBadge::new(count))
+                                        }
+                                    },
                                 )
                         })
                         .into_any_element(),
@@ -1627,7 +1658,12 @@ impl Render for PanelButtons {
         if dock_position == DockPosition::Right {
             buttons.reverse();
         }
-        if vertical {
+        if vertical
+            && !dock
+                .panel_entries
+                .iter()
+                .any(|entry| entry.panel.persistent_name() == "Project Search Panel")
+        {
             buttons.insert(
                 buttons.len().min(2),
                 div()
@@ -1728,6 +1764,7 @@ pub mod test {
         pub activation_focus_handle: Option<FocusHandle>,
         pub default_size: Pixels,
         pub flexible: bool,
+        pub fills_empty_workspace: bool,
         pub activation_priority: u32,
     }
     actions!(test_only, [ToggleTestPanel]);
@@ -1744,6 +1781,7 @@ pub mod test {
                 activation_focus_handle: None,
                 default_size: px(300.),
                 flexible: false,
+                fills_empty_workspace: false,
                 activation_priority,
             }
         }
@@ -1783,6 +1821,9 @@ pub mod test {
     }
 
     impl Panel for TestPanel {
+        fn fills_empty_workspace(&self) -> bool {
+            self.fills_empty_workspace
+        }
         fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
             self.activation_focus_handle
                 .clone()
