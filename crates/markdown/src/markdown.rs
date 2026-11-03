@@ -1775,6 +1775,7 @@ pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
     code_block_renderer: CodeBlockRenderer,
+    code_block_actions: Option<Rc<dyn Fn(&str, usize, &mut Window, &App) -> AnyElement>>,
     input_focus_handle: Option<FocusHandle>,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
@@ -1802,6 +1803,7 @@ impl MarkdownElement {
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
                 border: false,
             },
+            code_block_actions: None,
             input_focus_handle: None,
             on_url_click: None,
             on_url_hover: None,
@@ -1840,6 +1842,14 @@ impl MarkdownElement {
 
     pub fn code_block_renderer(mut self, variant: CodeBlockRenderer) -> Self {
         self.code_block_renderer = variant;
+        self
+    }
+
+    pub fn code_block_actions(
+        mut self,
+        render: impl Fn(&str, usize, &mut Window, &App) -> AnyElement + 'static,
+    ) -> Self {
+        self.code_block_actions = Some(Rc::new(render));
         self
     }
 
@@ -2850,7 +2860,9 @@ impl Element for MarkdownElement {
                                 CodeBlockRenderer::Default {
                                     copy_button_visibility,
                                     ..
-                                } if *copy_button_visibility != CopyButtonVisibility::Hidden => {
+                                } if *copy_button_visibility != CopyButtonVisibility::Hidden
+                                    || self.code_block_actions.is_some() =>
+                                {
                                     Some(String::new())
                                 }
                                 _ => None,
@@ -2891,6 +2903,14 @@ impl Element for MarkdownElement {
                                     // Styles must be final before `custom_scrollbars`, which reads the
                                     // corner radii and borders to round the scrollbar track.
                                     parent_container.style().refine(&self.style.code_block);
+                                    if self.code_block_actions.is_some() {
+                                        parent_container = parent_container
+                                            .m_0()
+                                            .border_0()
+                                            .rounded_none()
+                                            .px_3()
+                                            .py_3();
+                                    }
 
                                     let parent_container: AnyDiv = if let Some(scroll_handle) =
                                         scroll_handle.as_ref()
@@ -3206,7 +3226,8 @@ impl Element for MarkdownElement {
                             ..
                         } = &self.code_block_renderer
                             && (*copy_button_visibility != CopyButtonVisibility::Hidden
-                                || *wrap_button_visibility != WrapButtonVisibility::Hidden)
+                                || *wrap_button_visibility != WrapButtonVisibility::Hidden
+                                || self.code_block_actions.is_some())
                         {
                             let copy_button_visibility = *copy_button_visibility;
                             let wrap_button_visibility = *wrap_button_visibility;
@@ -3226,15 +3247,22 @@ impl Element for MarkdownElement {
                                         format!("markdown_code_block_buttons_{}", range.end)
                                     })
                                     .gap_0p5()
-                                    .absolute()
-                                    .bg(cx.theme().colors().editor_background)
-                                    .when_else(
-                                        use_hover,
-                                        |this| {
-                                            this.top_1().right_1().visible_on_hover("code_block")
-                                        },
-                                        |this| this.top_1p5().right_1p5(),
-                                    )
+                                    .when(self.code_block_actions.is_none(), |this| {
+                                        this.absolute()
+                                            .bg(cx.theme().colors().editor_background)
+                                            .when_else(
+                                                use_hover,
+                                                |this| {
+                                                    this.top_1()
+                                                        .right_1()
+                                                        .visible_on_hover("code_block")
+                                                },
+                                                |this| this.top_1p5().right_1p5(),
+                                            )
+                                    })
+                                    .when_some(self.code_block_actions.as_ref(), |this, render| {
+                                        this.child(render(&code, range.end, window, cx))
+                                    })
                                     .when(
                                         wrap_button_visibility != WrapButtonVisibility::Hidden,
                                         |this| {
@@ -3261,7 +3289,33 @@ impl Element for MarkdownElement {
                                         },
                                     );
 
-                                el.child(button_row)
+                                if self.code_block_actions.is_some() {
+                                    let mut container = div().w_full().min_w_0();
+                                    container.style().refine(&self.style.code_block);
+                                    container
+                                        .p_0()
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .child(
+                                            h_flex()
+                                                .w_full()
+                                                .h_8()
+                                                .px_3()
+                                                .justify_between()
+                                                .border_b_1()
+                                                .border_color(cx.theme().colors().border_variant)
+                                                .child(
+                                                    Label::new("Code")
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(button_row),
+                                        )
+                                        .child(el.into_any_element())
+                                        .into()
+                                } else {
+                                    el.child(button_row)
+                                }
                             });
                         }
 

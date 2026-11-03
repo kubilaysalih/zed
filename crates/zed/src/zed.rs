@@ -1,4 +1,7 @@
 mod app_menus;
+pub(crate) mod chat_bridge;
+static CHAT_BRIDGE_DEMO_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 mod chat_history;
 mod chat_history_store;
 mod chat_image_preview;
@@ -819,6 +822,11 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             workspace.finish_dock_restoration(cx);
             if std::env::var_os("ZED_PREVIEW_CHAT_HISTORY").is_some() {
                 workspace.focus_panel::<chat_history::ChatHistoryPanel>(window, cx);
+            }
+            if std::env::var_os("ZED_PREVIEW_CHAT_BRIDGE_DEMO").is_some()
+                && !CHAT_BRIDGE_DEMO_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                chat_history::open_bridge_demo(workspace, window, cx);
             }
         })?;
 

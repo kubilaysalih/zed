@@ -9,7 +9,7 @@ use crate::{
 use breadcrumbs::Breadcrumbs;
 use collections::HashMap;
 use db::kvp::KeyValueStore;
-use futures::{channel::oneshot, future::join_all};
+use futures::{FutureExt, channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt, WeakEntity,
@@ -41,6 +41,32 @@ use anyhow::{Result, anyhow};
 use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
+
+fn code_block_terminal_input(code: &str, execute: bool, bracketed: bool) -> Result<Vec<u8>> {
+    let code = code.replace("\r\n", "\n");
+    let code = code.trim_end_matches(['\r', '\n']);
+    anyhow::ensure!(!code.trim().is_empty(), "The code block is empty.");
+    anyhow::ensure!(
+        !code
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t'),
+        "The code block contains terminal control characters."
+    );
+    // Without bracketed paste, a newline is an Enter key and can execute code.
+    anyhow::ensure!(
+        execute || bracketed || !code.contains('\n'),
+        "This shell does not support safe multiline paste. Enable bracketed paste or transfer one line at a time. No code was sent."
+    );
+    let mut input = if bracketed {
+        format!("\x1b[200~{code}\x1b[201~").into_bytes()
+    } else {
+        code.replace('\n', "\r").replace('\t', "    ").into_bytes()
+    };
+    if execute {
+        input.push(b'\r');
+    }
+    Ok(input)
+}
 
 actions!(
     terminal_panel,
@@ -926,6 +952,36 @@ impl TerminalPanel {
 
                 terminal.downgrade()
             })
+        })
+    }
+
+    pub fn open_code_block(
+        &mut self,
+        code: String,
+        cwd: Option<PathBuf>,
+        execute: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let task = self.add_terminal_shell(false, cwd, RevealStrategy::Always, window, cx);
+        cx.spawn(async move |_, cx| {
+            let terminal = task.await?;
+            let startup = terminal.update(cx, |terminal, _| {
+                terminal.start_init_command_startup_handshake()
+            })?;
+            let timeout = cx.background_executor().timer(Duration::from_secs(10));
+            futures::select_biased! {
+                _ = startup.fuse() => {},
+                _ = timeout.fuse() => anyhow::bail!("Terminal is not ready. No code was sent; retry when the shell is available."),
+            }
+            terminal.update(cx, |terminal, _| {
+                let bracketed = terminal.last_content().mode.contains(terminal::Modes::BRACKETED_PASTE);
+                let input = code_block_terminal_input(&code, execute, bracketed)?;
+                if !terminal.write_input_after_startup(input) {
+                    anyhow::bail!("Terminal input changed before the code could be sent. No code was sent.");
+                }
+                anyhow::Ok(())
+            })?
         })
     }
 
@@ -1883,6 +1939,47 @@ mod tests {
     use project::FakeFs;
     use settings::SettingsStore;
     use workspace::{MultiWorkspace, WorkspaceId};
+
+    #[test]
+    fn test_code_block_transfer_never_submits() {
+        assert_eq!(
+            code_block_terminal_input("echo hello\r\n", false, false).expect("single line"),
+            b"echo hello"
+        );
+        assert_eq!(
+            code_block_terminal_input("echo one\necho two\n", false, true)
+                .expect("bracketed multiline"),
+            b"\x1b[200~echo one\necho two\x1b[201~"
+        );
+        assert!(code_block_terminal_input("echo one\necho two", false, false).is_err());
+    }
+
+    #[test]
+    fn test_code_block_run_submits_once_after_paste() {
+        assert_eq!(
+            code_block_terminal_input("echo hello\n", true, false).expect("command"),
+            b"echo hello\r"
+        );
+        assert_eq!(
+            code_block_terminal_input("echo one\r\necho two\n", true, true)
+                .expect("multiline command"),
+            b"\x1b[200~echo one\necho two\x1b[201~\r"
+        );
+    }
+
+    #[test]
+    fn test_code_block_rejects_terminal_control_sequences() {
+        for code in [
+            "",
+            "  \n",
+            "echo x\x1b[201~\r",
+            "echo x\x03",
+            "echo x\rwhoami",
+        ] {
+            assert!(code_block_terminal_input(code, false, true).is_err());
+            assert!(code_block_terminal_input(code, true, true).is_err());
+        }
+    }
 
     #[test]
     fn test_prepare_empty_task() {

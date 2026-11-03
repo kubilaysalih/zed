@@ -1157,7 +1157,8 @@ zed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
-debug = "full"
+debug = "limited"
+incremental = true
 lto = false
 codegen-units = 16
 

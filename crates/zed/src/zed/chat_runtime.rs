@@ -235,6 +235,7 @@ pub struct Run {
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
+    pub bridge: Option<super::chat_bridge::Connection>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub attachments: Vec<PathBuf>,
@@ -285,6 +286,84 @@ pub fn quota_windows(value: &Value) -> Vec<QuotaWindow> {
             })
         })
         .collect()
+}
+
+pub fn claude_quota_windows(value: &Value) -> Vec<QuotaWindow> {
+    let report = value
+        .get("usage_report")
+        .or_else(|| value["message"].get("usage_report"));
+    if let Some(report) = report {
+        return report["rate_limits"]["limits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|limit| {
+                let percent = limit["percent"].as_f64()?;
+                if !percent.is_finite() {
+                    return None;
+                }
+                let label = limit["label"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        let period = if limit["group"] == "weekly" {
+                            "7d quota"
+                        } else {
+                            "Session quota"
+                        };
+                        match limit["scope"]["model"]["display_name"].as_str() {
+                            Some(model) => format!("{model} {period}"),
+                            None => period.into(),
+                        }
+                    });
+                Some(QuotaWindow {
+                    label,
+                    used_percent: percent.clamp(0., 100.) as f32,
+                    resets_at: limit["resets_at"]
+                        .as_str()
+                        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+                        .map(|time| time.timestamp()),
+                })
+            })
+            .collect();
+    }
+    if value["type"] == "rate_limit_event" {
+        let info = &value["rate_limit_info"];
+        if let Some(used) = info["utilization"].as_f64().filter(|used| used.is_finite()) {
+            return vec![QuotaWindow {
+                label: match info["rateLimitType"].as_str() {
+                    Some("five_hour") => "5h quota".into(),
+                    Some("seven_day") => "7d quota".into(),
+                    Some(kind) => format!("{} quota", kind.replace('_', " ")),
+                    None => "Reported limit".into(),
+                },
+                used_percent: (used * 100.).clamp(0., 100.) as f32,
+                resets_at: info["resetsAt"].as_i64(),
+            }];
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+#[test]
+fn claude_quota_reports_preserve_scope_and_missing_values() {
+    assert!(claude_quota_windows(&json!({"type":"assistant"})).is_empty());
+    let windows = claude_quota_windows(&json!({"usage_report":{"rate_limits":{"limits":[
+        {"kind":"weekly_all","group":"weekly","percent":67,"resets_at":"2026-11-05T07:00:00Z"},
+        {"group":"weekly","percent":42,"scope":{"model":{"display_name":"Fable"}}},
+        {"group":"weekly","percent":null}
+    ]}}}));
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[0].label, "7d quota");
+    assert_eq!(windows[0].used_percent, 67.);
+    assert!(windows[0].resets_at.is_some());
+    assert_eq!(windows[1].label, "Fable 7d quota");
+    let event = claude_quota_windows(
+        &json!({"type":"rate_limit_event","rate_limit_info":{"utilization":0.25,"rateLimitType":"five_hour","resetsAt":123}}),
+    );
+    assert_eq!(event[0].used_percent, 25.);
+    assert_eq!(event[0].label, "5h quota");
 }
 
 #[cfg(test)]
@@ -355,8 +434,15 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
     if provider == Provider::Codex {
         command.args(["app-server", "--listen", "stdio://"]);
     } else {
+        // Account usage is a local CLI command. Avoid loading the current project's
+        // MCP servers or running it as part of an existing conversation.
+        command.current_dir(std::env::temp_dir());
         command.args([
             "--print",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "{\"mcpServers\":{}}",
             "--input-format",
             "stream-json",
             "--output-format",
@@ -396,13 +482,37 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
             &json!({"type":"control_request","request_id":"init","request":{"subtype":"initialize"}}),
         )?;
     }
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut models = Vec::new();
+    let mut claude_usage_requested = false;
+    let mut claude_quota = Vec::new();
     loop {
-        let line = receive
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .context("Model discovery timed out or closed")?;
+        let line = match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => line,
+            Err(_) if claude_usage_requested => {
+                return Ok(ProviderInfo {
+                    models,
+                    quota: claude_quota,
+                    quota_error: Some("Claude usage request timed out. Try refreshing.".into()),
+                });
+            }
+            Err(error) => return Err(error).context("Model discovery timed out or closed"),
+        };
         let value: Value = serde_json::from_str(&line)?;
+        if claude_usage_requested {
+            let quota = claude_quota_windows(&value);
+            if !quota.is_empty() {
+                claude_quota = quota;
+            }
+            if value["type"] == "result" {
+                let quota_error = claude_quota.is_empty().then(|| "Claude did not report account usage for this login. Try /usage in Claude Code.".into());
+                return Ok(ProviderInfo {
+                    models,
+                    quota: claude_quota,
+                    quota_error,
+                });
+            }
+        }
         if provider == Provider::Codex {
             if value["id"] == 3 {
                 return Ok(ProviderInfo {
@@ -441,13 +551,20 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
             if value["response"]["subtype"] == "error" {
                 bail!("{}", value["response"]["error"]);
             }
-            return Ok(ProviderInfo {
-                models: parse_models(provider, &value["response"]["response"]["models"]),
-                quota_error: Some(
-                    "Claude Code does not report account quota through this connection.".into(),
-                ),
-                ..Default::default()
-            });
+            models = parse_models(provider, &value["response"]["response"]["models"]);
+            let supported = value["response"]["response"]["commands"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|command| command["name"] == "usage");
+            if !supported {
+                return Ok(ProviderInfo { models, quota_error: Some("This Claude version does not expose /usage. Update Claude Code to read account usage.".into()), ..Default::default() });
+            }
+            claude_usage_requested = true;
+            write_json(
+                &mut input,
+                &json!({"type":"user","message":{"role":"user","content":"/usage"}}),
+            )?;
         }
     }
 }
@@ -617,7 +734,12 @@ pub fn start(chat: Chat, prompt: String, fork: bool, new: bool, options: RunOpti
     let (sender, events) = mpsc::channel();
     thread::spawn(move || {
         let provider = chat.provider;
-        let result = ActiveRun::acquire(chat.key())
+        let lease_key = if fork {
+            format!("fork:{}:{}", chat.key(), uuid::Uuid::new_v4())
+        } else {
+            chat.key()
+        };
+        let result = ActiveRun::acquire(lease_key)
             .and_then(|_lease| run(chat, prompt, fork, new, options, &sender, control));
         if let Err(error) = emit(
             &sender,
@@ -773,6 +895,8 @@ pub struct StreamState {
     claude_blocks: HashMap<u64, String>,
     compaction: Option<String>,
     compaction_count: u64,
+    plan: Vec<super::chat_history_store::PlanStep>,
+    plan_updates: HashMap<String, (String, String)>,
 }
 impl StreamState {
     pub fn ingest(&mut self, provider: Provider, value: &Value) -> Vec<(String, Message)> {
@@ -829,6 +953,19 @@ impl StreamState {
         if provider == Provider::Codex {
             let method = text(value, "method");
             let params = &value["params"];
+            if method == "turn/plan/updated" {
+                let id = format!("plan:{}", text(params, "turnId"));
+                let message = Message {
+                    role: "plan".into(),
+                    tool_name: "update_plan".into(),
+                    tool_input: params.to_string(),
+                    timestamp: now(),
+                    ..Default::default()
+                };
+                self.plan = super::chat_history_store::plan_steps(&message);
+                self.items.insert(id.clone(), message.clone());
+                return vec![(id, message)];
+            }
             if method == "item/started" || method == "item/completed" {
                 let item = &params["item"];
                 let id = text(item, "id");
@@ -976,6 +1113,7 @@ impl StreamState {
                 }
             } else if value["type"] == "assistant" {
                 let source = &value["message"];
+                let mut matched_blocks = HashSet::new();
                 for (index, block) in source["content"]
                     .as_array()
                     .into_iter()
@@ -988,6 +1126,28 @@ impl StreamState {
                     }
                     let id = if tool {
                         text(block, "id")
+                    } else if block["type"] == "text" && source["id"] == self.claude_message {
+                        // Claude can emit a final packet containing only one block, while
+                        // stream indexes also count thinking blocks. Reconcile by streamed
+                        // identity instead of treating the packet's index as a new message.
+                        let final_text = text(block, "text");
+                        let mut candidates = self.claude_blocks.iter().collect::<Vec<_>>();
+                        candidates.sort_by_key(|(index, _)| **index);
+                        let existing = candidates.into_iter().find_map(|(_, id)| {
+                            self.items
+                                .get(id)
+                                .filter(|message| {
+                                    message.role == "assistant"
+                                        && !matched_blocks.contains(id)
+                                        && !message.text.is_empty()
+                                        && final_text.starts_with(&message.text)
+                                })
+                                .map(|_| id.clone())
+                        });
+                        let id =
+                            existing.unwrap_or_else(|| format!("{}:{index}", text(source, "id")));
+                        matched_blocks.insert(id.clone());
+                        id
                     } else {
                         format!("{}:{index}", text(source, "id"))
                     };
@@ -1068,6 +1228,22 @@ impl StreamState {
                 }
             }
         }
+        for (id, message) in &mut changed {
+            let input = message.tool_input.clone();
+            if let Some((previous_input, snapshot)) = self.plan_updates.get(id)
+                && *previous_input == input
+            {
+                message.role = "plan".into();
+                message.tool_input = snapshot.clone();
+                continue;
+            }
+            let plan = super::chat_history_store::apply_plan_update(message, &self.plan);
+            if !plan.is_empty() {
+                self.plan = plan;
+                self.plan_updates
+                    .insert(id.clone(), (input, message.tool_input.clone()));
+            }
+        }
         changed
     }
 }
@@ -1139,6 +1315,29 @@ fn run(
         }
         if fork && !new {
             command.arg("--fork-session");
+        }
+    }
+    if let Some(bridge) = &options.bridge {
+        let executable = std::env::current_exe()?;
+        let arguments = bridge.helper_args();
+        if chat.provider == Provider::Codex {
+            command.arg("-c").arg(format!(
+                "mcp_servers.zed_chats.command={}",
+                serde_json::to_string(&executable.to_string_lossy())?
+            ));
+            command.arg("-c").arg(format!(
+                "mcp_servers.zed_chats.args={}",
+                serde_json::to_string(&arguments)?
+            ));
+        } else {
+            command.arg("--mcp-config").arg(
+                json!({"mcpServers":{"zed_chats":{"command":executable,"args":arguments}}})
+                    .to_string(),
+            );
+            command.args([
+                "--allowedTools",
+                "mcp__zed_chats__list_chats,mcp__zed_chats__read_chat,mcp__zed_chats__send_message",
+            ]);
         }
     }
     let mut child = OwnedChild(command.spawn().context("Cannot start the local agent")?);
@@ -1259,6 +1458,12 @@ fn run(
                 }
                 if value["method"] == "account/rateLimits/updated" {
                     let quota = quota_windows(&value["params"]["rateLimits"]);
+                    if !quota.is_empty() {
+                        emit(sender, Event::Quota(quota))?;
+                    }
+                }
+                if chat.provider == Provider::Claude {
+                    let quota = claude_quota_windows(&value);
                     if !quota.is_empty() {
                         emit(sender, Event::Quota(quota))?;
                     }
@@ -1513,6 +1718,53 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_final_text_reuses_stream_index_after_thinking() {
+        let mut stream = StreamState::default();
+        for event in [
+            json!({"type":"message_start","message":{"id":"message"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"I will reply"}}),
+        ] {
+            stream.ingest(
+                Provider::Claude,
+                &json!({"type":"stream_event","event":event}),
+            );
+        }
+        let final_message = stream.ingest(Provider::Claude, &json!({"type":"assistant","message":{"id":"message","content":[{"type":"text","text":"I will reply"}]}}));
+        assert_eq!(final_message[0].0, "message:1");
+        assert_eq!(stream.items.len(), 1);
+    }
+    #[test]
+    fn live_plan_notifications_update_the_same_card() {
+        let mut stream = super::StreamState::default();
+        let first = stream.ingest(super::Provider::Codex, &serde_json::json!({"method":"turn/plan/updated","params":{"turnId":"turn","plan":[{"step":"Review","status":"in_progress"}]}}));
+        let second = stream.ingest(super::Provider::Codex, &serde_json::json!({"method":"turn/plan/updated","params":{"turnId":"turn","plan":[{"step":"Review","status":"completed"}]}}));
+        assert_eq!(first[0].0, second[0].0);
+        assert_eq!(second[0].1.role, "plan");
+        assert_eq!(
+            super::super::chat_history_store::plan_steps(&second[0].1)[0].status,
+            "completed"
+        );
+        let claude = stream.ingest(super::Provider::Claude, &serde_json::json!({"type":"assistant","message":{"id":"reply","content":[{"type":"tool_use","id":"plan","name":"mcp__ccd_turn__update_plan","input":{"items":[{"content":"Review","status":"pending"}]}}]}}));
+        assert_eq!(claude[0].1.role, "plan");
+    }
+
+    #[test]
+    fn claude_plan_delta_is_not_reapplied_when_tool_result_arrives() {
+        let mut stream = StreamState::default();
+        stream.ingest(Provider::Claude, &json!({"type":"assistant","message":{"id":"one","content":[{"type":"tool_use","id":"initial","name":"mcp__ccd_turn__update_plan","input":{"items":[{"content":"A","status":"in_progress"},{"content":"B","status":"pending"},{"content":"C","status":"pending"}]}}]}}));
+        let event = json!({"type":"assistant","message":{"id":"two","content":[{"type":"tool_use","id":"advance","name":"mcp__ccd_turn__update_plan","input":{"advance":true}}]}});
+        let advanced = stream.ingest(Provider::Claude, &event);
+        let result = stream.ingest(Provider::Claude, &json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"advance","content":"OK"}]}}));
+        assert_eq!(
+            super::super::chat_history_store::plan_steps(&advanced[0].1),
+            super::super::chat_history_store::plan_steps(&result[0].1)
+        );
+        assert_eq!(stream.plan[1].status, "in_progress");
+        assert_eq!(stream.plan[2].status, "pending");
+    }
     use super::*;
 
     #[test]

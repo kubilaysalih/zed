@@ -14,19 +14,30 @@ The features below describe changes in this fork. The original Zed README follow
 - Questions support selectable answers, free text, and skipping. Permission cards show the reason, command, and working directory, with technical details collapsed. Codex connections respect the installed client's approval and sandbox configuration.
 - Use **`/goal <objective>`** in Codex chats to start a goal, optionally with **`/goal --budget <tokens> <objective>`**. Status, pause, resume, and clear commands are supported; the goal indicator appears only when a goal exists.
 - Rename, pin, archive, restore, and move chats to manually created projects. Trash is reversible. These organization changes are stored locally in this fork; they do not rename, archive, or delete chats in the original applications.
-- Group chats by date or by your own projects. Each project supports **Newest first** or **Custom · drag to reorder** sorting. Project-grouped rows omit the redundant project subtitle.
+- Group chats by date, by your own projects, or **By status**: Pinned, In progress, Input required, Unread, and Ready. Each project supports **Newest first** or **Custom · drag to reorder** sorting. Project-grouped rows omit the redundant project subtitle.
 - Existing conversations keep their provider fixed. Model and effort can be selected for the next turn using the options reported by the installed provider.
 - Attach images and local files using the attachment button, drag and drop, or clipboard paste. Images use provider image inputs; other files are referenced by their local paths and remain subject to the agent's normal permissions.
 - View Markdown, tables, and supported local or embedded images, including images in Claude tool results. Click an image to open the preview, zoom with the wheel or buttons, drag to pan, and use **Fit** to reset. Zoom has no fixed UI maximum.
 - Local file attachments and Codex file citations appear as file cards. Citations stay in their original position alongside the message text. Click to open with the system's default application, or right-click to open in Zed, reveal in File Explorer, or copy the path or filename.
 - Public progress updates and tool results appear in compact expandable activity groups. Background task notifications are rendered as activity rather than raw XML. Context compaction has its own aligned progress/completion row.
+- Plans appear as selectable-text checklists with pending, running, and completed steps. Claude subtasks can open their linked saved history separately. Automatic goal check-ins and internal continuation messages appear as activity; pasted-content wrappers are removed while preserving their contents.
+- Fenced code blocks have syntax highlighting and a separate toolbar for copying, **Run in Terminal**, and transferring code to the terminal without submitting it. Terminal startup preserves the shell prompt position; multiline transfer requires bracketed-paste support. Temporary file-opening errors can be dismissed.
 - Conversations open at the latest messages; scrolling upward loads older history automatically while preserving the reading position. Image thumbnails, centered loading states, message-hover copy controls, and a growing composer keep the conversation readable.
 - Sent messages appear immediately. Failed sends retain their bubble with retry controls; writer conflicts also offer sending in a new copy. Streaming updates preserve Markdown views, and the activity indicator has reserved space above the composer to avoid shifting the conversation.
 - Running chats show spinners in the sidebar and chat tabs. Completed, unread replies show persistent dots. The latest public activity is shown above the composer.
-- Context and account-quota indicators share the model/effort row. They use reported values rather than guessed limits; Claude account quota is currently unavailable through this connection.
+- Context and account-quota gauges share the model/effort row and show compact percentages, with labels, token counts, and reset details on hover. Claude usage reports and rate-limit events are supported when exposed by the installed client. Missing limits remain unknown rather than being guessed.
 - Turn completion notifications on or off, choose native system notifications or Zed popups, and configure sound and auto-dismiss. Native notification presentation also follows the operating system's settings.
 
 **Requirements and scope:** Codex uses its local App Server; Claude uses the official CLI's streaming JSON transport. Sending messages requires the relevant installed, signed-in client. Chats checks for those clients when opened and provides setup links when missing; saved history remains readable without them. This is a local coding-chat integration, not synchronization with ChatGPT or Claude web Projects. A forked conversation shares earlier context, but subsequent messages are independent.
+
+## Collaboration between local chats
+
+- Choose **Link for collaboration** from each chat's sidebar menu to connect Codex and Claude conversations. A group can contain more than two chats; an agent can consult several linked conversations through the local `zed_chats` tools.
+- Each recipient has its own message queue. Delivery waits until that chat is ready, preserving its existing writer and leaving drafts, pending questions, and permissions undisturbed. Repeated message IDs are deduplicated, and another application's writer lock is never forcibly bypassed.
+- Linked messages display their source with a provider icon and a compact card. Use **Pause exchange** to pause delivery or **Unlink from collaboration** to disconnect one chat. There is no fixed conversation-turn limit.
+- Use **Fork conversation** in the sidebar menu to continue with the same earlier context in an independent conversation. Chats settings also includes a **Codex ↔ Claude demo** that creates two new chats for a design discussion.
+
+Collaboration is opt-in and local to the running app. Group membership and pending deliveries are held in memory and are not restored after restarting Zed. Normal chat histories remain saved by their providers.
 
 ## General view and persistent projects
 
@@ -49,6 +60,7 @@ The features below describe changes in this fork. The original Zed README follow
 - Repositories under an opened folder appear in separate collapsible sections, each with its own Changes / History view, staging controls, and commit draft.
 - Repository sections use distinct backgrounds and readable headers with compact spacing. Duplicate entries are removed, and changed-file totals include nested folders and repositories in the Git activity badge.
 - Click a repository's branch name to switch branches for that repository. Changes lists grow with their contents and scroll through the panel rather than being clipped to a small fixed height.
+- Long multi-repository lists keep their vertical scrollbar attached to the panel viewport, so it remains reachable while scrolling through large change sets.
 - In **View Options → Open Changed Files**, choose **All Changes in One Tab**, **Separate File Diffs (Side by Side)**, or **Open File Without Diff**. Preferences persist; the combined diff view remains the default.
 - Right-click a folder and choose **Hide Folder** to hide it and nested repositories from both Files and Git. Use **Hidden Folders** or **Show All Hidden Folders** to restore them. This does not delete files or modify `.gitignore`.
 - Invalid or empty `.git` directories are no longer presented as ownership/trust failures. Actual Git ownership and project-trust checks remain in place.
@@ -69,10 +81,12 @@ Custom Windows builds are distributed separately as a signed **Zed Setup** execu
 For a local optimized build, first follow the [Windows development prerequisites](./docs/src/development/windows.md), then run:
 
 ```powershell
-cargo build --profile release-fast -p zed --bin zed -p cli --bin cli --locked
+pwsh -File script/build-windows-update.ps1
 ```
 
 The resulting executables are in `target/release-fast`. A standalone distribution also needs the Windows terminal support files and license notices; an EXE alone is not the full installer.
+
+The update script reuses the repository's `target` directory and enables incremental compilation. The `release-fast` profile retains release optimization with limited debug information. Keep the build cache between updates; changing the Rust toolchain or profile settings can require a large rebuild. Use `-Jobs 6` to adjust parallelism and `-Offline` when all dependencies are already cached. Cargo writes build timing reports to `target/cargo-timings`. Installer packaging and signing are separate steps and do not require recompilation.
 
 The download links in the original README below point to **upstream Zed**, not this fork.
 

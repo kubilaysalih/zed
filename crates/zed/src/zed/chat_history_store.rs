@@ -256,6 +256,159 @@ pub fn is_question_tool(name: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: String,
+}
+
+fn is_plan_tool(name: &str) -> bool {
+    let name = name.rsplit('.').next().unwrap_or(name);
+    name == "TodoWrite"
+        || name == "plan"
+        || name == "update_plan"
+        || name.ends_with("__update_plan")
+}
+
+pub fn plan_steps(message: &Message) -> Vec<PlanStep> {
+    if !is_plan_tool(&message.tool_name) {
+        return Vec::new();
+    }
+    let Ok(input) = serde_json::from_str::<Value>(&message.tool_input) else {
+        return Vec::new();
+    };
+    input
+        .get("items")
+        .or_else(|| input.get("plan"))
+        .or_else(|| input.get("todos"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|step| {
+            let text = step
+                .get("content")
+                .or_else(|| step.get("step"))?
+                .as_str()?
+                .trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(PlanStep {
+                text: text.into(),
+                status: match step["status"].as_str().unwrap_or("pending") {
+                    "inProgress" => "in_progress",
+                    status => status,
+                }
+                .into(),
+            })
+        })
+        .collect()
+}
+
+pub fn normalize_plan(message: &mut Message) {
+    if !plan_steps(message).is_empty() {
+        message.role = "plan".into();
+    }
+}
+
+pub fn apply_plan_update(message: &mut Message, previous: &[PlanStep]) -> Vec<PlanStep> {
+    let full = plan_steps(message);
+    if !full.is_empty() {
+        message.role = "plan".into();
+        return full;
+    }
+    if !is_plan_tool(&message.tool_name) || previous.is_empty() {
+        return Vec::new();
+    }
+    let Ok(input) = serde_json::from_str::<Value>(&message.tool_input) else {
+        return Vec::new();
+    };
+    let mut steps = previous.to_vec();
+    let mut changed = false;
+    if input["advance"] == true {
+        if let Some(current) = steps.iter().position(|step| step.status == "in_progress") {
+            steps[current].status = "completed".into();
+            if let Some(next) = steps
+                .iter_mut()
+                .skip(current + 1)
+                .find(|step| step.status == "pending")
+            {
+                next.status = "in_progress".into();
+            }
+            changed = true;
+        }
+    }
+    let done = input["done"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| vec![input["done"].clone()]);
+    for index in done
+        .iter()
+        .filter_map(Value::as_u64)
+        .filter_map(|index| index.checked_sub(1))
+        .filter_map(|index| usize::try_from(index).ok())
+    {
+        if let Some(step) = steps.get_mut(index) {
+            step.status = "completed".into();
+            changed = true;
+        }
+    }
+    if let Some(index) = input["start"]
+        .as_u64()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| usize::try_from(index).ok())
+    {
+        if let Some(step) = steps.get_mut(index) {
+            step.status = "in_progress".into();
+            changed = true;
+        }
+    }
+    if !changed {
+        return Vec::new();
+    }
+    message.role = "plan".into();
+    message.tool_input = serde_json::json!({"items":steps.iter().map(|step| serde_json::json!({"content":step.text,"status":step.status})).collect::<Vec<_>>(),"update":input}).to_string();
+    steps
+}
+
+pub fn work_summary(messages: &[&Message]) -> String {
+    let mut commands = 0;
+    let mut agents = 0;
+    let mut other = 0;
+    let mut failed = 0;
+    for message in messages.iter().filter(|message| message.role == "activity") {
+        failed += usize::from(message.tool_error);
+        if tool_label(message) == "Run command" {
+            commands += 1;
+        } else if matches!(
+            message.tool_name.rsplit('.').next(),
+            Some("Agent" | "Task" | "spawn_agent")
+        ) {
+            agents += 1;
+        } else {
+            other += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    for (count, singular, plural) in [
+        (commands, "command", "commands"),
+        (agents, "agent", "agents"),
+        (other, "step", "steps"),
+    ] {
+        if count > 0 {
+            parts.push(format!(
+                "{count} {}",
+                if count == 1 { singular } else { plural }
+            ));
+        }
+    }
+    let mut summary = parts.join(" · ");
+    if failed > 0 {
+        summary.push_str(&format!(" · {failed} failed"));
+    }
+    summary
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationPart {
     Message(usize),
     Work(std::ops::Range<usize>),
@@ -264,7 +417,15 @@ pub enum ConversationPart {
 pub fn conversation_parts(messages: &[&Message]) -> Vec<ConversationPart> {
     let mut parts = Vec::new();
     for (index, message) in messages.iter().enumerate() {
-        let work = message.role == "activity";
+        if message.role == "plan"
+            && messages[index + 1..]
+                .iter()
+                .take_while(|message| message.role != "user")
+                .any(|message| message.role == "plan")
+        {
+            continue;
+        }
+        let work = message.role == "activity" && !is_claude_subtask(message);
         if work {
             if let Some(ConversationPart::Work(range)) = parts.last_mut() {
                 range.end = index + 1;
@@ -276,6 +437,67 @@ pub fn conversation_parts(messages: &[&Message]) -> Vec<ConversationPart> {
         }
     }
     parts
+}
+
+pub fn is_claude_subtask(message: &Message) -> bool {
+    message.role == "activity" && matches!(message.tool_name.as_str(), "Agent" | "Task")
+}
+
+pub fn is_subtask_chat(chat: &Chat) -> bool {
+    chat.provider == Provider::Claude
+        && chat.internal
+        && chat
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "subagents")
+}
+
+/// Resolve using Claude's own tool-use metadata, never a title or an arbitrary path in tool output.
+pub fn claude_subtask_chat(parent: &Chat, tool_id: &str) -> Result<Chat> {
+    anyhow::ensure!(
+        parent.provider == Provider::Claude && !tool_id.is_empty(),
+        "No Claude subtask selected"
+    );
+    let directory = parent.path.with_extension("").join("subagents");
+    for entry in fs::read_dir(&directory)
+        .with_context(|| "Subtask history has not been saved yet. Try again shortly.")?
+    {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".meta.json") else {
+            continue;
+        };
+        let Ok(data) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice::<Value>(&data) else {
+            continue;
+        };
+        if meta["toolUseId"] != tool_id {
+            continue;
+        }
+        let path = directory.join(format!("{stem}.jsonl"));
+        let modified = fs::metadata(&path)
+            .with_context(|| "Subtask history is not available yet")?
+            .modified()?;
+        return Ok(Chat {
+            provider: Provider::Claude,
+            id: format!("{}:{stem}", parent.id),
+            title: meta["description"]
+                .as_str()
+                .unwrap_or("Claude subtask")
+                .into(),
+            cwd: parent.cwd.clone(),
+            path,
+            modified,
+            archived: false,
+            internal: true,
+        });
+    }
+    anyhow::bail!("Claude has not saved a linked conversation for this subtask yet.")
 }
 
 pub fn clean_user_text(text: &str) -> String {
@@ -297,6 +519,13 @@ pub fn clean_user_text(text: &str) -> String {
             fenced = !fenced;
         }
         let mut remaining = line;
+        if !fenced
+            && (line.trim().starts_with("<pasted_content id=")
+                || line.trim().starts_with("</pasted_content"))
+            && line.trim().ends_with('>')
+        {
+            continue;
+        }
         if !fenced {
             while let Some(start) = remaining.find("<image ") {
                 let Some(end) = remaining[start..].find('>').map(|end| start + end + 1) else {
@@ -392,6 +621,26 @@ impl SessionMetrics {
                     .map(str::to_owned);
             }
         } else {
+            if value["isSidechain"] == true || !value["parent_tool_use_id"].is_null() {
+                return;
+            }
+            if value["parent_tool_use_id"].is_null() && value["isSidechain"] != true {
+                let effort = value["perTurnEffort"]
+                    .as_str()
+                    .or_else(|| value["effort"].as_str())
+                    .or_else(|| value["params"]["output_config"]["effort"].as_str());
+                if let Some(effort) = effort {
+                    self.effort = Some(effort.into());
+                }
+                if value["type"] == "api-request" {
+                    if let Some(model) = value["params"]["model"].as_str() {
+                        if self.model.as_deref() != Some(model) {
+                            self.context_window = None;
+                        }
+                        self.model = Some(model.into());
+                    }
+                }
+            }
             if value["type"] == "system" && value["subtype"] == "init" {
                 self.model = value["model"].as_str().map(str::to_owned);
             }
@@ -465,6 +714,8 @@ pub fn activity_summary(message: &Message) -> String {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_source: Option<Chat>,
     pub title: Option<String>,
     pub archived: Option<bool>,
     pub pinned: bool,
@@ -602,6 +853,41 @@ pub enum ChatGrouping {
     #[default]
     Recent,
     Project,
+    Status,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChatStatus {
+    Pinned,
+    InputRequired,
+    InProgress,
+    Unread,
+    Ready,
+}
+
+impl ChatStatus {
+    pub fn from_state(pinned: bool, needs_input: bool, running: bool, unread: bool) -> Self {
+        if pinned {
+            Self::Pinned
+        } else if needs_input {
+            Self::InputRequired
+        } else if running {
+            Self::InProgress
+        } else if unread {
+            Self::Unread
+        } else {
+            Self::Ready
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::InputRequired => "Input required",
+            Self::InProgress => "In progress",
+            Self::Unread => "Unread",
+            Self::Ready => "Ready",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +1058,7 @@ fn is_context(text: &str) -> bool {
         "<command-name>",
         "<send_user_message_question_reply>",
         "<external_codex_apps_open_page>",
+        "<codex_internal_context ",
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
@@ -910,6 +1197,27 @@ fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
         return None;
     }
     let text = content_text(&message["content"]);
+    if provider == Provider::Codex
+        && role == "user"
+        && text
+            .trim_start()
+            .starts_with("<codex_internal_context source=\"goal\">")
+        && text.trim_end().ends_with("</codex_internal_context>")
+    {
+        let objective = text
+            .split_once("<objective>")
+            .and_then(|(_, text)| text.split_once("</objective>"))
+            .map(|(objective, _)| objective.trim())
+            .unwrap_or_default();
+        return Some(Message {
+            role: "activity".into(),
+            tool_name: "Continue goal".into(),
+            text: objective.into(),
+            timestamp: string(value, "timestamp"),
+            tool_finished: true,
+            ..Default::default()
+        });
+    }
     if provider == Provider::Claude
         && value["isMeta"] == true
         && text.trim_start().starts_with("[Image: original ")
@@ -917,6 +1225,17 @@ fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
         return None;
     }
     if provider == Provider::Claude && role == "user" {
+        if value["isMeta"] == true && text.trim_start().starts_with("Goal check-in:") {
+            return Some(Message {
+                role: "activity".into(),
+                tool_name: "Goal check-in".into(),
+                tool_input: "Background task status".into(),
+                text,
+                timestamp: string(value, "timestamp"),
+                tool_finished: true,
+                ..Default::default()
+            });
+        }
         if let Some(notification) = task_notification(&text, &string(value, "timestamp")) {
             return Some(notification);
         }
@@ -1347,6 +1666,9 @@ fn records(provider: Provider, value: &Value) -> Vec<Message> {
             }
         }
     }
+    for message in &mut records {
+        normalize_plan(message);
+    }
     records
 }
 
@@ -1355,6 +1677,7 @@ pub struct ChatActivity {
     pub modified: SystemTime,
     pub running: bool,
     pub reply: Option<String>,
+    pub pending_questions: HashSet<String>,
 }
 
 impl ChatActivity {
@@ -1383,6 +1706,9 @@ pub fn chat_activity(chat: &Chat, previous: Option<&ChatActivity>) -> Result<Cha
         modified,
         running: previous.is_some_and(|previous| previous.running),
         reply: previous.and_then(|previous| previous.reply.clone()),
+        pending_questions: previous
+            .map(|previous| previous.pending_questions.clone())
+            .unwrap_or_default(),
     };
     let offset = metadata.len().saturating_sub(256 * 1024);
     file.seek(SeekFrom::Start(offset))?;
@@ -1395,6 +1721,26 @@ pub fn chat_activity(chat: &Chat, previous: Option<&ChatActivity>) -> Result<Cha
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
+        for message in records(chat.provider, &value) {
+            match message.role.as_str() {
+                "question" if !message.tool_id.is_empty() => {
+                    activity.pending_questions.insert(message.tool_id);
+                }
+                "question_reply" => {
+                    activity.pending_questions.remove(&message.tool_id);
+                }
+                "tool_result" if message.text.trim() != "{\"accepted\":true}" => {
+                    let accepted = serde_json::from_str::<Value>(&message.text)
+                        .ok()
+                        .is_some_and(|value| value["accepted"] == true);
+                    if !accepted {
+                        activity.pending_questions.remove(&message.tool_id);
+                    }
+                }
+                "user" => activity.pending_questions.clear(),
+                _ => {}
+            }
+        }
         let mut reply = false;
         match chat.provider {
             Provider::Codex => {
@@ -1465,6 +1811,7 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
     let mut reader = BufReader::new(file.take(length));
     let mut line = Vec::new();
     let mut messages: VecDeque<Message> = VecDeque::new();
+    let mut plan = Vec::new();
     let mut transcript = Transcript::default();
     let mut seen = HashSet::new();
     loop {
@@ -1481,21 +1828,36 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
             transcript.skipped += 1;
             continue;
         }
-        let value: Value = match serde_json::from_slice(&line) {
+        let mut value: Value = match serde_json::from_slice(&line) {
             Ok(value) => value,
             Err(_) => {
                 transcript.skipped += 1;
                 continue;
             }
         };
+        // Sidechain messages are excluded from the parent, but are the content of an
+        // explicitly opened subtask. Do not merge them into ordinary conversations.
+        if is_subtask_chat(chat) {
+            value["isSidechain"] = Value::Bool(false);
+            value["parent_tool_use_id"] = Value::Null;
+        }
         transcript.metrics.observe(chat.provider, &value);
         match value["payload"]["type"].as_str() {
             Some("task_started" | "turn_started") => transcript.running = true,
             Some("task_complete" | "task_completed" | "turn_aborted") => transcript.running = false,
             _ => {}
         }
-        if chat.provider == Provider::Claude && value["message"]["stop_reason"] == "end_turn" {
-            transcript.running = false;
+        if chat.provider == Provider::Claude && value["isSidechain"] != true {
+            if matches!(value["type"].as_str(), Some("user" | "api-request")) {
+                transcript.running = true;
+            }
+            if matches!(
+                value["message"]["stop_reason"].as_str(),
+                Some("end_turn" | "stop_sequence")
+            ) || (value["type"] == "system" && value["subtype"] == "turn_duration")
+            {
+                transcript.running = false;
+            }
         }
         let parsed = records(chat.provider, &value);
         if !parsed.is_empty() {
@@ -1508,7 +1870,11 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
             if !id.is_empty() && !seen.insert(id) {
                 continue;
             }
-            for message in parsed {
+            for mut message in parsed {
+                let updated_plan = apply_plan_update(&mut message, &plan);
+                if !updated_plan.is_empty() {
+                    plan = updated_plan;
+                }
                 if message.role == "question_reply" {
                     if let Some(call) = messages
                         .iter_mut()
@@ -1522,7 +1888,7 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
                 }
                 if message.role == "tool_result" {
                     if let Some(call) = messages.iter_mut().rev().find(|call| {
-                        matches!(call.role.as_str(), "activity" | "question")
+                        matches!(call.role.as_str(), "activity" | "question" | "plan")
                             && call.tool_id == message.tool_id
                     }) {
                         call.text = message.text;
@@ -1554,6 +1920,284 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn status_grouping_prioritizes_pins_and_questions_and_persists() {
+        assert_eq!(
+            ChatStatus::from_state(true, true, true, true),
+            ChatStatus::Pinned
+        );
+        assert_eq!(
+            ChatStatus::from_state(false, true, true, true),
+            ChatStatus::InputRequired
+        );
+        assert_eq!(
+            ChatStatus::from_state(false, false, true, true),
+            ChatStatus::InProgress
+        );
+        assert_eq!(
+            ChatStatus::from_state(false, false, false, true),
+            ChatStatus::Unread
+        );
+        assert_eq!(
+            ChatStatus::from_state(false, false, false, false),
+            ChatStatus::Ready
+        );
+        let mut library = Library::default();
+        library.chat_grouping = ChatGrouping::Status;
+        let restored: Library =
+            serde_json::from_str(&serde_json::to_string(&library).expect("serialize"))
+                .expect("restore");
+        assert_eq!(restored.chat_grouping, ChatGrouping::Status);
+    }
+
+    #[test]
+    fn sidebar_tracks_async_questions_until_the_user_answers() {
+        let fixture = Fixture::new();
+        let mut rows = vec![
+            json!({"type":"response_item","payload":{"type":"function_call","name":"functions.request_user_input_async","call_id":"q","arguments":"{\"questions\":[{\"title\":\"Choose\",\"options\":[\"A\",\"B\"]}]}"}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"q","output":"{\"accepted\":true}"}}),
+        ];
+        let path = fixture.write("questions.jsonl", &rows);
+        let chat = Chat {
+            provider: Provider::Codex,
+            id: "q-chat".into(),
+            title: String::new(),
+            cwd: String::new(),
+            path,
+            modified: SystemTime::now(),
+            archived: false,
+            internal: false,
+        };
+        assert!(
+            chat_activity(&chat, None)
+                .expect("waiting")
+                .pending_questions
+                .contains("q")
+        );
+        rows.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<send_user_message_question_reply>\n[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"q\\\",0]\",\"answer\":\"A\"}]\n</send_user_message_question_reply>"}]}}));
+        fixture.write("questions.jsonl", &rows);
+        assert!(
+            chat_activity(&chat, None)
+                .expect("answered")
+                .pending_questions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_goal_continuation_is_status_without_internal_instructions() {
+        let value = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n<objective>Review the errors</objective>\n</codex_internal_context>"}]}});
+        let message = visible_message(Provider::Codex, &value).expect("goal status");
+        assert_eq!(message.role, "activity");
+        assert_eq!(message.tool_name, "Continue goal");
+        assert_eq!(message.text, "Review the errors");
+        assert!(!message.text.contains("codex_internal_context"));
+        assert!(!is_context(
+            "Here is an example: <codex_internal_context source=\"goal\">"
+        ));
+    }
+
+    #[test]
+    fn automatic_goal_check_in_is_activity_but_real_user_text_is_preserved() {
+        let mut value = json!({"type":"user","isMeta":true,"message":{"role":"user","content":"Goal check-in: work is still running"}});
+        let automatic = visible_message(Provider::Claude, &value).expect("status");
+        assert_eq!(automatic.role, "activity");
+        assert_eq!(automatic.tool_name, "Goal check-in");
+        assert!(automatic.tool_finished);
+        value["isMeta"] = Value::Bool(false);
+        assert_eq!(
+            visible_message(Provider::Claude, &value)
+                .expect("user")
+                .role,
+            "user"
+        );
+    }
+
+    #[test]
+    fn claude_effort_and_turn_start_are_read_from_external_history() {
+        let fixture = Fixture::new();
+        let path = fixture.write("effort.jsonl", &[
+            json!({"type":"api-request","params":{"model":"claude-model","output_config":{"effort":"high"}}}),
+        ]);
+        let chat = Chat {
+            provider: Provider::Claude,
+            id: "parent".into(),
+            title: String::new(),
+            cwd: String::new(),
+            path,
+            modified: SystemTime::now(),
+            archived: false,
+            internal: false,
+        };
+        let history = transcript(&chat, 20).expect("history");
+        assert!(history.running);
+        assert_eq!(history.metrics.effort.as_deref(), Some("high"));
+        assert_eq!(history.metrics.model.as_deref(), Some("claude-model"));
+        let mut metrics = history.metrics;
+        metrics.observe(
+            Provider::Claude,
+            &json!({"type":"assistant","effort":"low","isSidechain":true}),
+        );
+        assert_eq!(metrics.effort.as_deref(), Some("high"));
+        metrics.observe(
+            Provider::Claude,
+            &json!({"type":"assistant","perTurnEffort":"medium"}),
+        );
+        assert_eq!(metrics.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn subtask_opens_only_the_history_linked_to_its_tool_use() {
+        let fixture = Fixture::new();
+        let path = fixture.write("parent.jsonl", &[]);
+        let parent = Chat {
+            provider: Provider::Claude,
+            id: "parent".into(),
+            title: String::new(),
+            cwd: "C:/work".into(),
+            path,
+            modified: SystemTime::now(),
+            archived: false,
+            internal: false,
+        };
+        let directory = parent.path.with_extension("").join("subagents");
+        fs::create_dir_all(&directory).expect("directory");
+        fs::write(
+            directory.join("agent-child.meta.json"),
+            json!({"toolUseId":"tool-1","description":"Inspect docs"}).to_string(),
+        )
+        .expect("metadata");
+        let row = json!({"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"Child answer"}],"stop_reason":"end_turn"}});
+        fs::write(directory.join("agent-child.jsonl"), format!("{row}\n")).expect("child");
+        let child = claude_subtask_chat(&parent, "tool-1").expect("linked child");
+        assert!(is_subtask_chat(&child));
+        assert_eq!(child.title, "Inspect docs");
+        assert_eq!(child.cwd, parent.cwd);
+        assert_eq!(
+            transcript(&child, 20).expect("transcript").messages[0].text,
+            "Child answer"
+        );
+        assert!(visible_message(Provider::Claude, &row).is_none());
+        assert!(claude_subtask_chat(&parent, "another-tool").is_err());
+        let task = Message {
+            role: "activity".into(),
+            tool_name: "Agent".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            conversation_parts(&[&task]),
+            vec![ConversationPart::Message(0)]
+        );
+    }
+
+    #[test]
+    fn pasted_envelopes_preserve_content_and_code_examples() {
+        assert_eq!(
+            clean_user_text(
+                "Please review\n<pasted_content id=\"x\">\n[Source](https://example.com)\n</pasted_content id=\"x\">\nThanks"
+            ),
+            "Please review\n[Source](https://example.com)\nThanks"
+        );
+        let example = "```xml\n<pasted_content id=\"x\">\nexample\n</pasted_content>\n```";
+        assert_eq!(clean_user_text(example), example);
+    }
+
+    #[test]
+    fn claude_plan_and_progress_survive_shared_api_message_ids() {
+        let fixture = Fixture::new();
+        let rows = [
+            json!({"type":"assistant","uuid":"one","message":{"id":"same","role":"assistant","content":[{"type":"tool_use","id":"plan","name":"mcp__ccd_turn__update_plan","input":{"items":[{"content":"Check infrastructure","status":"in_progress"}]}}]}}),
+            json!({"type":"user","uuid":"two","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"plan","content":"OK"}]}}),
+            json!({"type":"assistant","uuid":"three","message":{"id":"same","role":"assistant","content":[{"type":"text","text":"The profile is live."}]}}),
+        ];
+        let path = fixture.write("plan.jsonl", &rows);
+        let chat = metadata(path, Provider::Claude, false, &HashMap::new()).expect("chat");
+        let transcript = transcript(&chat, 200).expect("transcript");
+        assert_eq!(transcript.messages.len(), 2);
+        assert_eq!(transcript.messages[0].role, "plan");
+        assert_eq!(plan_steps(&transcript.messages[0])[0].status, "in_progress");
+        assert_eq!(transcript.messages[1].text, "The profile is live.");
+    }
+
+    #[test]
+    fn plans_support_both_providers_and_only_latest_update_per_turn_is_visible() {
+        let mut first = Message {
+            tool_name: "TodoWrite".into(),
+            tool_input: json!({"todos":[{"content":"Read","status":"pending"}]}).to_string(),
+            ..Default::default()
+        };
+        normalize_plan(&mut first);
+        let mut second = Message {
+            tool_name: "functions.update_plan".into(),
+            tool_input: json!({"plan":[{"step":"Read","status":"completed"}]}).to_string(),
+            ..Default::default()
+        };
+        normalize_plan(&mut second);
+        let user = Message {
+            role: "user".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            conversation_parts(&[&first, &second, &user, &first]),
+            vec![
+                ConversationPart::Message(1),
+                ConversationPart::Message(2),
+                ConversationPart::Message(3)
+            ]
+        );
+        assert_eq!(plan_steps(&second)[0].status, "completed");
+    }
+
+    #[test]
+    fn work_summary_describes_commands_agents_and_failures() {
+        let command = Message {
+            role: "activity".into(),
+            tool_name: "Bash".into(),
+            tool_error: true,
+            ..Default::default()
+        };
+        let agent = Message {
+            role: "activity".into(),
+            tool_name: "Agent".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            work_summary(&[&command, &agent]),
+            "1 command · 1 agent · 1 failed"
+        );
+    }
+
+    #[test]
+    fn incremental_claude_plan_updates_advance_and_complete_numbered_steps() {
+        let previous = (0..5)
+            .map(|index| PlanStep {
+                text: format!("Task {index}"),
+                status: if index == 0 { "in_progress" } else { "pending" }.into(),
+            })
+            .collect::<Vec<_>>();
+        let mut advance = Message {
+            tool_name: "mcp__ccd_turn__update_plan".into(),
+            tool_input: r#"{"advance":true}"#.into(),
+            ..Default::default()
+        };
+        let advanced = apply_plan_update(&mut advance, &previous);
+        assert_eq!(advanced[0].status, "completed");
+        assert_eq!(advanced[1].status, "in_progress");
+        let mut update = Message {
+            tool_input: r#"{"done":[2,3,4],"start":5}"#.into(),
+            ..advance.clone()
+        };
+        let updated = apply_plan_update(&mut update, &advanced);
+        assert!(updated[..4].iter().all(|step| step.status == "completed"));
+        assert_eq!(updated[4].status, "in_progress");
+        assert_eq!(plan_steps(&update), updated);
+        let mut invalid = Message {
+            tool_input: r#"{"done":[0,99],"start":0}"#.into(),
+            ..advance
+        };
+        assert!(apply_plan_update(&mut invalid, &updated).is_empty());
+    }
 
     #[test]
     fn async_questions_are_cards_and_acknowledgement_is_not_an_answer() {
@@ -1770,6 +2414,7 @@ mod tests {
         library.chats.insert(
             chat.key(),
             ChatOptions {
+                fork_source: None,
                 title: Some("Renamed".into()),
                 archived: Some(true),
                 pinned: true,
@@ -2093,6 +2738,7 @@ mod tests {
             modified: SystemTime::now(),
             running: true,
             reply: Some("old".into()),
+            pending_questions: HashSet::new(),
         };
         let done = ChatActivity {
             running: false,

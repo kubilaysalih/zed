@@ -199,6 +199,13 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--chat-bridge-mcp") {
+        if let Err(error) = zed::chat_bridge::run_stdio_helper() {
+            eprintln!("Chat bridge: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode

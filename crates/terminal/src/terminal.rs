@@ -2311,6 +2311,17 @@ impl Terminal {
         true
     }
 
+    pub fn write_input_after_startup(&mut self, input: Vec<u8>) -> bool {
+        self.complete_init_command_startup_handshake();
+        if self.keyboard_input_sent || self.child_exited.is_some() {
+            return false;
+        }
+        // Readline tracks the prompt's screen coordinates. Clearing only the
+        // terminal grid here leaves that state stale and shifts pasted text.
+        self.write_init_command(input);
+        true
+    }
+
     fn clear_for_init_command(&mut self, cx: &mut Context<Self>) {
         let mut term = self.term.lock_unfair();
         clear_saved_screen(&mut term);
@@ -4709,6 +4720,33 @@ mod tests {
             terminal_bounds,
             ..Default::default()
         }
+    }
+
+    #[gpui::test]
+    async fn test_write_input_after_startup_preserves_prompt_position(cx: &mut TestAppContext) {
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::default(),
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        terminal.update(cx, |terminal, cx| {
+            terminal.write_output(b"startup\r\nPS C:\\project> ", cx);
+            let before = terminal.term.lock_unfair().grid().cursor.point;
+            let content = terminal.get_content();
+            assert!(terminal.write_input_after_startup(b"echo hello".to_vec()));
+            assert_eq!(terminal.term.lock_unfair().grid().cursor.point, before);
+            assert_eq!(terminal.get_content(), content);
+            assert_eq!(terminal.take_input_log(), vec![b"echo hello".to_vec()]);
+            terminal.input(b"user typed".to_vec());
+            assert!(!terminal.write_input_after_startup(b"another command".to_vec()));
+            assert_eq!(terminal.take_input_log(), vec![b"user typed".to_vec()]);
+        });
     }
 
     #[gpui::test]

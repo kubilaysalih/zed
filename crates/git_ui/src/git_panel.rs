@@ -2102,16 +2102,27 @@ impl GitPanel {
                     ),
             )
             .child(
-                v_flex()
-                    .id("repository-sections")
+                div()
+                    .id("repository-sections-viewport")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.repository_scroll_handle)
-                    .children(sections)
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .id("repository-sections")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.repository_scroll_handle)
+                            .children(sections),
+                    )
                     .custom_scrollbars(
-                        Scrollbars::for_settings::<GitPanelScrollbarAccessor>()
-                            .tracked_scroll_handle(&self.repository_scroll_handle),
+                        Scrollbars::always_visible(ScrollAxes::Vertical)
+                            .tracked_scroll_handle(&self.repository_scroll_handle)
+                            .with_track_along(
+                                ScrollAxes::Vertical,
+                                cx.theme().colors().panel_background,
+                            ),
                         window,
                         cx,
                     ),
