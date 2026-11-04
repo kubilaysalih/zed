@@ -91,6 +91,7 @@ pub struct Button {
     alpha: Option<f32>,
     truncate: bool,
     loading: bool,
+    loading_color: Color,
 }
 
 impl Button {
@@ -116,6 +117,7 @@ impl Button {
             alpha: None,
             truncate: false,
             loading: false,
+            loading_color: Color::Muted,
         }
     }
 
@@ -249,6 +251,11 @@ impl Button {
     /// loading spinner is shown instead.
     pub fn loading(mut self, loading: bool) -> Self {
         self.loading = loading;
+        self
+    }
+
+    pub fn loading_color(mut self, color: Color) -> Self {
+        self.loading_color = color;
         self
     }
 }
@@ -488,7 +495,7 @@ impl RenderOnce for Button {
                     this.child(
                         Icon::new(IconName::LoadCircle)
                             .size(IconSize::Small)
-                            .color(Color::Muted)
+                            .color(self.loading_color)
                             .with_keyed_rotate_animation(loading_icon_id, 2),
                     )
                 },

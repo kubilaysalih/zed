@@ -517,7 +517,7 @@ impl Dock {
         self.is_open
     }
 
-    fn resizable(&self, cx: &App) -> bool {
+    pub(crate) fn resizable(&self, cx: &App) -> bool {
         !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
     }
 
@@ -1278,70 +1278,73 @@ impl Dock {
     }
 }
 
+impl Dock {
+    // In framed mode the hit area spans the entire gap, including the adjacent frame.
+    pub(crate) fn resize_handle(&self, framed: bool, cx: &mut Context<Self>) -> AnyElement {
+        let handle = div()
+            .id("resize-handle")
+            .on_drag(DraggedDock(self.position), |dock, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| dock.clone())
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|dock, e: &MouseUpEvent, window, cx| {
+                    if e.click_count == 2 {
+                        dock.reset_panel_sizes(window, cx);
+                        dock.workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.serialize_workspace(window, cx);
+                            })
+                            .ok();
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .occlude();
+        match self.position() {
+            DockPosition::Left => deferred(
+                handle
+                    .absolute()
+                    .right(if framed { px(-3.) } else { px(0.) })
+                    .top(px(0.))
+                    .h_full()
+                    .w(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
+                    .cursor_col_resize(),
+            ),
+            DockPosition::Bottom => deferred(
+                handle
+                    .absolute()
+                    .top(if framed { px(-3.) } else { px(0.) })
+                    .left(px(0.))
+                    .w_full()
+                    .h(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
+                    .cursor_row_resize(),
+            ),
+            DockPosition::Right => deferred(
+                handle
+                    .absolute()
+                    .top(px(0.))
+                    .left(if framed { px(-3.) } else { px(0.) })
+                    .h_full()
+                    .w(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
+                    .cursor_col_resize(),
+            ),
+        }
+        .into_any_element()
+    }
+}
+
 impl Render for Dock {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context(cx);
         if let Some(entry) = self.visible_entry() {
-            let position = self.position;
-            let create_resize_handle = || {
-                let handle = div()
-                    .id("resize-handle")
-                    .on_drag(DraggedDock(position), |dock, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| dock.clone())
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|dock, e: &MouseUpEvent, window, cx| {
-                            if e.click_count == 2 {
-                                dock.reset_panel_sizes(window, cx);
-                                dock.workspace
-                                    .update(cx, |workspace, cx| {
-                                        workspace.serialize_workspace(window, cx);
-                                    })
-                                    .ok();
-                                cx.stop_propagation();
-                            }
-                        }),
-                    )
-                    .occlude();
-                match self.position() {
-                    DockPosition::Left => deferred(
-                        handle
-                            .absolute()
-                            .right(px(0.))
-                            .top(px(0.))
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
-                    DockPosition::Bottom => deferred(
-                        handle
-                            .absolute()
-                            .top(px(0.))
-                            .left(px(0.))
-                            .w_full()
-                            .h(RESIZE_HANDLE_SIZE)
-                            .cursor_row_resize(),
-                    ),
-                    DockPosition::Right => deferred(
-                        handle
-                            .absolute()
-                            .top(px(0.))
-                            .left(px(0.))
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
-                }
-            };
-
             div()
                 .id("dock-panel")
                 .relative()
@@ -1379,9 +1382,12 @@ impl Render for Dock {
                                 .cached(StyleRefinement::default().v_flex().size_full()),
                         ),
                 )
-                .when(self.resizable(cx), |this| {
-                    this.child(create_resize_handle())
-                })
+                .when(
+                    self.resizable(cx)
+                        && WorkspaceSettings::get_global(cx).pane_layout
+                            == settings::PaneLayout::Flat,
+                    |this| this.child(self.resize_handle(false, cx)),
+                )
         } else {
             div()
                 .id("dock-panel")

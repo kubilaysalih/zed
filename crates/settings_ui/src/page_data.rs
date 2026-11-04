@@ -9067,6 +9067,20 @@ fn ai_page(cx: &App) -> SettingsPage {
 
         items.extend([
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Use Local Chats for Editor",
+                description: "Use local Codex/Claude conversations for Add to Agent Thread and inline questions/edits. Turn off to use Zed’s built-in agent and inline model.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.use_local_chats_for_editor"),
+                    pick: |settings_content| settings_content.agent.as_ref()?.use_local_chats_for_editor.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().use_local_chats_for_editor = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Single File Review",
                 description: "When enabled, agent edits will also be displayed in single-file buffers for review.",
                 field: Box::new(SettingField {

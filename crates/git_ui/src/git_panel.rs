@@ -111,7 +111,7 @@ const GIT_PANEL_KEY: &str = "GitPanel";
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 const RECENT_COMMIT_COUNT: usize = 3;
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
-const TREE_INDENT: f32 = 16.0;
+const TREE_INDENT: f32 = 12.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
@@ -952,11 +952,39 @@ struct TreeViewState {
     // Length equals the number of visible entries.
     // This is needed because some entries (like collapsed directories) may be hidden.
     logical_indices: Vec<usize>,
+    sticky_parents: Vec<Option<usize>>,
     expanded_dirs: HashMap<TreeKey, bool>,
     directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
 }
 
 impl TreeViewState {
+    fn rebuild_sticky_parents(&mut self, entries: &[GitListEntry]) {
+        self.sticky_parents.clear();
+        self.sticky_parents.resize(entries.len(), None);
+        let mut ancestors: Vec<usize> = Vec::new();
+        for &index in &self.logical_indices {
+            let Some(entry) = entries.get(index) else {
+                continue;
+            };
+            ancestors.truncate(entry.depth());
+            self.sticky_parents[index] = ancestors.last().copied();
+            if matches!(entry, GitListEntry::Directory(_)) {
+                ancestors.push(index);
+            }
+        }
+    }
+
+    fn sticky_ancestors(&self, index: usize) -> SmallVec<[usize; 8]> {
+        let mut ancestors = SmallVec::new();
+        let mut parent = self.sticky_parents.get(index).copied().flatten();
+        while let Some(index) = parent {
+            ancestors.push(index);
+            parent = self.sticky_parents.get(index).copied().flatten();
+        }
+        ancestors.reverse();
+        ancestors
+    }
+
     fn build_tree_entries(
         &mut self,
         section: Section,
@@ -1088,6 +1116,53 @@ impl TreeViewState {
 struct GitTreeStatusEntry {
     entry: GitStatusEntry,
     depth: usize,
+}
+
+#[derive(Clone)]
+struct GitStickyCandidate {
+    index: usize,
+    depth: usize,
+}
+
+impl ui::StickyCandidate for GitStickyCandidate {
+    fn depth(&self) -> usize {
+        self.depth
+    }
+}
+
+struct GitStickyHeaders(ui::StickyItems<GitStickyCandidate>);
+
+impl gpui::UniformListDecoration for GitStickyHeaders {
+    fn compute(
+        &self,
+        _visible_range: Range<usize>,
+        bounds: gpui::Bounds<Pixels>,
+        scroll_offset: Point<Pixels>,
+        item_height: Pixels,
+        item_count: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        // Multi-repository lists scroll in their parent viewport, not in the
+        // individual list. Anchor to the intersection with that viewport.
+        let viewport = gpui::Bounds::new(bounds.origin - scroll_offset, bounds.size)
+            .intersect(&window.content_mask().bounds);
+        if viewport.size.height <= px(0.) || item_height <= px(0.) {
+            return Empty.into_any_element();
+        }
+        let top = (viewport.top() - bounds.top()).max(px(0.));
+        let start = ((top / item_height).floor() as usize).min(item_count);
+        let end = (((top + viewport.size.height) / item_height).ceil() as usize).min(item_count);
+        self.0.compute(
+            start..end,
+            gpui::Bounds::new(bounds.origin, viewport.size),
+            gpui::point(scroll_offset.x, -top),
+            item_height,
+            item_count,
+            window,
+            cx,
+        )
+    }
 }
 
 /// Identifies a row by section and path. A partially staged file has a row in
@@ -6645,6 +6720,7 @@ impl GitPanel {
                     .expanded_dirs
                     .retain(|key, _| seen_directories.contains(key));
                 self.tree_expanded_dirs = tree_state.expanded_dirs.clone();
+                tree_state.rebuild_sticky_parents(&self.entries);
                 self.view_mode = GitPanelViewMode::Tree(tree_state);
             }
             GitPanelViewMode::Flat => {
@@ -7596,6 +7672,7 @@ impl GitPanel {
                     h_flex()
                         .gap_1()
                         .child(self.render_view_options_menu("view_options_menu"))
+                        .child(self.render_history_button(cx))
                         .child(self.render_git_changes_actions_button(cx)),
                 ),
         )
@@ -8054,84 +8131,33 @@ impl GitPanel {
         )
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_tab = self.active_tab;
-        let accent = workspace::folder_colors::for_project(self.project.read(cx), cx)
-            .unwrap_or(cx.theme().colors().text_accent);
-
-        let focus_handle = self.focus_handle.clone();
-        let tab = |id: ElementId,
-                   active: bool,
-                   show_changes: bool,
-                   label: SharedString,
-                   set_active_tab: GitPanelTab,
-                   tooltip_action: Box<dyn Action>| {
-            let focus_handle = focus_handle.clone();
-
-            h_flex()
-                .cursor_pointer()
-                .id(id)
-                .h_full()
-                .py_1()
-                .gap_1()
-                .flex_1()
-                .justify_center()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
-                .rounded_sm()
-                .bg(cx.theme().colors().editor_background)
-                .when(active, |s| {
-                    s.bg(cx
-                        .theme()
-                        .colors()
-                        .element_selected
-                        .blend(accent.opacity(0.12)))
-                })
-                .child(
-                    Label::new(label.clone())
-                        .when(active, |label| label.weight(gpui::FontWeight::SEMIBOLD))
-                        .when(!active, |label| label.color(Color::Muted)),
-                )
-                .when(show_changes && self.changes_count > 0, |this| {
-                    this.child(
-                        Label::new(format!("({})", self.changes_count))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                })
-                .tooltip(Tooltip::for_action_title_in(
-                    format!("Toggle {} Tab", label),
-                    tooltip_action.as_ref(),
-                    &focus_handle,
-                ))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_active_tab(set_active_tab, window, cx)
-                }))
-        };
-
-        h_flex()
-            .relative()
-            .h(Tab::container_height(cx) + px(8.0))
-            .p_1()
-            .gap_1()
-            .flex_none()
-            .bg(cx.theme().colors().editor_background)
-            .w_full()
-            .child(tab(
-                ElementId::Name("changes-tab".into()),
-                active_tab == GitPanelTab::Changes,
-                true,
-                "Changes".into(),
-                GitPanelTab::Changes,
-                ActivateChangesTab.boxed_clone(),
-            ))
-            .child(tab(
-                ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
-                false,
-                "History".into(),
-                GitPanelTab::History,
-                ActivateHistoryTab.boxed_clone(),
-            ))
+    fn render_history_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let history = self.active_tab == GitPanelTab::History;
+        IconButton::new(
+            "toggle-commit-history",
+            if history {
+                IconName::ArrowLeft
+            } else {
+                IconName::HistoryRerun
+            },
+        )
+        .icon_size(IconSize::Small)
+        .tooltip(Tooltip::text(if history {
+            "Back to Changes"
+        } else {
+            "Commit History"
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.set_active_tab(
+                if history {
+                    GitPanelTab::Changes
+                } else {
+                    GitPanelTab::History
+                },
+                window,
+                cx,
+            );
+        }))
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9075,6 +9101,54 @@ impl GitPanel {
                                     ),
                             )
                         })
+                        .when(is_tree_view, |list| {
+                            list.with_decoration(GitStickyHeaders(ui::sticky_items(
+                                cx.entity(),
+                                |this, range, _window, _cx| {
+                                    let Some(state) = this.view_mode.tree_state() else {
+                                        return SmallVec::new();
+                                    };
+                                    range
+                                        .filter_map(|index| {
+                                            let index = *state.logical_indices.get(index)?;
+                                            Some(GitStickyCandidate {
+                                                index,
+                                                depth: this.entries.get(index)?.depth(),
+                                            })
+                                        })
+                                        .collect()
+                                },
+                                move |this, candidate, window, cx| {
+                                    let Some(state) = this.view_mode.tree_state() else {
+                                        return SmallVec::new();
+                                    };
+                                    state
+                                        .sticky_ancestors(candidate.index)
+                                        .into_iter()
+                                        .filter_map(|index| {
+                                            let entry =
+                                                this.entries.get(index)?.directory_entry()?;
+                                            Some(
+                                                div()
+                                                    .id(("sticky-directory", index))
+                                                    .w_full()
+                                                    .h(this.list_item_height())
+                                                    .bg(cx.theme().colors().panel_background)
+                                                    .block_mouse_except_scroll()
+                                                    .child(this.render_directory_entry(
+                                                        index,
+                                                        entry,
+                                                        has_write_access,
+                                                        window,
+                                                        cx,
+                                                    ))
+                                                    .into_any_element(),
+                                            )
+                                        })
+                                        .collect()
+                                },
+                            )))
+                        })
                         .group("entries")
                         .size_full()
                         .flex_grow_1()
@@ -9105,7 +9179,7 @@ impl GitPanel {
     }
 
     fn list_item_height(&self) -> Rems {
-        rems(1.75)
+        rems(1.5)
     }
 
     fn render_list_header(
@@ -9623,9 +9697,10 @@ impl GitPanel {
                     this.child(icon)
                 }
             })
-            .when(status_style != StatusStyle::LabelColor, |el| {
-                el.child(git_status_icon(status))
-            })
+            .when(
+                !settings.file_icons && status_style != StatusStyle::LabelColor,
+                |el| el.child(git_status_icon(status)),
+            )
             .map(|this| {
                 if tree_view {
                     this.pl(px(depth as f32 * TREE_INDENT)).child(
@@ -9674,6 +9749,10 @@ impl GitPanel {
                     ))
                 })
             })
+            .when(
+                settings.file_icons && status_style != StatusStyle::LabelColor,
+                |el| el.child(git_status_icon(status)),
+            )
             .child(
                 div()
                     .id(checkbox_wrapper_id)
@@ -9776,7 +9855,7 @@ impl GitPanel {
     ) -> AnyElement {
         let selected = self.selected_entry == Some(ix);
         let marked = self.marked_directories.contains(&entry.key);
-        let label_color = Color::Muted;
+        let label_color = Color::Default;
         let id: ElementId = ElementId::Name(format!("dir_{}_{}", entry.name, ix).into());
         let checkbox_id: ElementId =
             ElementId::Name(format!("dir_checkbox_{}_{}", entry.name, ix).into());
@@ -10353,9 +10432,6 @@ impl Render for GitPanel {
                             && self.active_tab == GitPanelTab::Changes,
                         |panel| panel.h_auto().flex_none(),
                     )
-                    .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
-                    })
                     .map(|this| match self.active_tab {
                         GitPanelTab::Changes => this
                             .children(self.render_changes_header(window, cx))
@@ -10382,7 +10458,18 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
-                        GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::History => this
+                            .child(
+                                h_flex()
+                                    .min_h(Tab::container_height(cx))
+                                    .px_2()
+                                    .gap_1()
+                                    .flex_none()
+                                    .justify_between()
+                                    .child(Label::new("History").size(LabelSize::Small))
+                                    .child(self.render_history_button(cx)),
+                            )
+                            .child(self.render_history_tab(window, cx)),
                     })
                     .into_any_element(),
             )

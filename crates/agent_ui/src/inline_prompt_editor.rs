@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
-use ui::{IconButtonShape, KeyBinding, PopoverMenuHandle, Tooltip, prelude::*};
+use ui::{CommonAnimationExt, IconButtonShape, KeyBinding, PopoverMenuHandle, Tooltip, prelude::*};
 use uuid::Uuid;
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
@@ -58,6 +58,12 @@ struct SessionState {
     completion: CompletionState,
 }
 
+struct InlineConversationTurn {
+    prompt: SharedString,
+    answer: Option<Entity<Markdown>>,
+    failed: bool,
+}
+
 pub struct PromptEditor<T> {
     pub editor: Entity<Editor>,
     mode: PromptEditorMode,
@@ -68,6 +74,8 @@ pub struct PromptEditor<T> {
     prompt_history: VecDeque<String>,
     prompt_history_ix: Option<usize>,
     pending_prompt: String,
+    local_turns: Vec<InlineConversationTurn>,
+    local_turn_pending: bool,
     _codegen_subscription: Subscription,
     editor_subscriptions: Vec<Subscription>,
     show_rate_limit_notice: bool,
@@ -123,6 +131,132 @@ impl<T: 'static> Render for PromptEditor<T> {
 
         buttons.extend(self.render_buttons(window, cx));
 
+        let target_chat = self.mention_set.read(cx).local_chat_target.clone();
+        let local_controls = if crate::local_editor_agent::enabled(cx) {
+            if let PromptEditorMode::Buffer { codegen, .. } = &self.mode {
+                use crate::local_editor_agent::LocalEditorProvider;
+                let provider = codegen.read(cx).local_provider;
+                let ask = codegen.read(cx).local_ask;
+                let pending = matches!(self.codegen_status(cx), CodegenStatus::Pending);
+                let codegen_provider = codegen.clone();
+                let codegen_mode = codegen.clone();
+                Some(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            ui::PopoverMenu::new("local-inline-provider")
+                                .trigger(
+                                    Button::new(
+                                        "inline-provider",
+                                        if provider == LocalEditorProvider::Codex {
+                                            "Codex"
+                                        } else {
+                                            "Claude"
+                                        },
+                                    )
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown).size(IconSize::Small),
+                                    )
+                                    .disabled(pending),
+                                )
+                                .menu(move |window, cx| {
+                                    Some(ui::ContextMenu::build(window, cx, |mut menu, _, _| {
+                                        for (label, provider) in [
+                                            ("Codex", LocalEditorProvider::Codex),
+                                            ("Claude", LocalEditorProvider::Claude),
+                                        ] {
+                                            let codegen = codegen_provider.clone();
+                                            menu = menu.entry(label, None, move |_, cx| {
+                                                crate::local_editor_agent::remember_provider(
+                                                    provider, cx,
+                                                );
+                                                codegen.update(cx, |codegen, cx| {
+                                                    codegen.local_provider = provider;
+                                                    cx.notify();
+                                                });
+                                            });
+                                        }
+                                        menu
+                                    }))
+                                }),
+                        )
+                        .child(
+                            Button::new("inline-mode", if ask { "Ask" } else { "Edit" })
+                                .disabled(pending)
+                                .tooltip(Tooltip::text(
+                                    "Switch between asking about code and previewing an edit",
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    codegen_mode.update(cx, |codegen, cx| {
+                                        codegen.local_ask = !codegen.local_ask;
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .into_any_element(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let local = local_controls.is_some();
+        let local_controls = if let Some(target) = target_chat.filter(|_| local) {
+            Some(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Chat).size(IconSize::Small))
+                    .child(Label::new(target.title).size(LabelSize::Small).truncate())
+                    .child(
+                        IconButton::new("clear-inline-target", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Continue as an inline Quick chat"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mention_set.update(cx, |mentions, cx| {
+                                    mentions.local_chat_target = None;
+                                    cx.notify();
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            local_controls
+        };
+        let conversation = local.then(|| {
+            v_flex()
+                .w_full()
+                .pl(left_gutter_width + px(6.))
+                .pr_2()
+                .py_2()
+                .gap_3()
+                .children(self.local_turns.iter().map(|turn| {
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div().w_full().flex().justify_end().child(
+                                div()
+                                    .max_w_full()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(cx.theme().colors().element_background)
+                                    .child(turn.prompt.clone()),
+                            ),
+                        )
+                        .when_some(turn.answer.clone(), |this, answer| {
+                            let mut style = markdown_style(window, cx);
+                            if turn.failed {
+                                style.base_text_style.color = cx.theme().status().error;
+                            }
+                            this.child(self.render_markdown(answer, style))
+                        })
+                }))
+        });
         let menu_visible = self.is_completions_menu_visible(cx);
         let add_context_button = IconButton::new("add-context", IconName::AtSign)
             .icon_size(IconSize::Small)
@@ -161,6 +295,7 @@ impl<T: 'static> Render for PromptEditor<T> {
             .border_y_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().editor_background)
+            .children(conversation)
             .child(
                 h_flex()
                     .on_action(cx.listener(Self::confirm))
@@ -172,15 +307,25 @@ impl<T: 'static> Render for PromptEditor<T> {
                     .on_action(cx.listener(Self::thumbs_down))
                     .capture_action(cx.listener(Self::cycle_prev))
                     .capture_action(cx.listener(Self::cycle_next))
-                    .on_action(cx.listener(|this, _: &ToggleModelSelector, window, cx| {
-                        this.model_selector
-                            .update(cx, |model_selector, cx| model_selector.toggle(window, cx));
-                    }))
-                    .on_action(cx.listener(|this, _: &CycleFavoriteModels, window, cx| {
-                        this.model_selector.update(cx, |model_selector, cx| {
-                            model_selector.cycle_favorite_models(window, cx);
-                        });
-                    }))
+                    .on_action(
+                        cx.listener(move |this, _: &ToggleModelSelector, window, cx| {
+                            if local {
+                                return;
+                            }
+                            this.model_selector
+                                .update(cx, |model_selector, cx| model_selector.toggle(window, cx));
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(move |this, _: &CycleFavoriteModels, window, cx| {
+                            if local {
+                                return;
+                            }
+                            this.model_selector.update(cx, |model_selector, cx| {
+                                model_selector.cycle_favorite_models(window, cx);
+                            });
+                        }),
+                    )
                     .child(
                         WithRemSize::new(ui_font_size)
                             .h_full()
@@ -222,12 +367,13 @@ impl<T: 'static> Render for PromptEditor<T> {
                                     .items_center()
                                     .gap_1()
                                     .child(add_context_button)
-                                    .child(self.model_selector.clone())
+                                    .when(!local, |this| this.child(self.model_selector.clone()))
+                                    .children(local_controls)
                                     .children(buttons),
                             ),
                     ),
             )
-            .when_some(explanation, |this, _| {
+            .when_some(explanation.filter(|_| !local), |this, _| {
                 this.child(
                     h_flex()
                         .size_full()
@@ -319,6 +465,8 @@ impl<T: 'static> PromptEditor<T> {
 
     fn subscribe_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_subscriptions.clear();
+        self.editor_subscriptions
+            .push(cx.observe(&self.mention_set, |_, _, cx| cx.notify()));
         self.editor_subscriptions.push(cx.subscribe_in(
             &self.editor,
             window,
@@ -327,9 +475,10 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn assign_completion_provider(&mut self, cx: &mut Context<Self>) {
+        let local_chats = matches!(self.mode, PromptEditorMode::Buffer { .. });
         self.editor.update(cx, |editor, cx| {
             editor.set_completion_provider(Some(Rc::new(PromptCompletionProvider::new(
-                PromptEditorCompletionProviderDelegate,
+                PromptEditorCompletionProviderDelegate { local_chats },
                 cx.weak_entity(),
                 self.mention_set.clone(),
                 self.workspace.clone(),
@@ -545,6 +694,14 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn handle_confirm(&mut self, execute: bool, cx: &mut Context<Self>) {
+        if self.is_local_conversation(cx) {
+            if !matches!(self.codegen_status(cx), CodegenStatus::Pending)
+                && !self.prompt(cx).trim().is_empty()
+            {
+                cx.emit(PromptEditorEvent::StartRequested);
+            }
+            return;
+        }
         match self.codegen_status(cx) {
             CodegenStatus::Idle => {
                 self.fire_started_telemetry(cx);
@@ -743,6 +900,10 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_local_conversation(cx) {
+            cx.propagate();
+            return;
+        }
         if let Some(ix) = self.prompt_history_ix {
             if ix > 0 {
                 self.prompt_history_ix = Some(ix - 1);
@@ -763,6 +924,10 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_local_conversation(cx) {
+            cx.propagate();
+            return;
+        }
         if let Some(ix) = self.prompt_history_ix {
             if ix < self.prompt_history.len() - 1 {
                 self.prompt_history_ix = Some(ix + 1);
@@ -783,6 +948,41 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn render_buttons(&self, _window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.is_local_conversation(cx) {
+            if matches!(self.codegen_status(cx), CodegenStatus::Pending) {
+                return vec![
+                    Icon::new(IconName::LoadCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Accent)
+                        .with_keyed_rotate_animation("inline-working", 2)
+                        .into_any_element(),
+                    IconButton::new("stop", IconName::Stop)
+                        .tooltip(Tooltip::text("Stop response"))
+                        .on_click(
+                            cx.listener(|_, _, _, cx| cx.emit(PromptEditorEvent::StopRequested)),
+                        )
+                        .into_any_element(),
+                ];
+            }
+            let mut buttons = vec![
+                IconButton::new("send-follow-up", IconName::ArrowUp)
+                    .disabled(self.prompt(cx).trim().is_empty())
+                    .tooltip(Tooltip::for_action_title("Send message", &menu::Confirm))
+                    .on_click(cx.listener(|this, _, _, cx| this.handle_confirm(false, cx)))
+                    .into_any_element(),
+            ];
+            if !self.local_turns.is_empty() {
+                buttons.push(
+                    IconButton::new("accept", IconName::Check)
+                        .tooltip(Tooltip::text("Accept changes and close"))
+                        .on_click(cx.listener(|_, _, _, cx| {
+                            cx.emit(PromptEditorEvent::ConfirmRequested { execute: false })
+                        }))
+                        .into_any_element(),
+                );
+            }
+            return buttons;
+        }
         let mode = match &self.mode {
             PromptEditorMode::Buffer { codegen, .. } => {
                 let codegen = codegen.read(cx);
@@ -1155,6 +1355,11 @@ impl<T: 'static> PromptEditor<T> {
             .into_any_element()
     }
 
+    fn is_local_conversation(&self, cx: &App) -> bool {
+        matches!(self.mode, PromptEditorMode::Buffer { .. })
+            && crate::local_editor_agent::enabled(cx)
+    }
+
     fn render_markdown(&self, markdown: Entity<Markdown>, style: MarkdownStyle) -> MarkdownElement {
         MarkdownElement::new(markdown, style)
             .image_resolver(|dest_url, _cx| crate::resolve_agent_image(dest_url, &[]))
@@ -1193,7 +1398,9 @@ impl InlineAssistId {
     }
 }
 
-struct PromptEditorCompletionProviderDelegate;
+struct PromptEditorCompletionProviderDelegate {
+    local_chats: bool,
+}
 
 fn inline_assistant_model_supports_images(cx: &App) -> bool {
     LanguageModelRegistry::read_global(cx)
@@ -1202,6 +1409,9 @@ fn inline_assistant_model_supports_images(cx: &App) -> bool {
 }
 
 impl PromptCompletionProviderDelegate for PromptEditorCompletionProviderDelegate {
+    fn supports_local_chat_targets(&self, cx: &App) -> bool {
+        self.local_chats && crate::local_editor_agent::enabled(cx)
+    }
     fn supported_modes(&self, _cx: &App) -> Vec<PromptContextType> {
         vec![
             PromptContextType::File,
@@ -1293,6 +1503,8 @@ impl PromptEditor<BufferCodegen> {
             prompt_history,
             prompt_history_ix: None,
             pending_prompt: String::new(),
+            local_turns: Vec::new(),
+            local_turn_pending: false,
             _codegen_subscription: codegen_subscription,
             editor_subscriptions: Vec::new(),
             show_rate_limit_notice: false,
@@ -1314,6 +1526,32 @@ impl PromptEditor<BufferCodegen> {
         codegen: Entity<BufferCodegen>,
         cx: &mut Context<PromptEditor<BufferCodegen>>,
     ) {
+        if self.is_local_conversation(cx) {
+            self.editor
+                .update(cx, |editor, _| editor.set_read_only(false));
+            if self.local_turn_pending && !matches!(self.codegen_status(cx), CodegenStatus::Pending)
+            {
+                let alternative = codegen.read(cx).active_alternative().read(cx);
+                let (answer, failed) = match self.codegen_status(cx) {
+                    CodegenStatus::Error(error) => (error.to_string(), true),
+                    _ => (
+                        alternative
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| "Response stopped.".into()),
+                        false,
+                    ),
+                };
+                let answer = cx.new(|cx| Markdown::new(answer.into(), None, None, cx));
+                if let Some(turn) = self.local_turns.last_mut() {
+                    turn.answer = Some(answer);
+                    turn.failed = failed;
+                }
+                self.local_turn_pending = false;
+            }
+            cx.notify();
+            return;
+        }
         match self.codegen_status(cx) {
             CodegenStatus::Idle => {
                 self.editor
@@ -1346,6 +1584,25 @@ impl PromptEditor<BufferCodegen> {
             PromptEditorMode::Buffer { id, .. } => *id,
             PromptEditorMode::Terminal { .. } => unreachable!(),
         }
+    }
+
+    pub fn begin_local_turn(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.local_turns.push(InlineConversationTurn {
+            prompt: prompt.into(),
+            answer: None,
+            failed: false,
+        });
+        self.local_turn_pending = true;
+        self.pending_prompt.clear();
+        self.prompt_history_ix = None;
+        self.editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        cx.notify();
     }
 
     pub fn codegen(&self) -> &Entity<BufferCodegen> {
@@ -1442,6 +1699,8 @@ impl PromptEditor<TerminalCodegen> {
             prompt_history,
             prompt_history_ix: None,
             pending_prompt: String::new(),
+            local_turns: Vec::new(),
+            local_turn_pending: false,
             _codegen_subscription: codegen_subscription,
             editor_subscriptions: Vec::new(),
             mode,

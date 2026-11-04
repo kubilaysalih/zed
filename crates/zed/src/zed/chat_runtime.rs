@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -41,15 +41,162 @@ pub enum Event {
     Item(String, Message),
     Approval(Approval),
     Finished(Option<String>),
+    Suggestion(String),
+    Closed,
 }
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Goal {
     pub objective: String,
     pub status: String,
     pub token_budget: Option<i64>,
     pub tokens_used: i64,
+    #[serde(default)]
+    pub time_used_seconds: i64,
+}
+
+impl Goal {
+    pub fn visible(&self) -> bool {
+        !self.objective.trim().is_empty() && self.status != "complete"
+    }
+
+    pub fn can_continue(&self, working: bool) -> bool {
+        self.visible() && (self.status != "active" || !working)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self.status.as_str() {
+            "active" => "Pursuing goal",
+            "paused" => "Goal paused",
+            "blocked" => "Goal blocked",
+            "usageLimited" => "Usage limit reached",
+            "budgetLimited" => "Goal budget reached",
+            _ => "Goal",
+        }
+    }
+
+    pub fn elapsed_label(&self) -> String {
+        let seconds = self.time_used_seconds.max(0);
+        if seconds >= 3600 {
+            format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+        } else {
+            format!("{}m {}s", seconds / 60, seconds % 60)
+        }
+    }
+}
+
+struct GoalReader {
+    _child: OwnedChild,
+    input: std::process::ChildStdin,
+    output: Receiver<String>,
+    sequence: i64,
+}
+
+impl GoalReader {
+    fn new() -> Result<Self> {
+        let mut command = Command::new(executable(Provider::Codex)?);
+        command
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = OwnedChild(command.spawn()?);
+        let input = child
+            .0
+            .stdin
+            .take()
+            .context("Goal reader stdin unavailable")?;
+        let stdout = child
+            .0
+            .stdout
+            .take()
+            .context("Goal reader stdout unavailable")?;
+        let (send, output) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        if send.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("Goal reader closed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+        let mut reader = Self {
+            _child: child,
+            input,
+            output,
+            sequence: 0,
+        };
+        reader.request("initialize", json!({"clientInfo":{"name":"zed_goal_status","version":"0.1"},"capabilities":{"experimentalApi":true}}))?;
+        write_json(
+            &mut reader.input,
+            &json!({"method":"initialized","params":{}}),
+        )?;
+        Ok(reader)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.sequence += 1;
+        let id = self.sequence;
+        write_json(
+            &mut self.input,
+            &json!({"id":id,"method":method,"params":params}),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let line = self
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .context("Goal status request timed out or closed")?;
+            let value: Value = serde_json::from_str(&line)?;
+            if value.get("method").is_some() && value.get("id").is_some() {
+                write_json(
+                    &mut self.input,
+                    &json!({"id":value["id"],"error":{"code":-32601,"message":"Read-only goal status client"}}),
+                )?;
+            } else if value["id"] == id {
+                if !value["error"].is_null() {
+                    bail!("{}", value["error"]);
+                }
+                return Ok(value["result"].clone());
+            }
+        }
+    }
+}
+
+pub fn goal_status(thread_id: &str) -> Result<Option<Goal>> {
+    // A shared read-only connection avoids acquiring a writer or starting a server per tab.
+    static READER: OnceLock<Mutex<Option<GoalReader>>> = OnceLock::new();
+    let mut reader = READER
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Goal status reader unavailable"))?;
+    if reader.is_none() {
+        *reader = Some(GoalReader::new()?);
+    }
+    let result = reader
+        .as_mut()
+        .context("Goal reader unavailable")?
+        .request("thread/goal/get", json!({"threadId":thread_id}));
+    match result {
+        Ok(value) => Ok(serde_json::from_value(value["goal"].clone())?),
+        Err(error) => {
+            *reader = None;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +225,7 @@ impl GoalCommand {
             "" | "status" => Self::Status,
             "clear" => Self::Clear,
             "pause" => Self::Pause,
-            "resume" => Self::Resume,
+            "resume" | "continue" => Self::Resume,
             _ => {
                 let (objective, budget) = if let Some(rest) = argument.strip_prefix("--budget ") {
                     let (budget, objective) = rest
@@ -235,6 +382,8 @@ pub struct Run {
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
+    pub inline_preview: bool,
+    pub inline_images: Vec<String>,
     pub bridge: Option<super::chat_bridge::Connection>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -729,6 +878,11 @@ pub fn executable(provider: Provider) -> Result<PathBuf> {
     )
 }
 
+pub fn inline_response_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["explanation","replacement_text"],
+        "properties":{"explanation":{"type":"string"},"replacement_text":{"type":["string","null"]}}})
+}
+
 pub fn start(chat: Chat, prompt: String, fork: bool, new: bool, options: RunOptions) -> Run {
     let (commands, control) = mpsc::channel();
     let (sender, events) = mpsc::channel();
@@ -739,16 +893,34 @@ pub fn start(chat: Chat, prompt: String, fork: bool, new: bool, options: RunOpti
         } else {
             chat.key()
         };
-        let result = ActiveRun::acquire(lease_key)
-            .and_then(|_lease| run(chat, prompt, fork, new, options, &sender, control));
+        let result = ActiveRun::acquire(lease_key).and_then(|_lease| {
+            if provider == Provider::Codex {
+                cancel_prediction(&chat.id)?;
+            }
+            run(chat, prompt, fork, new, options, &sender, control)
+        });
         if let Err(error) = emit(
             &sender,
-            Event::Finished(result.err().map(|error| {
+            Event::Finished(result.as_ref().err().map(|error| {
                 let error = format!("{error:#}");
                 log::warn!("Chat connection failed: {error}");
                 connection_error(provider, &error)
             })),
         ) {
+            log::debug!("{error}");
+        }
+        if let Ok(Some(prediction)) = result {
+            match prediction.finish() {
+                Ok(Some(suggestion)) => {
+                    if let Err(error) = emit(&sender, Event::Suggestion(suggestion)) {
+                        log::debug!("{error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => log::debug!("Composer prediction unavailable: {error:#}"),
+            }
+        }
+        if let Err(error) = emit(&sender, Event::Closed) {
             log::debug!("{error}");
         }
     });
@@ -897,10 +1069,18 @@ pub struct StreamState {
     compaction_count: u64,
     plan: Vec<super::chat_history_store::PlanStep>,
     plan_updates: HashMap<String, (String, String)>,
+    subtasks: super::chat_history_store::ClaudeSubtasks,
 }
 impl StreamState {
     pub fn ingest(&mut self, provider: Provider, value: &Value) -> Vec<(String, Message)> {
         let mut changed = Vec::new();
+        if provider == Provider::Claude
+            && let Some(message) = super::chat_history_store::claude_task_event(value)
+        {
+            let id = message.tool_id.clone();
+            self.items.insert(id.clone(), message.clone());
+            changed.push((id, message));
+        }
         let codex_compaction = provider == Provider::Codex
             && matches!(
                 value["method"].as_str(),
@@ -1181,6 +1361,11 @@ impl StreamState {
                     changed.push((id, message));
                 }
             } else if value["type"] == "user" {
+                if let Some(message) = super::chat_history_store::claude_skill_message(value) {
+                    let id = format!("skill:{}", text(value, "uuid"));
+                    self.items.insert(id.clone(), message.clone());
+                    changed.push((id, message));
+                }
                 let content = &value["message"]["content"];
                 let texts: Vec<&str> = if let Some(text) = content.as_str() {
                     vec![text]
@@ -1212,12 +1397,19 @@ impl StreamState {
                         message.tool_finished = true;
                         message.tool_error = block["is_error"] == true;
                         message.text = super::chat_history_store::content_text(&block["content"]);
+                        message.subtask =
+                            super::chat_history_store::claude_async_subtask(value, block);
+                        if message.subtask.is_some() {
+                            let mut result = message.clone();
+                            result.role = "tool_result".into();
+                            self.subtasks.observe(&result);
+                        }
                         changed.push((id.clone(), message.clone()));
                     }
                     if !attachments.is_empty() {
                         let image_id = format!("{id}:images");
                         let message = Message {
-                            role: "assistant".into(),
+                            role: "tool_image".into(),
                             timestamp: now(),
                             attachments,
                             ..Default::default()
@@ -1225,6 +1417,20 @@ impl StreamState {
                         self.items.insert(image_id.clone(), message.clone());
                         changed.push((image_id, message));
                     }
+                }
+            }
+        }
+        for (_, message) in &changed {
+            self.subtasks.observe(message);
+        }
+        for (id, message) in &mut self.items {
+            let before = message.subtask.clone();
+            self.subtasks.apply(message);
+            if before != message.subtask {
+                if let Some((_, updated)) = changed.iter_mut().find(|(key, _)| key == id) {
+                    *updated = message.clone();
+                } else {
+                    changed.push((id.clone(), message.clone()));
                 }
             }
         }
@@ -1248,6 +1454,123 @@ impl StreamState {
     }
 }
 
+const PREDICTION_REQUEST_ID: u64 = 90;
+
+type PredictionProcess = Arc<Mutex<Option<OwnedChild>>>;
+static PREDICTIONS: OnceLock<Mutex<HashMap<String, PredictionProcess>>> = OnceLock::new();
+
+fn cancel_prediction(thread_id: &str) -> Result<()> {
+    let process = PREDICTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Cannot check composer predictions"))?
+        .remove(thread_id);
+    if let Some(process) = process {
+        // Unsubscribing can leave a sample holding the writer. Reap only our
+        // prediction process before opening a new connection for the user's turn.
+        drop(
+            process
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cannot stop composer prediction"))?
+                .take(),
+        );
+    }
+    Ok(())
+}
+
+fn prediction_request(thread_id: &str, turn_id: &str) -> Value {
+    json!({"id": PREDICTION_REQUEST_ID, "method": "thread/sample", "params": {
+        "threadId": thread_id, "expectedTurnId": turn_id,
+        "prompt": "Predict one short next message the USER is likely to type from this conversation. Use the user's language and style. Do not answer the user, perform work, or call tools. Return only a JSON object with a suggestion string. Use an empty string if there is no useful natural follow-up. Keep the suggestion under 300 characters.",
+        "effort": "low", "threadSource": "composer_predictions",
+        "turnTrigger": "composer_predictions", "disableMcp": true
+    }})
+}
+
+fn prediction_text(value: &Value) -> Option<String> {
+    if value["id"] != PREDICTION_REQUEST_ID || !value["error"].is_null() {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(value["result"]["text"].as_str()?).ok()?;
+    let suggestion = parsed["suggestion"].as_str()?.trim();
+    (!suggestion.is_empty() && suggestion.chars().count() <= 512).then(|| suggestion.to_owned())
+}
+
+struct PendingPrediction {
+    process: PredictionProcess,
+    thread_id: String,
+    _input: std::process::ChildStdin,
+    incoming: Receiver<(bool, String)>,
+}
+
+impl Drop for PendingPrediction {
+    fn drop(&mut self) {
+        match self.process.lock() {
+            Ok(mut process) => drop(process.take()),
+            Err(error) => log::warn!("Cannot close composer prediction: {error}"),
+        }
+        if let Ok(mut predictions) = PREDICTIONS.get_or_init(Default::default).lock() {
+            if predictions
+                .get(&self.thread_id)
+                .is_some_and(|process| Arc::ptr_eq(process, &self.process))
+            {
+                predictions.remove(&self.thread_id);
+            }
+        }
+    }
+}
+
+impl PendingPrediction {
+    fn begin(
+        child: OwnedChild,
+        mut input: std::process::ChildStdin,
+        incoming: Receiver<(bool, String)>,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Self> {
+        write_json(&mut input, &prediction_request(thread_id, turn_id))?;
+        let process = Arc::new(Mutex::new(Some(child)));
+        PREDICTIONS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cannot register composer prediction"))?
+            .insert(thread_id.to_owned(), process.clone());
+        Ok(Self {
+            process,
+            thread_id: thread_id.to_owned(),
+            _input: input,
+            incoming,
+        })
+    }
+
+    fn finish(self) -> Result<Option<String>> {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            if self
+                .process
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Cannot read composer prediction"))?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            match self.incoming.recv_timeout(Duration::from_millis(100)) {
+                Ok((true, line)) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if value["id"] == PREDICTION_REQUEST_ID {
+                        return Ok(prediction_text(&value));
+                    }
+                }
+                Ok((false, _)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn run(
     mut chat: Chat,
     prompt: String,
@@ -1256,7 +1579,7 @@ fn run(
     options: RunOptions,
     sender: &Sender<Event>,
     controls: Receiver<Control>,
-) -> Result<()> {
+) -> Result<Option<PendingPrediction>> {
     let goal_command = GoalCommand::parse(&prompt)?;
     if goal_command.is_some() && chat.provider != Provider::Codex {
         bail!("/goal is available for Codex conversations.");
@@ -1270,7 +1593,16 @@ fn run(
             "Create a conversation before managing its goal. Use /goal <objective> to create one."
         );
     }
-    let user_input = user_input(chat.provider, &prompt, &options.attachments)?;
+    let mut user_input = user_input(chat.provider, &prompt, &options.attachments)?;
+    if let Some(content) = user_input.as_array_mut() {
+        for image in &options.inline_images {
+            content.push(if chat.provider == Provider::Codex {
+                json!({"type":"image","url":format!("data:image/png;base64,{image}")})
+            } else {
+                json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":image}})
+            });
+        }
+    }
     let cwd = Path::new(&chat.cwd);
     if !cwd.is_absolute() || !cwd.is_dir() {
         bail!("Choose an existing project folder before sending.");
@@ -1288,6 +1620,20 @@ fn run(
     }
     if chat.provider == Provider::Codex {
         command.args(["app-server", "--listen", "stdio://"]);
+        if options.inline_preview {
+            command.args([
+                "-c",
+                "features.shell_tool=false",
+                "-c",
+                "features.apply_patch_freeform=false",
+                "-c",
+                "mcp_servers={}",
+                "-c",
+                "features.apps=false",
+                "-c",
+                "web_search=\"disabled\"",
+            ]);
+        }
     } else {
         command.args([
             "--print",
@@ -1302,6 +1648,15 @@ fn run(
             "--permission-mode",
             "manual",
         ]);
+        if options.inline_preview {
+            command.args([
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+            ]);
+        }
         if let Some(model) = &options.model {
             command.args(["--model", model]);
         }
@@ -1317,7 +1672,9 @@ fn run(
             command.arg("--fork-session");
         }
     }
-    if let Some(bridge) = &options.bridge {
+    if let Some(bridge) = &options.bridge
+        && !options.inline_preview
+    {
         let executable = std::env::current_exe()?;
         let arguments = bridge.helper_args();
         if chat.provider == Provider::Codex {
@@ -1336,7 +1693,7 @@ fn run(
             );
             command.args([
                 "--allowedTools",
-                "mcp__zed_chats__list_chats,mcp__zed_chats__read_chat,mcp__zed_chats__send_message",
+                "mcp__zed_chats__list_chats,mcp__zed_chats__read_chat,mcp__zed_chats__send_message,mcp__zed_chats__list_terminals,mcp__zed_chats__read_terminal",
             ]);
         }
     }
@@ -1558,6 +1915,12 @@ fn run(
                                 "thread/resume"
                             };
                             let mut params = json!({"cwd":chat.cwd});
+                            if options.inline_preview {
+                                params["sandbox"] = json!("read-only");
+                                params["approvalPolicy"] = json!("never");
+                                params["config"] =
+                                    json!({"mcp_servers":{}, "features":{"apps":false}});
+                            }
                             if !new {
                                 params["threadId"] = json!(chat.id);
                             }
@@ -1585,6 +1948,12 @@ fn run(
                                 continue;
                             }
                             let mut params = json!({"threadId":chat.id,"input":user_input});
+                            if options.inline_preview {
+                                params["sandboxPolicy"] =
+                                    json!({"type":"readOnly","networkAccess":false});
+                                params["approvalPolicy"] = json!("never");
+                                params["outputSchema"] = inline_response_schema();
+                            }
                             if let Some(model) = &options.model {
                                 params["model"] = json!(model);
                             }
@@ -1622,6 +1991,20 @@ fn run(
                         if goal_running {
                             write_json(&mut input, &GoalCommand::Status.request(&chat.id, 4))?;
                         } else {
+                            if goal_command.is_none()
+                                && stopping.is_none()
+                                && !options.inline_preview
+                            {
+                                return match PendingPrediction::begin(
+                                    child, input, receive, &chat.id, &turn_id,
+                                ) {
+                                    Ok(prediction) => Ok(Some(prediction)),
+                                    Err(error) => {
+                                        log::debug!("Composer prediction unavailable: {error:#}");
+                                        Ok(None)
+                                    }
+                                };
+                            }
                             break;
                         }
                     }
@@ -1690,7 +2073,11 @@ fn run(
                                     .unwrap_or(&value["result"])
                             );
                         }
-                        break;
+                        // Claude may finish its parent turn while an async Agent is still
+                        // running. Keep its process (and event stream) alive for the report.
+                        if state.subtasks.pending() == 0 {
+                            break;
+                        }
                     }
                 }
                 for (id, message) in state.ingest(chat.provider, &value) {
@@ -1709,15 +2096,121 @@ fn run(
     drop(input);
     for _ in 0..20 {
         if child.0.try_wait()?.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn predictions_use_a_completed_source_and_never_start_a_user_turn() {
+        let request = prediction_request("thread-one", "turn-one");
+        assert_eq!(request["method"], "thread/sample");
+        assert_eq!(request["params"]["expectedTurnId"], "turn-one");
+        assert_eq!(request["params"]["threadId"], "thread-one");
+        assert_eq!(request["params"]["disableMcp"], true);
+    }
+
+    #[test]
+    fn predictions_ignore_empty_invalid_failed_and_unrelated_results() {
+        let response = |text: &str| json!({"id": PREDICTION_REQUEST_ID, "result": {"text": text}});
+        assert_eq!(
+            prediction_text(&response(r#"{"suggestion":"  Add a test  "}"#)).as_deref(),
+            Some("Add a test")
+        );
+        for text in [
+            "",
+            "plain text",
+            r#"{"suggestion":" "}"#,
+            r#"{"suggestion":4}"#,
+        ] {
+            assert_eq!(prediction_text(&response(text)), None);
+        }
+        assert_eq!(
+            prediction_text(
+                &json!({"id": PREDICTION_REQUEST_ID, "error": {"message":"unsupported"}})
+            ),
+            None
+        );
+        assert_eq!(
+            prediction_text(
+                &json!({"id": 1, "result": {"text": r#"{"suggestion":"wrong turn"}"#}})
+            ),
+            None
+        );
+        assert_eq!(
+            prediction_text(&response(
+                &json!({"suggestion": "x".repeat(513)}).to_string()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn continue_goal_is_available_for_suspended_and_idle_goals_without_replacing_objective() {
+        let mut goal: Goal = serde_json::from_value(
+            json!({"objective":"Finish the migration","status":"active","tokensUsed":42}),
+        )
+        .expect("goal");
+        assert!(!goal.can_continue(true));
+        assert!(goal.can_continue(false));
+        for status in ["paused", "blocked", "usageLimited", "budgetLimited"] {
+            goal.status = status.into();
+            assert!(goal.can_continue(false));
+        }
+        goal.status = "complete".into();
+        assert!(!goal.can_continue(false));
+        let command = GoalCommand::parse("/goal continue")
+            .expect("parse")
+            .expect("command");
+        assert_eq!(command, GoalCommand::Resume);
+        let request = command.request("same-thread", 3);
+        assert_eq!(request["method"], "thread/goal/set");
+        assert_eq!(request["params"]["threadId"], "same-thread");
+        assert_eq!(request["params"]["status"], "active");
+        assert!(request["params"].get("objective").is_none());
+        assert!(request["params"].get("tokenBudget").is_none());
+    }
+    #[test]
+    fn claude_stream_keeps_async_agent_running_until_its_notification() {
+        let mut stream = StreamState::default();
+        stream.ingest(Provider::Claude, &json!({"type":"assistant","message":{"id":"one","content":[{"type":"tool_use","id":"tool-1","name":"Agent","input":{"description":"Review"}}]}}));
+        let launch = json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"Async agent launched successfully.\nagentId: child-1 (internal ID)"}]}});
+        stream.ingest(Provider::Claude, &launch);
+        assert!(
+            stream.items["tool-1"]
+                .subtask
+                .as_ref()
+                .expect("task")
+                .running()
+        );
+        stream.ingest(Provider::Claude, &json!({"type":"assistant","message":{"id":"two","content":[{"type":"text","text":"Waiting for review"}],"stop_reason":"end_turn"}}));
+        assert!(
+            stream.items["tool-1"]
+                .subtask
+                .as_ref()
+                .expect("task")
+                .running()
+        );
+        let changes = stream.ingest(Provider::Claude, &json!({"type":"user","message":{"content":"<task-notification><task-id>child-1</task-id><status>failed</status><summary>Build failed</summary></task-notification>"}}));
+        let finished = changes
+            .iter()
+            .find(|(id, _)| id == "tool-1")
+            .expect("updated card");
+        assert!(finished.1.tool_error);
+        assert!(!finished.1.subtask.as_ref().expect("task").running());
+        stream.ingest(Provider::Claude, &launch);
+        assert!(
+            !stream.items["tool-1"]
+                .subtask
+                .as_ref()
+                .expect("task")
+                .running()
+        );
+    }
     #[test]
     fn claude_final_text_reuses_stream_index_after_thinking() {
         let mut stream = StreamState::default();
@@ -1766,6 +2259,45 @@ mod tests {
         assert_eq!(stream.plan[2].status, "pending");
     }
     use super::*;
+
+    #[test]
+    fn goal_strip_uses_native_time_and_hides_finished_goals() {
+        let mut goal: Goal = serde_json::from_value(json!({
+            "objective": "Finish the migration", "status": "active",
+            "tokensUsed": 1250, "tokenBudget": null, "timeUsedSeconds": 102
+        }))
+        .expect("native goal");
+        assert!(goal.visible());
+        assert_eq!(goal.label(), "Pursuing goal");
+        assert_eq!(goal.elapsed_label(), "1m 42s");
+        goal.status = "paused".into();
+        assert!(goal.visible());
+        assert_eq!(goal.label(), "Goal paused");
+        goal.time_used_seconds = 3723;
+        assert_eq!(goal.elapsed_label(), "1h 2m");
+        goal.status = "complete".into();
+        assert!(!goal.visible());
+        goal.status = "active".into();
+        goal.objective = "  ".into();
+        assert!(!goal.visible());
+    }
+
+    #[test]
+    fn goal_strip_handles_legacy_metadata_and_limited_states() {
+        let mut goal: Goal = serde_json::from_value(json!({
+            "objective": "Ship", "status": "blocked", "tokensUsed": 0
+        }))
+        .expect("legacy goal");
+        assert_eq!(goal.elapsed_label(), "0m 0s");
+        assert!(goal.visible());
+        assert_eq!(goal.label(), "Goal blocked");
+        goal.status = "usageLimited".into();
+        assert_eq!(goal.label(), "Usage limit reached");
+        goal.status = "budgetLimited".into();
+        assert_eq!(goal.label(), "Goal budget reached");
+        goal.time_used_seconds = -1;
+        assert_eq!(goal.elapsed_label(), "0m 0s");
+    }
 
     #[test]
     fn goal_commands_use_native_methods_and_explicit_user_provenance() {
@@ -1938,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_streamed_tool_images_are_separate_from_activity() {
+    fn claude_streamed_tool_images_have_a_groupable_role() {
         let mut state = StreamState::default();
         state.ingest(Provider::Claude, &json!({"type":"assistant","message":{"id":"a","content":[{"type":"tool_use","id":"read","name":"Read","input":{}}]}}));
         let changes = state.ingest(Provider::Claude, &json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}]}}));
@@ -1952,7 +2484,7 @@ mod tests {
             .iter()
             .find(|(id, _)| id == "read:images")
             .expect("image");
-        assert_eq!(image.1.role, "assistant");
+        assert_eq!(image.1.role, "tool_image");
         assert_eq!(image.1.attachments, ["data:image/png;base64,aGVsbG8="]);
     }
 

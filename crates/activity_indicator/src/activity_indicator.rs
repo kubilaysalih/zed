@@ -746,6 +746,15 @@ impl Render for ActivityIndicator {
         let activity_indicator = cx.entity().downgrade();
         let truncate_content = content.message.len() > MAX_MESSAGE_LEN;
         let has_click_handler = content.on_click.is_some();
+        let icon_color = workspace::folder_colors::for_project(self.project.read(cx), cx)
+            .map(|_| {
+                Color::Custom(if cx.theme().appearance().is_light() {
+                    gpui::black()
+                } else {
+                    gpui::white()
+                })
+            })
+            .unwrap_or(Color::Muted);
 
         result.child(
             PopoverMenu::new("activity-indicator-popover")
@@ -760,11 +769,11 @@ impl Render for ActivityIndicator {
                     .label_size(LabelSize::Small)
                     .tab_index(0isize)
                     .map(|this| match content.icon {
-                        ActivityIcon::LoadingSpinner => this.loading(true),
+                        ActivityIcon::LoadingSpinner => {
+                            this.loading(true).loading_color(icon_color)
+                        }
                         ActivityIcon::Icon(icon_name) => this.start_icon(
-                            Icon::new(icon_name)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
+                            Icon::new(icon_name).size(IconSize::Small).color(icon_color),
                         ),
                     })
                     .map(|button| {

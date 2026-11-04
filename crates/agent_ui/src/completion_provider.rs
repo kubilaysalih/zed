@@ -449,6 +449,9 @@ fn group_by_relevance<T>(items: &mut [T], group_key: impl Fn(&T) -> u32) {
 }
 
 pub trait PromptCompletionProviderDelegate: Send + Sync + 'static {
+    fn supports_local_chat_targets(&self, _cx: &App) -> bool {
+        false
+    }
     fn supports_context(&self, mode: PromptContextType, cx: &App) -> bool {
         self.supported_modes(cx).contains(&mode)
     }
@@ -1424,7 +1427,12 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
             let offset_to_line = buffer.point_to_offset(line_start);
             let mut lines = buffer.text_for_range(line_start..position).lines();
             let line = lines.next()?;
-            PromptCompletion::try_parse(line, offset_to_line, &self.source.supported_modes(cx))
+            PromptCompletion::try_parse_with_chats(
+                line,
+                offset_to_line,
+                &self.source.supported_modes(cx),
+                self.source.supports_local_chat_targets(cx),
+            )
         });
         let Some(state) = state else {
             return Task::ready(Ok(Vec::new()));
@@ -1696,6 +1704,17 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
 
                 let show_section_headers = mode.is_none() && argument.is_none();
                 let query = argument.unwrap_or_default();
+                let chat_targets = if mode.is_none() && source.supports_local_chat_targets(cx) {
+                    let bridge = cx
+                        .global::<crate::local_editor_agent::LocalEditorAgent>()
+                        .clone();
+                    Some((
+                        (bridge.list_chats)(workspace.downgrade(), window, cx),
+                        query.clone(),
+                    ))
+                } else {
+                    None
+                };
                 let search_task =
                     self.search_mentions(mode, query, Arc::<AtomicBool>::default(), cx);
 
@@ -1726,6 +1745,11 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
 
                 cx.spawn(async move |_, cx| {
                     let mut matches = search_task.await;
+                    let chat_targets = if let Some((task, query)) = chat_targets {
+                        crate::local_editor_agent::filter_chat_targets(task.await?, &query)
+                    } else {
+                        Vec::new()
+                    };
                     if show_section_headers {
                         matches.sort_by_key(|mat| match mat {
                             Match::File(FileMatch {
@@ -1738,7 +1762,34 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                     }
 
                     let completions = cx.update(|cx| {
-                        matches
+                        let mut completions = chat_targets.into_iter().map(|target| {
+                            let mention_set = mention_set.clone();
+                            let provider = match target.provider {
+                                crate::local_editor_agent::LocalEditorProvider::Codex => "Codex",
+                                crate::local_editor_agent::LocalEditorProvider::Claude => "Claude",
+                            };
+                            Completion {
+                                replace_range: source_range.clone(),
+                                new_text: String::new(),
+                                label: CodeLabel::plain(format!("{} · {} · {}", target.title, provider, target.project), None),
+                                icon_path: Some(IconName::Chat.path().into()),
+                                icon_color: None,
+                                documentation: Some(CompletionDocumentation::MultiLinePlainText("Send your question and selected code to this conversation".into())),
+                                source: project::CompletionSource::Custom,
+                                match_start: None,
+                                snippet_deduplication_key: None,
+                                insert_text_mode: None,
+                                group: Some(CompletionGroup { key: "local-chats".into(), label: Some("Send to chat".into()) }),
+                                confirm: Some(Arc::new(move |_, _, cx| {
+                                    mention_set.update(cx, |mentions, cx| {
+                                        mentions.local_chat_target = Some(target.clone());
+                                        cx.notify();
+                                    }).log_err();
+                                    false
+                                })),
+                            }
+                        }).collect::<Vec<_>>();
+                        completions.extend(matches
                             .into_iter()
                             .filter_map(|mat| {
                                 let group = if show_section_headers {
@@ -1876,7 +1927,8 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                 }
                                 completion
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>());
+                        completions
                     });
 
                     Ok(vec![CompletionResponse {
@@ -1907,24 +1959,28 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
         let offset_to_line = buffer.point_to_offset(line_start);
         let mut lines = buffer.text_for_range(line_start..position).lines();
         if let Some(line) = lines.next() {
-            PromptCompletion::try_parse(line, offset_to_line, &self.source.supported_modes(cx))
-                .filter(|completion| {
-                    // Right now we don't support completing arguments of slash commands
-                    let is_slash_command_with_argument = matches!(
-                        completion,
-                        PromptCompletion::SlashCommand(SlashCommandCompletion {
-                            argument: Some(_),
-                            ..
-                        })
-                    );
-                    !is_slash_command_with_argument
-                })
-                .map(|completion| {
-                    completion.source_range().start <= offset_to_line + position.column as usize
-                        && completion.source_range().end
-                            >= offset_to_line + position.column as usize
-                })
-                .unwrap_or(false)
+            PromptCompletion::try_parse_with_chats(
+                line,
+                offset_to_line,
+                &self.source.supported_modes(cx),
+                self.source.supports_local_chat_targets(cx),
+            )
+            .filter(|completion| {
+                // Right now we don't support completing arguments of slash commands
+                let is_slash_command_with_argument = matches!(
+                    completion,
+                    PromptCompletion::SlashCommand(SlashCommandCompletion {
+                        argument: Some(_),
+                        ..
+                    })
+                );
+                !is_slash_command_with_argument
+            })
+            .map(|completion| {
+                completion.source_range().start <= offset_to_line + position.column as usize
+                    && completion.source_range().end >= offset_to_line + position.column as usize
+            })
+            .unwrap_or(false)
         } else {
             false
         }
@@ -1989,6 +2045,41 @@ enum PromptCompletion {
 }
 
 impl PromptCompletion {
+    fn try_parse_with_chats(
+        line: &str,
+        offset: usize,
+        modes: &[PromptContextType],
+        chats: bool,
+    ) -> Option<Self> {
+        if chats {
+            for (start, _) in line.rmatch_indices('@') {
+                if line[..start].chars().last().is_some_and(|character| {
+                    !character.is_whitespace() && !matches!(character, '(' | '[' | '{')
+                }) {
+                    continue;
+                }
+                let query = &line[start + 1..];
+                if query.chars().next().is_some_and(char::is_whitespace) {
+                    continue;
+                }
+                if query
+                    .split_whitespace()
+                    .next()
+                    .and_then(|word| PromptContextType::try_from(word).ok())
+                    .is_some_and(|mode| modes.contains(&mode))
+                {
+                    break;
+                }
+                return Some(Self::Mention(MentionCompletion {
+                    source_range: start + offset..line.len() + offset,
+                    mode: None,
+                    argument: (!query.is_empty()).then(|| query.trim().to_string()),
+                }));
+            }
+        }
+        Self::try_parse(line, offset, modes)
+    }
+
     fn source_range(&self) -> Range<usize> {
         match self {
             Self::SlashCommand(completion) => completion.source_range.clone(),
@@ -2849,6 +2940,45 @@ fn completion_text_for_terminal_selections(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn local_chat_mentions_accept_multiple_words_and_unicode_offsets() {
+        let line = "şunu sor @sevk AWS";
+        let parsed = PromptCompletion::try_parse_with_chats(line, 40, &[], true);
+        assert_eq!(
+            parsed,
+            Some(PromptCompletion::Mention(MentionCompletion {
+                source_range: 50..40 + line.len(),
+                mode: None,
+                argument: Some("sevk AWS".into()),
+            }))
+        );
+        assert_eq!(
+            PromptCompletion::try_parse_with_chats("user@example.com", 0, &[], true),
+            None
+        );
+        assert_eq!(
+            PromptCompletion::try_parse_with_chats("@sevk aws", 0, &[], false),
+            None
+        );
+        assert_eq!(
+            PromptCompletion::try_parse_with_chats("@", 0, &[], true),
+            Some(PromptCompletion::Mention(MentionCompletion {
+                source_range: 0..1,
+                mode: None,
+                argument: None
+            }))
+        );
+    }
+
+    #[test]
+    fn chat_mentions_preserve_explicit_file_context() {
+        let modes = [PromptContextType::File];
+        assert_eq!(
+            PromptCompletion::try_parse_with_chats("@file src/main.rs", 12, &modes, true),
+            PromptCompletion::try_parse("@file src/main.rs", 12, &modes)
+        );
+    }
 
     #[test]
     fn test_prompt_completion_parse() {

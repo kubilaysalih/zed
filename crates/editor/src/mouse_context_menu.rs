@@ -292,7 +292,11 @@ pub fn deploy_context_menu(
                     }),
                 )
                 .when(!disable_ai && has_selections, |this| {
-                    this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                    this.action(
+                        "Ask AI Inline",
+                        Box::new(zed_actions::assistant::InlineAssist::default()),
+                    )
+                    .action("Add to Agent Thread", Box::new(AddSelectionToThread))
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

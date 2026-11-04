@@ -652,6 +652,29 @@ pub fn init(cx: &mut App) {
                             return;
                         };
 
+                        if crate::local_editor_agent::enabled(cx) {
+                            let mut text = format_selection_for_terminal(
+                                &selection,
+                                workspace.project(),
+                                None,
+                                cx,
+                            );
+                            if let AgentContextSelection::Editor(ranges) = &selection {
+                                for (buffer, range) in ranges {
+                                    let snapshot = buffer.read(cx).snapshot();
+                                    let selected = snapshot
+                                        .text_for_range(range.to_offset(&snapshot))
+                                        .collect::<String>();
+                                    text.push_str(&format!("\n```\n{selected}\n```\n"));
+                                }
+                            }
+                            let bridge = cx
+                                .global::<crate::local_editor_agent::LocalEditorAgent>()
+                                .clone();
+                            (bridge.add_selection)(text, cx.weak_entity(), window, cx);
+                            return;
+                        }
+
                         if !agent_panel.focus_handle(cx).contains_focused(window, cx) {
                             workspace.toggle_panel_focus::<AgentPanel>(window, cx);
                         }

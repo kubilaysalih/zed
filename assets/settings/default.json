@@ -600,9 +600,9 @@
   // Toolbar related settings
   "toolbar": {
     // Whether to show breadcrumbs.
-    "breadcrumbs": true,
+    "breadcrumbs": false,
     // Whether to show quick action buttons.
-    "quick_actions": true,
+    "quick_actions": false,
     // Whether to show the Selections menu in the editor toolbar.
     "selections_menu": true,
     // Whether to show agent review buttons in the editor toolbar.
@@ -1109,8 +1109,8 @@
     "status_style": "icon",
     // Whether to show file icons in the git panel.
     //
-    // Default: false
-    "file_icons": false,
+    // Default: true
+    "file_icons": true,
     // What to show for directories in the git panel.
     //
     // 1. A folder icon:
@@ -1120,8 +1120,8 @@
     // 3. A disclosure chevron followed by a folder icon:
     //   "both"
     //
-    // Default: icon
-    "folder_indicator": "icon",
+    // Default: both
+    "folder_indicator": "both",
     // What branch name to use if `init.defaultBranch` is not set
     //
     // Default: main
@@ -1140,8 +1140,8 @@
     "collapse_untracked_diff": false,
     // Whether to show entries with tree or flat view in the panel
     //
-    // Default: false
-    "tree_view": false,
+    // Default: true
+    "tree_view": true,
     // Whether the git panel should open on startup.
     //
     // Default: false
@@ -1180,6 +1180,7 @@
   "agent": {
     // Whether the inline assistant should use streaming tools, when available
     "inline_assistant_use_streaming_tools": true,
+    "use_local_chats_for_editor": false,
     // Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)
     // in the prompt when generating git commit messages.
     "commit_message_include_project_rules": true,
@@ -1488,7 +1489,7 @@
     // Whether or not to show the tab bar in the editor
     "show": true,
     // Whether or not to show the navigation history buttons.
-    "show_nav_history_buttons": true,
+    "show_nav_history_buttons": false,
     // Whether or not to show the tab bar buttons.
     "show_tab_bar_buttons": true,
     // Whether or not to show pinned tabs in a separate row.

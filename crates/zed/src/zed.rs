@@ -97,7 +97,7 @@ use std::{
 use terminal_view::terminal_panel::{self, TerminalPanel};
 use theme::{ActiveTheme, SystemAppearance, ThemeRegistry};
 use theme_settings::{ThemeSettings, load_user_theme};
-use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, prelude::*};
+use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, Tooltip, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
@@ -1479,7 +1479,7 @@ fn initialize_pane(
 ) {
     let workspace_handle = cx.weak_entity();
     pane.update(cx, |pane, cx| {
-        pane.toolbar().update(cx, |toolbar, cx| {
+        let quick_action_bar = pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);
             let solo_diff_style_toolbar = cx.new(SoloDiffStyleToolbar::new);
@@ -1498,7 +1498,7 @@ fn initialize_pane(
             toolbar.add_item(buffer_search_bar.clone(), window, cx);
             let quick_action_bar =
                 cx.new(|cx| QuickActionBar::new(buffer_search_bar, workspace, cx));
-            toolbar.add_item(quick_action_bar, window, cx);
+            toolbar.add_item(quick_action_bar.clone(), window, cx);
             let diagnostic_editor_controls = cx.new(|_| diagnostics::ToolbarControls::new());
             toolbar.add_item(diagnostic_editor_controls, window, cx);
             let project_search_bar = cx.new(|_| ProjectSearchBar::new());
@@ -1538,7 +1538,35 @@ fn initialize_pane(
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
             toolbar.add_item(image_view_toolbar, window, cx);
-        })
+            quick_action_bar
+        });
+        cx.observe(&quick_action_bar, |_, _, cx| cx.notify())
+            .detach();
+        pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
+            let (left, right) = workspace::pane::default_render_tab_bar_buttons(pane, window, cx);
+            if !quick_action_bar.read(cx).has_collapsed_controls() {
+                return (left, right);
+            }
+            let expanded = quick_action_bar.read(cx).controls_expanded();
+            let controls = quick_action_bar.clone();
+            (
+                left,
+                Some(
+                    h_flex()
+                        .child(
+                            IconButton::new("toggle-editor-controls", IconName::Filter)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(expanded)
+                                .tooltip(Tooltip::text("Toggle editor controls"))
+                                .on_click(move |_, _, cx| {
+                                    controls.update(cx, |controls, cx| controls.toggle_controls(cx))
+                                }),
+                        )
+                        .children(right)
+                        .into_any_element(),
+                ),
+            )
+        });
     });
 }
 

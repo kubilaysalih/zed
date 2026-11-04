@@ -31,6 +31,7 @@ pub struct Chat {
     pub title: String,
     pub cwd: String,
     pub path: PathBuf,
+    /// Time of the latest human message, used for sidebar recency.
     pub modified: SystemTime,
     pub archived: bool,
     pub internal: bool,
@@ -55,7 +56,227 @@ pub struct Message {
     pub tool_input: String,
     pub tool_finished: bool,
     pub tool_error: bool,
+    pub subtask: Option<ClaudeSubtask>,
     pub question_answers: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeSubtask {
+    pub id: String,
+    pub status: String,
+}
+
+impl ClaudeSubtask {
+    pub fn running(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "running" | "async_launched" | "in_progress" | "waiting"
+        )
+    }
+}
+
+pub fn claude_async_subtask(value: &Value, block: &Value) -> Option<ClaudeSubtask> {
+    let result = &value["toolUseResult"];
+    let output = content_text(&block["content"]);
+    let structured = result["isAsync"] == true || result["status"] == "async_launched";
+    if !structured && !output.starts_with("Async agent launched successfully.") {
+        return None;
+    }
+    let id = result["agentId"].as_str().or_else(|| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix("agentId: ")?.split_whitespace().next())
+    })?;
+    // IDs become filenames when checking the child transcript.
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return None;
+    }
+    Some(ClaudeSubtask {
+        id: id.into(),
+        status: "running".into(),
+    })
+}
+
+pub fn claude_task_event(value: &Value) -> Option<Message> {
+    if value["type"] != "system"
+        || value["subtype"] != "task_notification"
+        || !value["parent_tool_use_id"].is_null()
+    {
+        return None;
+    }
+    let id = value["task_id"].as_str()?;
+    let status = value["status"].as_str()?;
+    if !matches!(
+        status,
+        "completed" | "failed" | "killed" | "cancelled" | "stopped"
+    ) {
+        return None;
+    }
+    Some(Message {
+        role: "activity".into(),
+        timestamp: string(value, "timestamp"),
+        tool_id: format!("task:{id}"),
+        tool_name: format!("Background task · {status}"),
+        tool_input: string(value, "output_file"),
+        text: string(value, "summary"),
+        tool_finished: true,
+        tool_error: matches!(status, "failed" | "killed"),
+        subtask: Some(ClaudeSubtask {
+            id: id.into(),
+            status: status.into(),
+        }),
+        ..Default::default()
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ClaudeSubtasks {
+    pub tasks: HashMap<String, ClaudeSubtask>,
+    offset: u64,
+    child_versions: HashMap<String, (u64, SystemTime)>,
+}
+
+impl ClaudeSubtasks {
+    pub fn pending(&self) -> usize {
+        self.tasks.values().filter(|task| task.running()).count()
+    }
+
+    pub fn observe(&mut self, message: &Message) {
+        let Some(task) = &message.subtask else { return };
+        if message.role == "tool_result" {
+            // A repeated launch must not overwrite an already received completion.
+            self.tasks
+                .entry(message.tool_id.clone())
+                .or_insert_with(|| task.clone());
+        } else if message.role == "activity" && message.tool_id.starts_with("task:") {
+            self.child_versions.remove(&task.id);
+            for existing in self
+                .tasks
+                .values_mut()
+                .filter(|existing| existing.id == task.id)
+            {
+                *existing = task.clone();
+            }
+        }
+    }
+
+    pub fn apply(&self, message: &mut Message) {
+        if is_claude_subtask(message)
+            && let Some(task) = self.tasks.get(&message.tool_id)
+        {
+            message.subtask = Some(task.clone());
+            message.tool_finished = true;
+            message.tool_error = matches!(task.status.as_str(), "failed" | "killed");
+        }
+    }
+
+    fn refresh_children(&mut self, chat: &Chat) -> Result<()> {
+        for task in self.tasks.values_mut().filter(|task| task.running()) {
+            let path = chat
+                .path
+                .with_extension("")
+                .join("subagents")
+                .join(format!("agent-{}.jsonl", task.id));
+            let mut file = match File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let metadata = file.metadata()?;
+            let version = (metadata.len(), metadata.modified()?);
+            if self.child_versions.get(&task.id) == Some(&version) {
+                continue;
+            }
+            let offset = metadata.len().saturating_sub(256 * 1024);
+            file.seek(SeekFrom::Start(offset))?;
+            let mut reader = BufReader::new(file.take(256 * 1024));
+            if offset > 0 {
+                reader.skip_until(b'\n')?;
+            }
+            let mut completed = false;
+            let mut handback = None;
+            let mut report_delivered = false;
+            for line in reader.split(b'\n') {
+                let line = line?;
+                let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                    continue;
+                };
+                // Ignore request snapshots and metadata. Only an actual child turn ending
+                // or the parent's task notification can complete a background agent.
+                if value["type"] == "assistant" {
+                    completed = matches!(
+                        value["message"]["stop_reason"].as_str(),
+                        Some("end_turn" | "stop_sequence")
+                    );
+                    for block in value["message"]["content"].as_array().into_iter().flatten() {
+                        if block["type"] == "tool_use" && block["name"] == "SubagentHandback" {
+                            handback = block["id"].as_str().map(str::to_owned);
+                        }
+                    }
+                } else if value["type"] == "user" || value["type"] == "api-request" {
+                    completed = false;
+                    for block in value["message"]["content"].as_array().into_iter().flatten() {
+                        if block["type"] == "tool_result"
+                            && block["tool_use_id"]
+                                .as_str()
+                                .zip(handback.as_deref())
+                                .is_some_and(|(id, handback)| id == handback)
+                            && block["is_error"] != true
+                            && serde_json::from_str::<Value>(&content_text(&block["content"]))
+                                .ok()
+                                .is_some_and(|result| result["success"] == true)
+                        {
+                            report_delivered = true;
+                        }
+                    }
+                }
+            }
+            if report_delivered || (completed && task.status != "waiting") {
+                task.status = "completed".into();
+            }
+            self.child_versions.insert(task.id.clone(), version);
+        }
+        Ok(())
+    }
+
+    fn refresh(&mut self, chat: &Chat) -> Result<()> {
+        if chat.provider != Provider::Claude {
+            return Ok(());
+        }
+        let mut file = File::open(&chat.path)?;
+        let length = file.metadata()?.len();
+        if length < self.offset {
+            *self = Self::default();
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut reader = BufReader::new(file.take(length - self.offset));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let count = reader.read_until(b'\n', &mut line)?;
+            if count == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            self.offset += count as u64;
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if !matches!(value["type"].as_str(), Some("user" | "system"))
+                || value["isSidechain"] == true
+                || !value["parent_tool_use_id"].is_null()
+            {
+                continue;
+            }
+            for message in records(Provider::Claude, &value) {
+                self.observe(&message);
+            }
+        }
+        self.refresh_children(chat)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,7 +409,29 @@ fn parse_file_citation(input: &str) -> Option<(usize, String)> {
 
 #[cfg(test)]
 mod file_citation_tests {
-    use super::{MessageBodyPart::*, message_body_parts};
+    use super::{
+        Message, MessageBodyPart::*, inline_display_text, message_body_parts,
+        normalize_protocol_message,
+    };
+
+    #[test]
+    fn inline_transport_is_readable_without_document_scaffolding() {
+        let payload = serde_json::json!({"request":"Fix bounds", "file":"src/a.rs", "document":"private unsaved source", "instructions":"transport only"});
+        let message = normalize_protocol_message(Message {
+            role: "user".into(),
+            text: format!("[Zed inline request]\n{payload}"),
+            ..Default::default()
+        });
+        assert_eq!(message.text, "Fix bounds\n\nsrc/a.rs");
+        let response = normalize_protocol_message(Message {
+            role: "assistant".into(),
+            text: r#"{"explanation":"Fixed bounds","replacement_text":"safe_call();"}"#.into(),
+            ..Default::default()
+        });
+        assert_eq!(response.text, "Fixed bounds\n\n```\nsafe_call();\n```");
+        let ordinary = "{\"explanation\":\"ordinary data\"}";
+        assert!(inline_display_text("assistant", ordinary).is_none());
+    }
 
     #[test]
     fn file_cards_preserve_message_order_and_unicode_paths() {
@@ -401,6 +644,9 @@ pub fn work_summary(messages: &[&Message]) -> String {
             ));
         }
     }
+    if parts.is_empty() && messages.iter().any(|message| message.role == "tool_image") {
+        parts.push("Images".into());
+    }
     let mut summary = parts.join(" · ");
     if failed > 0 {
         summary.push_str(&format!(" · {failed} failed"));
@@ -417,6 +663,9 @@ pub enum ConversationPart {
 pub fn conversation_parts(messages: &[&Message]) -> Vec<ConversationPart> {
     let mut parts = Vec::new();
     for (index, message) in messages.iter().enumerate() {
+        if message.role == "internal" {
+            continue;
+        }
         if message.role == "plan"
             && messages[index + 1..]
                 .iter()
@@ -425,9 +674,12 @@ pub fn conversation_parts(messages: &[&Message]) -> Vec<ConversationPart> {
         {
             continue;
         }
-        let work = message.role == "activity" && !is_claude_subtask(message);
+        let work = (message.role == "activity" && !is_claude_subtask(message))
+            || message.role == "tool_image";
         if work {
-            if let Some(ConversationPart::Work(range)) = parts.last_mut() {
+            if let Some(ConversationPart::Work(range)) = parts.last_mut()
+                && range.end == index
+            {
                 range.end = index + 1;
             } else {
                 parts.push(ConversationPart::Work(index..index + 1));
@@ -437,6 +689,14 @@ pub fn conversation_parts(messages: &[&Message]) -> Vec<ConversationPart> {
         }
     }
     parts
+}
+
+pub fn plan_is_running(messages: &[&Message], index: usize, running: bool) -> bool {
+    running
+        && !messages.iter().skip(index + 1).any(|message| {
+            message.role == "user"
+                || (message.role == "assistant" && message.phase == "final_answer")
+        })
 }
 
 pub fn is_claude_subtask(message: &Message) -> bool {
@@ -576,6 +836,7 @@ pub struct Transcript {
     pub total: usize,
     pub skipped: usize,
     pub running: bool,
+    pub pending_subtasks: usize,
     pub metrics: SessionMetrics,
 }
 
@@ -714,6 +975,7 @@ pub fn activity_summary(message: &Message) -> String {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatOptions {
+    pub quick_chat: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_source: Option<Chat>,
     pub title: Option<String>,
@@ -789,9 +1051,125 @@ pub struct SavedChatGroup {
     pub weight: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ChatPaneLayout {
+    Group(usize),
+    Split {
+        vertical: bool,
+        ratio: f32,
+        first: Box<ChatPaneLayout>,
+        second: Box<ChatPaneLayout>,
+    },
+}
+
+impl ChatPaneLayout {
+    pub fn from_weights(weights: &[f32], vertical: bool) -> Self {
+        fn build(weights: &[f32], index: usize, vertical: bool) -> ChatPaneLayout {
+            if weights.len() <= 1 {
+                return ChatPaneLayout::Group(index);
+            }
+            ChatPaneLayout::Split {
+                vertical,
+                ratio: weights[0] / weights.iter().sum::<f32>(),
+                first: Box::new(ChatPaneLayout::Group(index)),
+                second: Box::new(build(&weights[1..], index + 1, vertical)),
+            }
+        }
+        build(weights, 0, vertical)
+    }
+
+    pub fn valid_for(&self, count: usize) -> bool {
+        fn collect(node: &ChatPaneLayout, groups: &mut Vec<usize>, depth: usize) -> bool {
+            if depth > 64 {
+                return false;
+            }
+            match node {
+                ChatPaneLayout::Group(group) => groups.push(*group),
+                ChatPaneLayout::Split {
+                    ratio,
+                    first,
+                    second,
+                    ..
+                } => {
+                    if !ratio.is_finite() || *ratio <= 0. || *ratio >= 1. {
+                        return false;
+                    }
+                    if !collect(first, groups, depth + 1) || !collect(second, groups, depth + 1) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        let mut groups = Vec::new();
+        if !collect(self, &mut groups, 0) {
+            return false;
+        }
+        groups.sort_unstable();
+        groups == (0..count).collect::<Vec<_>>()
+    }
+
+    pub fn split(&mut self, group: usize, added: usize, vertical: bool) -> bool {
+        match self {
+            Self::Group(index) if *index == group => {
+                *self = Self::Split {
+                    vertical,
+                    ratio: 0.5,
+                    first: Box::new(Self::Group(group)),
+                    second: Box::new(Self::Group(added)),
+                };
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.split(group, added, vertical) || second.split(group, added, vertical)
+            }
+            _ => false,
+        }
+    }
+
+    pub fn remove(self, removed: usize) -> Option<Self> {
+        match self {
+            Self::Group(index) => {
+                (index != removed).then(|| Self::Group(index - usize::from(index > removed)))
+            }
+            Self::Split {
+                vertical,
+                ratio,
+                first,
+                second,
+            } => match (first.remove(removed), second.remove(removed)) {
+                (Some(first), Some(second)) => Some(Self::Split {
+                    vertical,
+                    ratio,
+                    first: Box::new(first),
+                    second: Box::new(second),
+                }),
+                (first, second) => first.or(second),
+            },
+        }
+    }
+
+    pub fn set_ratio(&mut self, path: &[bool], value: f32) {
+        if let Self::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        {
+            if let Some((right, rest)) = path.split_first() {
+                if *right { second } else { first }.set_ratio(rest, value);
+            } else {
+                *ratio = value;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralWorkspace {
+    pub layout: Option<ChatPaneLayout>,
     pub active: bool,
     pub projects: Vec<Vec<PathBuf>>,
     pub groups: Vec<SavedChatGroup>,
@@ -901,6 +1279,16 @@ pub enum ChatSort {
 impl Chat {
     pub fn key(&self) -> String {
         format!("{}:{}", self.provider.name(), self.id)
+    }
+
+    pub fn reference(&self, title: &str) -> String {
+        format!(
+            "Chat: {title}\nProvider: {}\nChat ID: {}\nSession ID: {}\nDirectory: {}",
+            self.provider.name(),
+            self.key(),
+            self.id,
+            self.cwd
+        )
     }
 }
 
@@ -1132,6 +1520,275 @@ pub(crate) fn content_text(content: &Value) -> String {
         .join("\n\n")
 }
 
+struct ProtocolEnvelope {
+    fields: HashMap<String, String>,
+    complete: bool,
+}
+
+fn protocol_envelope(text: &str) -> Option<ProtocolEnvelope> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(text);
+    let mut stack: Vec<String> = Vec::new();
+    let mut fields: HashMap<String, String> = HashMap::new();
+    let mut roots = 0;
+    let mut complete = false;
+    loop {
+        let text = match reader.read_event() {
+            Ok(Event::Start(tag)) => {
+                if stack.is_empty() {
+                    roots += 1;
+                    if roots > 1 {
+                        return None;
+                    }
+                }
+                if stack.len() >= 64 {
+                    return None;
+                }
+                stack.push(String::from_utf8_lossy(tag.name().as_ref()).into_owned());
+                None
+            }
+            Ok(Event::Empty(_)) => {
+                if stack.is_empty() {
+                    return None;
+                }
+                None
+            }
+            Ok(Event::End(_)) => {
+                stack.pop()?;
+                complete = stack.is_empty();
+                None
+            }
+            Ok(Event::Text(value)) => Some(value.decode().ok()?.into_owned()),
+            Ok(Event::CData(value)) => Some(value.decode().ok()?.into_owned()),
+            Ok(Event::GeneralRef(value)) => {
+                let reference = format!("&{};", value.decode().ok()?);
+                Some(quick_xml::escape::unescape(&reference).ok()?.into_owned())
+            }
+            Ok(Event::Comment(_) | Event::Decl(_)) => None,
+            Ok(Event::Eof) => break,
+            // Never resolve entities or interpret declarations from a transcript.
+            Ok(Event::DocType(_) | Event::PI(_)) | Err(_) => return None,
+        };
+        if let Some(text) = text {
+            if stack.is_empty() && !text.trim().is_empty() {
+                return None;
+            }
+            for field in stack.iter().skip(1) {
+                fields.entry(field.clone()).or_default().push_str(&text);
+            }
+        }
+    }
+    for value in fields.values_mut() {
+        *value = value.trim().to_owned();
+    }
+    Some(ProtocolEnvelope { fields, complete })
+}
+
+fn inline_display_text(role: &str, text: &str) -> Option<String> {
+    if role == "user" {
+        let request: Value =
+            serde_json::from_str(text.trim().strip_prefix("[Zed inline request]\n")?).ok()?;
+        let prompt = request["request"].as_str()?;
+        let file = request["file"].as_str()?;
+        return Some(format!("{prompt}\n\n{file}"));
+    }
+    if role != "assistant" {
+        return None;
+    }
+    let text = text.trim();
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|text| text.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
+    let answer: Value = serde_json::from_str(text).ok()?;
+    let fields = answer.as_object()?;
+    if fields.len() != 2 || !fields.contains_key("replacement_text") {
+        return None;
+    }
+    let explanation = answer["explanation"].as_str()?;
+    match &answer["replacement_text"] {
+        Value::Null => Some(explanation.into()),
+        Value::String(replacement) => {
+            // Generated code may itself contain Markdown fences.
+            let longest = replacement
+                .lines()
+                .map(|line| line.chars().take_while(|c| *c == '`').count())
+                .max()
+                .unwrap_or(0);
+            let fence = "`".repeat(longest.max(2) + 1);
+            Some(format!("{explanation}\n\n{fence}\n{replacement}\n{fence}"))
+        }
+        _ => None,
+    }
+}
+
+fn claude_peer_message(text: &str) -> Option<(String, String)> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix("Another Claude session sent a message:")
+        .unwrap_or(text)
+        .trim();
+    let mut reader = quick_xml::Reader::from_str(text);
+    let quick_xml::events::Event::Start(tag) = reader.read_event().ok()? else {
+        return None;
+    };
+    if tag.name().as_ref() != b"agent-message" {
+        return None;
+    }
+    let sender = tag.attributes().find_map(|attribute| {
+        let attribute = attribute.ok()?;
+        (attribute.key.as_ref() == b"from")
+            .then(|| {
+                attribute
+                    .decode_and_unescape_value(reader.decoder())
+                    .ok()
+                    .map(|value| value.into_owned())
+            })
+            .flatten()
+    })?;
+    if sender.trim().is_empty() {
+        return None;
+    }
+    let body = text
+        .get(reader.buffer_position() as usize..)?
+        .trim_end()
+        .strip_suffix("</agent-message>")?
+        .trim();
+    Some((sender, body.to_owned()))
+}
+
+pub fn normalize_protocol_message(mut message: Message) -> Message {
+    if let Some(text) = inline_display_text(&message.role, &message.text) {
+        message.text = text;
+        return message;
+    }
+
+    if !matches!(message.role.as_str(), "user" | "assistant") {
+        return message;
+    }
+    if message.role == "user"
+        && let Some((sender, body)) = claude_peer_message(&message.text)
+    {
+        message.role = "agent_message".into();
+        message.tool_name = sender;
+        message.text = body;
+        return message;
+    }
+    let text = message.text.trim();
+    let Some(rest) = text.strip_prefix('<') else {
+        return message;
+    };
+    let root = rest
+        .split(|character: char| character.is_whitespace() || matches!(character, '>' | '/'))
+        .next()
+        .unwrap_or_default();
+    // Context and UI acknowledgements were never conversational messages. Keep
+    // that rule identical for history imports and streaming display updates.
+    if message.role == "user" && is_context(text) && root != "codex_internal_context" {
+        message.role = "internal".into();
+        return message;
+    }
+    let known = matches!(
+        root,
+        "heartbeat"
+            | "task-notification"
+            | "codex_internal_context"
+            | "system-reminder"
+            | "environment_context"
+            | "permissions"
+            | "skills_instructions"
+            | "recommended_plugins"
+            | "send_user_message_question_reply"
+            | "external_codex_apps_open_page"
+    );
+    // Only classify transport envelopes, not XML/HTML examples, source code or prose.
+    let family = root.ends_with("_notification")
+        || root.ends_with("-notification")
+        || root.ends_with("_event")
+        || root.ends_with("-event")
+        || root.ends_with("_context")
+        || root.ends_with("-context")
+        || root.ends_with("_reminder")
+        || root.ends_with("-reminder");
+    let envelope = protocol_envelope(text);
+    let machine_fields = envelope.as_ref().is_some_and(|envelope| {
+        [
+            "automation_id",
+            "task-id",
+            "task_id",
+            "thread_id",
+            "tool-use-id",
+            "tool_use_id",
+            "session_id",
+        ]
+        .iter()
+        .any(|field| envelope.fields.contains_key(*field))
+    });
+    let control_fields = envelope.as_ref().is_some_and(|envelope| {
+        [
+            "decision",
+            "status",
+            "instructions",
+            "current_time_iso",
+            "event",
+        ]
+        .iter()
+        .any(|field| envelope.fields.contains_key(*field))
+    });
+    if !known
+        && (!machine_fields
+            || !(family || control_fields)
+            || !envelope.as_ref().is_some_and(|envelope| envelope.complete))
+    {
+        return message;
+    }
+    // A wrapper embedded in normal prose is still normal content.
+    if text.contains(&format!("</{root}>")) && !text.ends_with(&format!("</{root}>")) {
+        return message;
+    }
+    let field = |name: &str| {
+        envelope
+            .as_ref()
+            .and_then(|envelope| envelope.fields.get(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let original = message.text.clone();
+    if root == "heartbeat" && message.role == "assistant" {
+        let report = field("message");
+        if field("decision").eq_ignore_ascii_case("NOTIFY") && !report.is_empty() {
+            message.text = report;
+            return message;
+        }
+    }
+    if root == "task-notification" {
+        if let Some(mut notification) = task_notification(text, &message.timestamp) {
+            notification.tool_input = original;
+            return notification;
+        }
+    }
+    message.tool_name = match root {
+        "heartbeat" if message.role == "assistant" => "Scheduled check completed",
+        "heartbeat" => "Scheduled check",
+        "codex_internal_context" if !field("objective").is_empty() => "Continue goal",
+        "task-notification" => "Background task update",
+        _ => "System update",
+    }
+    .into();
+    message.text = ["message", "summary", "event", "objective", "status"]
+        .iter()
+        .map(|name| field(name))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    message.tool_input = original;
+    message.role = "activity".into();
+    message.tool_finished = true;
+    message.tool_error = matches!(field("status").as_str(), "failed" | "error");
+    message
+}
+
 pub fn task_notification(text: &str, timestamp: &str) -> Option<Message> {
     let text = text.trim();
     if !text.starts_with("<task-notification>") || !text.contains("</task-notification>") {
@@ -1144,7 +1801,13 @@ pub fn task_notification(text: &str, timestamp: &str) -> Option<Message> {
             .unwrap_or_default()
     };
     let id = field("task-id");
-    let status = field("status");
+    let mut status = field("status");
+    if status == "completed"
+        && (field("note").contains("background work of its own still running")
+            || field("result").contains("waiting on its own background work"))
+    {
+        status = "waiting".into();
+    }
     let event = field("event");
     let summary = field("summary");
     if id.is_empty() || (status.is_empty() && event.is_empty() && summary.is_empty()) {
@@ -1166,6 +1829,14 @@ pub fn task_notification(text: &str, timestamp: &str) -> Option<Message> {
             .collect::<Vec<_>>()
             .join("\n\n"),
         tool_input: field("output-file"),
+        subtask: matches!(
+            status.as_str(),
+            "completed" | "failed" | "killed" | "cancelled" | "stopped" | "waiting"
+        )
+        .then(|| ClaudeSubtask {
+            id,
+            status: status.clone(),
+        }),
         // A monitor event is a delivered notification, not a new running command.
         tool_finished: update
             || matches!(
@@ -1177,7 +1848,38 @@ pub fn task_notification(text: &str, timestamp: &str) -> Option<Message> {
     })
 }
 
+pub fn claude_skill_message(value: &Value) -> Option<Message> {
+    if value["type"] != "user" || value["isMeta"] != true {
+        return None;
+    }
+    let text = content_text(&value["message"]["content"]);
+    if !text
+        .trim_start()
+        .starts_with("Base directory for this skill:")
+    {
+        return None;
+    }
+    let name = text
+        .lines()
+        .find_map(|line| line.strip_prefix("# "))
+        .unwrap_or("Skill loaded");
+    Some(Message {
+        role: "activity".into(),
+        tool_name: "Loaded skill".into(),
+        text: name.to_owned(),
+        tool_input: text,
+        tool_finished: true,
+        timestamp: string(value, "timestamp"),
+        ..Default::default()
+    })
+}
+
 fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
+    if provider == Provider::Claude
+        && let Some(message) = claude_skill_message(value)
+    {
+        return Some(message);
+    }
     let message = match provider {
         Provider::Codex
             if value["type"] == "response_item" && value["payload"]["type"] == "message" =>
@@ -1197,30 +1899,23 @@ fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
         return None;
     }
     let text = content_text(&message["content"]);
-    if provider == Provider::Codex
-        && role == "user"
-        && text
-            .trim_start()
-            .starts_with("<codex_internal_context source=\"goal\">")
-        && text.trim_end().ends_with("</codex_internal_context>")
-    {
-        let objective = text
-            .split_once("<objective>")
-            .and_then(|(_, text)| text.split_once("</objective>"))
-            .map(|(objective, _)| objective.trim())
-            .unwrap_or_default();
-        return Some(Message {
-            role: "activity".into(),
-            tool_name: "Continue goal".into(),
-            text: objective.into(),
-            timestamp: string(value, "timestamp"),
-            tool_finished: true,
-            ..Default::default()
-        });
+    let normalized = normalize_protocol_message(Message {
+        role: role.clone(),
+        text: text.clone(),
+        timestamp: string(value, "timestamp"),
+        phase: string(message, "phase"),
+        ..Default::default()
+    });
+    if normalized.role == "internal" {
+        return None;
+    }
+    if normalized.role != role || normalized.text != text {
+        return Some(normalized);
     }
     if provider == Provider::Claude
         && value["isMeta"] == true
-        && text.trim_start().starts_with("[Image: original ")
+        && (text.trim_start().starts_with("[Image: original ")
+            || claude_image_source_metadata(&text))
     {
         return None;
     }
@@ -1299,6 +1994,27 @@ fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
     })
 }
 
+// Claude writes this companion record after the actual image attachment. It is
+// transport metadata, not another user message or a second copy of the image.
+fn claude_image_source_metadata(text: &str) -> bool {
+    let mut found = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some(path) = line
+            .strip_prefix("[Image: source: ")
+            .and_then(|value| value.strip_suffix(']'))
+        else {
+            return false;
+        };
+        let windows_absolute = path.as_bytes().get(1) == Some(&b':')
+            && matches!(path.as_bytes().get(2), Some(b'\\' | b'/'));
+        if !(path.starts_with('/') || Path::new(path).is_absolute() || windows_absolute) {
+            return false;
+        }
+        found = true;
+    }
+    found
+}
+
 fn files_in(root: &Path, depth: usize, output: &mut Vec<PathBuf>) -> Result<()> {
     if !root.exists() {
         return Ok(());
@@ -1329,6 +2045,114 @@ fn title_excerpt(text: &str) -> String {
         .collect()
 }
 
+#[derive(Clone)]
+struct RecencyCacheEntry {
+    length: u64,
+    modified: SystemTime,
+    last_user: Option<SystemTime>,
+}
+
+fn human_message_time(provider: Provider, value: &Value) -> Option<SystemTime> {
+    if value["isMeta"] == true || value["isSidechain"] == true {
+        return None;
+    }
+    let role = match provider {
+        Provider::Codex => &value["payload"]["role"],
+        Provider::Claude => &value["message"]["role"],
+    };
+    if role != "user" {
+        return None;
+    }
+    let message = visible_message(provider, value)?;
+    if message.role != "user" || super::chat_bridge::linked_message(&message.text).is_some() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(&message.timestamp)
+        .ok()
+        .map(SystemTime::from)
+}
+
+fn last_human_message_time(path: &Path, provider: Provider) -> Result<Option<SystemTime>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, RecencyCacheEntry>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    let length = metadata.len();
+    let modified = metadata.modified()?;
+    let complete = if length > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        tail[0] == b'\n'
+    } else {
+        true
+    };
+    let previous = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Chat recency cache unavailable"))?
+        .get(path)
+        .cloned();
+    if let Some(previous) = &previous {
+        if previous.length == length && previous.modified == modified {
+            return Ok(previous.last_user);
+        }
+    }
+    // Scan only newly appended bytes after the first lookup. AI output must not
+    // require rereading a long conversation every time the sidebar polls it.
+    let previous = previous.filter(|entry| entry.length < length);
+    let lower = previous
+        .as_ref()
+        .map_or(0, |entry| entry.length.saturating_sub(1));
+    let mut end = length;
+    let mut prefix = Vec::new();
+    let mut latest = None;
+    while end > lower && latest.is_none() {
+        let start = end.saturating_sub(256 * 1024).max(lower);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; (end - start) as usize];
+        file.read_exact(&mut bytes)?;
+        bytes.extend_from_slice(&prefix);
+        let boundary = if start > 0 {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+        } else {
+            Some(0)
+        };
+        if let Some(boundary) = boundary {
+            for line in bytes[boundary..].rsplit(|byte| *byte == b'\n') {
+                if let Ok(value) = serde_json::from_slice::<Value>(line) {
+                    if let Some(time) = human_message_time(provider, &value) {
+                        latest = Some(time);
+                        break;
+                    }
+                }
+            }
+            prefix = bytes[..boundary].to_vec();
+        } else {
+            prefix = bytes;
+        }
+        end = start;
+    }
+    let last_user = latest.or_else(|| previous.and_then(|entry| entry.last_user));
+    if complete {
+        cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Chat recency cache unavailable"))?
+            .insert(
+                path.to_owned(),
+                RecencyCacheEntry {
+                    length,
+                    modified,
+                    last_user,
+                },
+            );
+    }
+    Ok(last_user)
+}
+
 fn metadata(
     path: PathBuf,
     provider: Provider,
@@ -1346,8 +2170,9 @@ fn metadata(
             .into_owned(),
         title: String::new(),
         cwd: String::new(),
-        path,
-        modified: file_metadata.modified()?,
+        path: path.clone(),
+        modified: last_human_message_time(&path, provider)?
+            .unwrap_or_else(|| file_metadata.created().unwrap_or(SystemTime::UNIX_EPOCH)),
         archived,
         internal: false,
     };
@@ -1506,6 +2331,127 @@ pub fn catalog(codex_home: &Path, claude_home: &Path) -> Catalog {
     catalog
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ChatSchedule {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub rrule: String,
+    pub target_thread_id: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(skip)]
+    pub path: PathBuf,
+}
+
+impl ChatSchedule {
+    pub fn active(&self) -> bool {
+        self.status.eq_ignore_ascii_case("ACTIVE")
+    }
+
+    pub fn cadence(&self) -> String {
+        let rule = self.rrule.strip_prefix("RRULE:").unwrap_or(&self.rrule);
+        let fields = rule
+            .split(';')
+            .filter_map(|field| field.split_once('='))
+            .collect::<HashMap<_, _>>();
+        if fields
+            .keys()
+            .any(|key| !matches!(*key, "FREQ" | "INTERVAL" | "BYHOUR" | "BYMINUTE"))
+        {
+            return self.rrule.clone();
+        }
+        let frequency = fields.get("FREQ").copied();
+        let unit = match frequency {
+            Some("MINUTELY") => "minute",
+            Some("HOURLY") => "hour",
+            Some("DAILY") => "day",
+            Some("WEEKLY") => "week",
+            _ => return self.rrule.clone(),
+        };
+        let interval = fields.get("INTERVAL").copied().unwrap_or("1");
+        let mut cadence = match interval.parse::<u32>() {
+            Ok(1) => format!("Every {unit}"),
+            Ok(count) if count > 1 => format!("Every {count} {unit}s"),
+            _ => return self.rrule.clone(),
+        };
+        if fields.contains_key("BYHOUR") || fields.contains_key("BYMINUTE") {
+            if frequency != Some("DAILY") {
+                return self.rrule.clone();
+            }
+            let hour = fields
+                .get("BYHOUR")
+                .and_then(|hour| hour.parse::<u32>().ok());
+            let minute = fields
+                .get("BYMINUTE")
+                .copied()
+                .unwrap_or("0")
+                .parse::<u32>()
+                .ok();
+            match (hour, minute) {
+                (Some(hour), Some(minute)) if hour < 24 && minute < 60 => {
+                    cadence.push_str(&format!(" at {hour:02}:{minute:02}"));
+                }
+                _ => return self.rrule.clone(),
+            }
+        }
+        cadence
+    }
+}
+
+fn schedules_in(directory: &Path) -> Result<HashMap<String, Vec<ChatSchedule>>> {
+    let mut schedules: HashMap<String, Vec<ChatSchedule>> = HashMap::new();
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(schedules),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("automation.toml");
+        let read = || -> Result<ChatSchedule> {
+            let mut schedule: ChatSchedule = toml::from_str(&fs::read_to_string(&path)?)?;
+            schedule.path = path.clone();
+            Ok(schedule)
+        };
+        match read() {
+            Ok(schedule) => {
+                if let Some(thread) = schedule
+                    .target_thread_id
+                    .as_ref()
+                    .filter(|id| !id.is_empty())
+                {
+                    schedules
+                        .entry(format!("Codex:{thread}"))
+                        .or_default()
+                        .push(schedule);
+                }
+            }
+            Err(error) => log::warn!("Cannot read schedule {}: {error}", path.display()),
+        }
+    }
+    for entries in schedules.values_mut() {
+        entries.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    }
+    Ok(schedules)
+}
+
+pub fn local_schedules() -> Result<HashMap<String, Vec<ChatSchedule>>> {
+    let codex = match std::env::var_os("CODEX_HOME") {
+        Some(directory) => PathBuf::from(directory),
+        None => PathBuf::from(
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .context("Home directory is unavailable")?,
+        )
+        .join(".codex"),
+    };
+    schedules_in(&codex.join("automations"))
+}
+
 pub fn local_catalog() -> Result<Catalog> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -1535,6 +2481,16 @@ pub fn compaction_message(finished: bool, timestamp: String) -> Message {
 }
 
 fn records(provider: Provider, value: &Value) -> Vec<Message> {
+    if provider == Provider::Claude
+        && (value["isSidechain"] == true || !value["parent_tool_use_id"].is_null())
+    {
+        return Vec::new();
+    }
+    if provider == Provider::Claude
+        && let Some(message) = claude_task_event(value)
+    {
+        return vec![message];
+    }
     let payload = if provider == Provider::Codex {
         &value["payload"]
     } else {
@@ -1649,6 +2605,9 @@ fn records(provider: Provider, value: &Value) -> Vec<Message> {
                 },
                 tool_finished: true,
                 tool_error: block["is_error"] == true,
+                subtask: (provider == Provider::Claude)
+                    .then(|| claude_async_subtask(value, block))
+                    .flatten(),
                 attachments: if inline_image {
                     Vec::new()
                 } else {
@@ -1658,7 +2617,7 @@ fn records(provider: Provider, value: &Value) -> Vec<Message> {
             });
             if inline_image {
                 records.push(Message {
-                    role: "assistant".into(),
+                    role: "tool_image".into(),
                     timestamp: timestamp.clone(),
                     attachments,
                     ..Default::default()
@@ -1675,9 +2634,12 @@ fn records(provider: Provider, value: &Value) -> Vec<Message> {
 #[derive(Clone, Debug)]
 pub struct ChatActivity {
     pub modified: SystemTime,
+    pub last_user_message_at: Option<SystemTime>,
     pub running: bool,
     pub reply: Option<String>,
     pub pending_questions: HashSet<String>,
+    pub subtasks: ClaudeSubtasks,
+    turn_running: bool,
 }
 
 impl ChatActivity {
@@ -1688,27 +2650,52 @@ impl ChatActivity {
     }
 }
 
+fn codex_turn_running(value: &Value) -> Option<bool> {
+    if value["type"] == "event_msg" {
+        match value["payload"]["type"].as_str() {
+            Some("task_started" | "turn_started") => return Some(true),
+            Some("task_complete" | "task_completed" | "turn_aborted") => return Some(false),
+            _ => {}
+        }
+    }
+    if value["type"] == "response_item"
+        && value["payload"]["type"] == "message"
+        && value["payload"]["role"] == "assistant"
+        && value["payload"]["phase"] == "final_answer"
+    {
+        return Some(false);
+    }
+    None
+}
+
 pub fn chat_activity(chat: &Chat, previous: Option<&ChatActivity>) -> Result<ChatActivity> {
     let mut file = File::open(&chat.path)?;
     let metadata = file.metadata()?;
     let modified = metadata.modified()?;
     if let Some(previous) = previous.filter(|previous| previous.modified == modified) {
         let mut previous = previous.clone();
+        previous.subtasks.refresh(chat)?;
         if modified
             .elapsed()
             .is_ok_and(|age| age > std::time::Duration::from_secs(90))
         {
-            previous.running = false;
+            previous.turn_running = false;
         }
+        previous.running = previous.turn_running || previous.subtasks.pending() > 0;
         return Ok(previous);
     }
     let mut activity = ChatActivity {
         modified,
-        running: previous.is_some_and(|previous| previous.running),
+        last_user_message_at: last_human_message_time(&chat.path, chat.provider)?,
+        running: previous.is_some_and(|previous| previous.turn_running),
         reply: previous.and_then(|previous| previous.reply.clone()),
         pending_questions: previous
             .map(|previous| previous.pending_questions.clone())
             .unwrap_or_default(),
+        subtasks: previous
+            .map(|previous| previous.subtasks.clone())
+            .unwrap_or_default(),
+        turn_running: false,
     };
     let offset = metadata.len().saturating_sub(256 * 1024);
     file.seek(SeekFrom::Start(offset))?;
@@ -1744,24 +2731,9 @@ pub fn chat_activity(chat: &Chat, previous: Option<&ChatActivity>) -> Result<Cha
         let mut reply = false;
         match chat.provider {
             Provider::Codex => {
-                if value["type"] == "event_msg" {
-                    match value["payload"]["type"].as_str() {
-                        Some("task_started" | "turn_started") => activity.running = true,
-                        Some("task_complete" | "task_completed") => {
-                            activity.running = false;
-                            reply = true;
-                        }
-                        Some("turn_aborted") => activity.running = false,
-                        _ => {}
-                    }
-                }
-                if value["type"] == "response_item"
-                    && value["payload"]["type"] == "message"
-                    && value["payload"]["role"] == "assistant"
-                    && value["payload"]["phase"] == "final_answer"
-                {
-                    activity.running = false;
-                    reply = true;
+                if let Some(running) = codex_turn_running(&value) {
+                    activity.running = running;
+                    reply = !running && value["payload"]["type"] != "turn_aborted";
                 }
             }
             Provider::Claude
@@ -1801,6 +2773,9 @@ pub fn chat_activity(chat: &Chat, previous: Option<&ChatActivity>) -> Result<Cha
     {
         activity.running = false;
     }
+    activity.turn_running = activity.running;
+    activity.subtasks.refresh(chat)?;
+    activity.running |= activity.subtasks.pending() > 0;
     Ok(activity)
 }
 
@@ -1813,6 +2788,7 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
     let mut messages: VecDeque<Message> = VecDeque::new();
     let mut plan = Vec::new();
     let mut transcript = Transcript::default();
+    let mut subtasks = ClaudeSubtasks::default();
     let mut seen = HashSet::new();
     loop {
         line.clear();
@@ -1842,10 +2818,10 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
             value["parent_tool_use_id"] = Value::Null;
         }
         transcript.metrics.observe(chat.provider, &value);
-        match value["payload"]["type"].as_str() {
-            Some("task_started" | "turn_started") => transcript.running = true,
-            Some("task_complete" | "task_completed" | "turn_aborted") => transcript.running = false,
-            _ => {}
+        if chat.provider == Provider::Codex
+            && let Some(running) = codex_turn_running(&value)
+        {
+            transcript.running = running;
         }
         if chat.provider == Provider::Claude && value["isSidechain"] != true {
             if matches!(value["type"].as_str(), Some("user" | "api-request")) {
@@ -1871,6 +2847,9 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
                 continue;
             }
             for mut message in parsed {
+                if chat.provider == Provider::Claude {
+                    subtasks.observe(&message);
+                }
                 let updated_plan = apply_plan_update(&mut message, &plan);
                 if !updated_plan.is_empty() {
                     plan = updated_plan;
@@ -1894,6 +2873,7 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
                         call.text = message.text;
                         call.tool_finished = true;
                         call.tool_error = message.tool_error;
+                        call.subtask = message.subtask;
                         call.attachments.extend(message.attachments);
                     }
                     continue;
@@ -1912,6 +2892,12 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
             }
         }
     }
+    subtasks.refresh_children(chat)?;
+    for message in &mut messages {
+        subtasks.apply(message);
+    }
+    transcript.pending_subtasks = subtasks.pending();
+    transcript.running |= transcript.pending_subtasks > 0;
     transcript.messages = messages.into();
     Ok(transcript)
 }
@@ -1920,6 +2906,507 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn claude_image_source_companions_are_not_duplicate_user_bubbles() {
+        let marker = r"[Image: source: C:\Users\example\Temp\claude\images\10.png]";
+        let mut value = json!({
+            "type": "user", "isMeta": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": marker}]}
+        });
+        assert!(visible_message(Provider::Claude, &value).is_none());
+        value["isMeta"] = json!(false);
+        assert_eq!(
+            visible_message(Provider::Claude, &value)
+                .expect("real user text")
+                .text,
+            marker
+        );
+        value["message"]["content"] = json!([
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}},
+            {"type": "text", "text": "Please inspect this screenshot"}
+        ]);
+        let message = visible_message(Provider::Claude, &value).expect("image message");
+        assert_eq!(message.text, "Please inspect this screenshot");
+        assert_eq!(message.attachments, ["data:image/png;base64,aW1hZ2U="]);
+        assert!(!claude_image_source_metadata(
+            "Explain [Image: source: C:/image.png]"
+        ));
+        assert!(!claude_image_source_metadata(
+            "[Image: source: relative.png]"
+        ));
+        assert!(!claude_image_source_metadata(""));
+        assert!(claude_image_source_metadata(
+            "[Image: source: /tmp/image.png]\n[Image: source: C:/other.png]"
+        ));
+    }
+
+    #[test]
+    fn nested_chat_layout_preserves_independent_splits_and_survives_closing() {
+        let mut layout = ChatPaneLayout::Group(0);
+        assert!(layout.split(0, 1, true));
+        assert!(layout.split(0, 2, false));
+        layout.set_ratio(&[false], 0.65);
+        assert!(layout.valid_for(3));
+        let restored: ChatPaneLayout =
+            serde_json::from_str(&serde_json::to_string(&layout).expect("serialize layout"))
+                .expect("restore layout");
+        assert_eq!(restored, layout);
+        if let ChatPaneLayout::Split {
+            vertical,
+            ratio,
+            first,
+            second,
+        } = &restored
+        {
+            assert!(*vertical);
+            assert_eq!(*ratio, 0.5);
+            assert_eq!(**second, ChatPaneLayout::Group(1));
+            assert!(matches!(
+                **first,
+                ChatPaneLayout::Split {
+                    vertical: false,
+                    ratio: 0.65,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected split");
+        }
+        let remaining = restored.remove(0).expect("remaining panes");
+        assert!(remaining.valid_for(2));
+        assert_eq!(remaining.remove(0), Some(ChatPaneLayout::Group(0)));
+        assert_eq!(ChatPaneLayout::Group(0).remove(0), None);
+    }
+
+    #[test]
+    fn chat_layout_validates_saved_groups_and_legacy_weights() {
+        let layout = ChatPaneLayout::from_weights(&[2., 1., 1.], false);
+        assert!(layout.valid_for(3));
+        assert!(!layout.valid_for(2));
+        let mut invalid = layout.clone();
+        invalid.set_ratio(&[], f32::NAN);
+        assert!(!invalid.valid_for(3));
+        let legacy: GeneralWorkspace =
+            serde_json::from_str(r#"{"vertical":true}"#).expect("legacy");
+        assert!(legacy.layout.is_none());
+    }
+
+    #[test]
+    fn peer_messages_preserve_body_without_displaying_protocol_wrapper() {
+        let body = "Review **Workers**.\n```rust\nlet value: Vec<T> = Vec::new();\n```";
+        for prefix in ["", "Another Claude session sent a message:\n"] {
+            let message = normalize_protocol_message(Message {
+                role: "user".into(),
+                text: format!(
+                    "{prefix}<agent-message from=\"agent&amp;one\">\n{body}\n</agent-message>"
+                ),
+                ..Default::default()
+            });
+            assert_eq!(message.role, "agent_message");
+            assert_eq!(message.tool_name, "agent&one");
+            assert_eq!(message.text, body);
+            assert_eq!(normalize_protocol_message(message.clone()), message);
+        }
+        for text in [
+            "Explain <agent-message from=\"a\">text</agent-message>",
+            "<agent-message from=\"a\">unfinished",
+        ] {
+            let message = normalize_protocol_message(Message {
+                role: "user".into(),
+                text: text.into(),
+                ..Default::default()
+            });
+            assert_eq!(message.text, text);
+        }
+    }
+
+    #[test]
+    fn copied_chat_reference_uses_provider_qualified_routing_key() {
+        for provider in [Provider::Codex, Provider::Claude] {
+            let chat = Chat {
+                provider,
+                id: "same-id".into(),
+                title: "Old title".into(),
+                cwd: "C:/Projects/sevk".into(),
+                path: PathBuf::new(),
+                modified: SystemTime::UNIX_EPOCH,
+                archived: false,
+                internal: false,
+            };
+            let reference = chat.reference("Renamed chat");
+            assert!(reference.contains("Chat: Renamed chat\n"));
+            assert!(reference.contains(&format!("Chat ID: {}\n", chat.key())));
+            assert!(reference.contains("Directory: C:/Projects/sevk"));
+        }
+    }
+
+    fn async_agent_rows() -> Vec<Value> {
+        vec![
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Agent","input":{"description":"Review Rust"}}],"stop_reason":"tool_use"}}),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"Async agent launched successfully.\nagentId: child-1 (internal ID)"}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"child-1"}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Waiting for the agent."}],"stop_reason":"end_turn"}}),
+            json!({"type":"system","subtype":"turn_duration"}),
+        ]
+    }
+
+    #[test]
+    fn async_agent_outlives_parent_turn_and_visible_history_page() {
+        let fixture = Fixture::new();
+        let path = fixture.write("async.jsonl", &async_agent_rows());
+        let chat = metadata(path.clone(), Provider::Claude, false, &HashMap::new()).expect("chat");
+        let history = transcript(&chat, 200).expect("history");
+        let call = history
+            .messages
+            .iter()
+            .find(|message| is_claude_subtask(message))
+            .expect("agent");
+        assert!(call.tool_finished, "launch call has returned");
+        assert!(call.subtask.as_ref().expect("async task").running());
+        assert!(history.running);
+        assert_eq!(
+            transcript(&chat, 1).expect("small page").pending_subtasks,
+            1
+        );
+        let old = SystemTime::now() - std::time::Duration::from_secs(600);
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("file")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("mtime");
+        let activity = chat_activity(&chat, None).expect("activity");
+        assert!(
+            activity.running,
+            "parent inactivity does not complete a background task"
+        );
+        assert!(
+            chat_activity(&chat, Some(&activity))
+                .expect("cached activity")
+                .running
+        );
+    }
+
+    #[test]
+    fn async_agent_completion_is_detected_without_parent_file_changes() {
+        let fixture = Fixture::new();
+        let path = fixture.write("parent.jsonl", &async_agent_rows());
+        let chat = metadata(path, Provider::Claude, false, &HashMap::new()).expect("chat");
+        fixture.write(
+            "parent/subagents/agent-child-1.jsonl",
+            &[json!({"type":"assistant","isSidechain":true,"message":{"stop_reason":"tool_use"}})],
+        );
+        let before = chat_activity(&chat, None).expect("running");
+        fixture.write("parent/subagents/agent-child-1.jsonl", &[json!({"type":"assistant","isSidechain":true,"message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Done"}]}})]);
+        let after = chat_activity(&chat, Some(&before)).expect("finished");
+        assert_eq!(before.modified, after.modified);
+        assert!(before.running);
+        assert!(!after.running);
+        let history = transcript(&chat, 200).expect("history");
+        assert!(!history.running);
+        assert_eq!(history.pending_subtasks, 0);
+        let call = history
+            .messages
+            .iter()
+            .find(|message| is_claude_subtask(message))
+            .expect("agent");
+        assert_eq!(call.subtask.as_ref().expect("task").status, "completed");
+    }
+
+    #[test]
+    fn async_notifications_finish_only_the_matching_agent_and_survive_replayed_launches() {
+        for status in ["completed", "failed", "killed", "cancelled", "stopped"] {
+            let mut tracker = ClaudeSubtasks::default();
+            let launch = Message {
+                role: "tool_result".into(),
+                tool_id: "tool-1".into(),
+                subtask: Some(ClaudeSubtask {
+                    id: "child-1".into(),
+                    status: "running".into(),
+                }),
+                ..Default::default()
+            };
+            tracker.observe(&launch);
+            tracker.observe(&Message {
+                tool_id: "tool-2".into(),
+                subtask: Some(ClaudeSubtask {
+                    id: "child-2".into(),
+                    status: "running".into(),
+                }),
+                ..launch.clone()
+            });
+            let notification = task_notification(&format!("<task-notification><task-id>child-1</task-id><status>{status}</status><summary>Agent report</summary></task-notification>"), "").expect("notification");
+            tracker.observe(&notification);
+            tracker.observe(&launch);
+            assert_eq!(tracker.pending(), 1);
+            assert_eq!(tracker.tasks["tool-1"].status, status);
+            assert!(tracker.tasks["tool-2"].running());
+        }
+    }
+
+    #[test]
+    fn synchronous_agent_result_and_unrelated_monitor_are_not_pending_agents() {
+        let fixture = Fixture::new();
+        let mut rows = async_agent_rows();
+        rows[1] = json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"Finished review"}]}});
+        let path = fixture.write("sync.jsonl", &rows);
+        let chat = metadata(path, Provider::Claude, false, &HashMap::new()).expect("chat");
+        let history = transcript(&chat, 200).expect("history");
+        assert!(!history.running);
+        assert_eq!(history.pending_subtasks, 0);
+        assert!(history.messages[0].tool_finished);
+        assert!(history.messages[0].subtask.is_none());
+        let event = task_notification("<task-notification><task-id>child-1</task-id><event>Build still running</event></task-notification>", "").expect("event");
+        assert!(event.subtask.is_none());
+    }
+
+    #[test]
+    fn async_launch_fallback_does_not_require_run_in_background_input() {
+        let result = json!({"content":[{"type":"text","text":"Async agent launched successfully.\nagentId: a123 (internal ID)\nThe agent is working in the background."}]});
+        assert_eq!(
+            claude_async_subtask(&Value::Null, &result)
+                .expect("fallback")
+                .id,
+            "a123"
+        );
+        assert!(
+            claude_async_subtask(
+                &json!({"toolUseResult":{"isAsync":true,"agentId":"../bad"}}),
+                &result
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn async_tracker_reads_launches_outside_tail_and_retries_partial_notifications() {
+        use std::io::Write;
+        let fixture = Fixture::new();
+        let mut rows = async_agent_rows();
+        rows.insert(
+            2,
+            json!({"type":"api-request-blob","payload":"x".repeat(300 * 1024)}),
+        );
+        let path = fixture.write("parent.jsonl", &rows);
+        let chat = metadata(path.clone(), Provider::Claude, false, &HashMap::new()).expect("chat");
+        let before = chat_activity(&chat, None).expect("cold start");
+        assert_eq!(before.subtasks.pending(), 1);
+        let notification = json!({"type":"system","subtype":"task_notification","task_id":"child-1","status":"completed","summary":"Done"}).to_string();
+        let mut file = File::options().append(true).open(path).expect("file");
+        file.write_all(notification.as_bytes())
+            .expect("partial record");
+        let partial = chat_activity(&chat, Some(&before)).expect("partial");
+        assert_eq!(partial.subtasks.pending(), 1);
+        file.write_all(b"\n").expect("finish record");
+        let complete = chat_activity(&chat, Some(&partial)).expect("complete");
+        assert_eq!(complete.subtasks.pending(), 0);
+        assert!(!complete.running);
+        assert_eq!(transcript(&chat, 200).expect("history").pending_subtasks, 0);
+    }
+
+    #[test]
+    fn interim_completed_notification_waits_for_successful_subagent_handback() {
+        let fixture = Fixture::new();
+        let mut rows = async_agent_rows();
+        rows.push(json!({"type":"user","message":{"role":"user","content":"<task-notification><task-id>child-1</task-id><status>completed</status><summary>Agent is waiting on its own background work</summary><note>This agent stopped with background work of its own still running.</note><result>This agent has not reported yet: it is waiting on its own background work and will deliver its report through SubagentHandback.</result></task-notification>"}}));
+        rows.push(json!({"type":"system","subtype":"turn_duration"}));
+        let path = fixture.write("parent.jsonl", &rows);
+        let chat = metadata(path, Provider::Claude, false, &HashMap::new()).expect("chat");
+        fixture.write("parent/subagents/agent-child-1.jsonl", &[json!({"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Waiting for compilation"}]}})]);
+        let before = chat_activity(&chat, None).expect("waiting");
+        assert!(before.running);
+        assert_eq!(before.subtasks.tasks["tool-1"].status, "waiting");
+        assert_eq!(
+            transcript(&chat, 200)
+                .expect("waiting transcript")
+                .pending_subtasks,
+            1
+        );
+        let handback = json!({"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"handback","name":"SubagentHandback","input":{}}]}});
+        fixture.write("parent/subagents/agent-child-1.jsonl", &[handback.clone(), json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"handback","is_error":true,"content":"Failed"}]}})]);
+        let failed = chat_activity(&chat, Some(&before)).expect("failed handback");
+        assert!(failed.running, "failed delivery does not complete the task");
+        fixture.write("parent/subagents/agent-child-1.jsonl", &[handback, json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"handback","content":[{"type":"text","text":"{\"success\":true,\"message\":\"Report delivered to your caller.\"}"}]}]}})]);
+        let after = chat_activity(&chat, Some(&failed)).expect("delivered report");
+        assert!(!after.running);
+        assert_eq!(after.subtasks.pending(), 0);
+        assert_eq!(
+            transcript(&chat, 200)
+                .expect("complete transcript")
+                .pending_subtasks,
+            0
+        );
+    }
+
+    #[test]
+    fn plan_animation_stops_at_turn_boundary_without_completing_tasks() {
+        let plan = Message {
+            role: "plan".into(),
+            ..Default::default()
+        };
+        let commentary = Message {
+            role: "assistant".into(),
+            phase: "commentary".into(),
+            ..Default::default()
+        };
+        let answer = Message {
+            role: "assistant".into(),
+            phase: "final_answer".into(),
+            ..Default::default()
+        };
+        let user = Message {
+            role: "user".into(),
+            ..Default::default()
+        };
+        assert!(plan_is_running(&[&plan, &commentary], 0, true));
+        assert!(!plan_is_running(&[&plan, &commentary], 0, false));
+        assert!(!plan_is_running(&[&plan, &answer], 0, true));
+        assert!(!plan_is_running(&[&plan, &user], 0, true));
+    }
+
+    #[test]
+    fn injected_claude_skill_is_activity_but_user_quoted_skill_is_preserved() {
+        let text = "Base directory for this skill: C:/skills/browser\n\n# Built-in browser\n\nInstructions remain available in details.";
+        let mut record = json!({"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":text}]}});
+        let message = visible_message(Provider::Claude, &record).expect("activity");
+        assert_eq!(message.role, "activity");
+        assert_eq!(message.tool_name, "Loaded skill");
+        assert_eq!(message.text, "Built-in browser");
+        assert_eq!(message.tool_input, text);
+        assert!(message.tool_finished);
+        record["isMeta"] = json!(false);
+        let message = visible_message(Provider::Claude, &record).expect("user quote");
+        assert_eq!(message.role, "user");
+        assert_eq!(message.text, text);
+    }
+
+    #[test]
+    fn schedules_match_explicit_thread_and_refresh_status_and_removal() {
+        let fixture = Fixture::new();
+        let directory = fixture.0.join("automations");
+        fs::create_dir_all(directory.join("first")).expect("directory");
+        let path = directory.join("first/automation.toml");
+        let config = r#"id = "first"
+name = "R2 batch takibi"
+status = "ACTIVE"
+rrule = "FREQ=MINUTELY;INTERVAL=30"
+target_thread_id = "target"
+prompt = "Check progress"
+"#;
+        fs::write(&path, config).expect("config");
+        fs::create_dir_all(directory.join("unbound")).expect("directory");
+        fs::write(
+            directory.join("unbound/automation.toml"),
+            config.replace("target_thread_id = \"target\"\n", ""),
+        )
+        .expect("config");
+        let first = schedules_in(&directory).expect("schedules");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first["Codex:target"].len(), 1);
+        let schedule = &first["Codex:target"][0];
+        assert!(schedule.active());
+        assert_eq!(schedule.cadence(), "Every 30 minutes");
+        assert!(!first.contains_key("Claude:target"));
+        fs::write(
+            &path,
+            config
+                .replace("ACTIVE", "PAUSED")
+                .replace("FREQ=MINUTELY;INTERVAL=30", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .expect("pause");
+        let paused = schedules_in(&directory).expect("schedules");
+        assert!(!paused["Codex:target"][0].active());
+        assert_eq!(paused["Codex:target"][0].cadence(), "Every day at 09:00");
+        fs::remove_file(path).expect("remove");
+        assert!(schedules_in(&directory).expect("schedules").is_empty());
+    }
+
+    #[test]
+    fn recency_does_not_skip_a_partially_written_user_record() {
+        let fixture = Fixture::new();
+        let path = fixture.write("partial.jsonl", &[json!({"type":"user","timestamp":"2026-11-01T10:00:00Z","message":{"role":"user","content":"first"}})]);
+        let initial = last_human_message_time(&path, Provider::Claude).expect("initial");
+        let original = fs::read_to_string(&path).expect("read");
+        let next = serde_json::to_string(&json!({"type":"user","timestamp":"2026-11-01T12:00:00Z","message":{"role":"user","content":"second"}})).expect("json");
+        fs::write(&path, format!("{original}{}", &next[..next.len() / 2])).expect("partial");
+        assert_eq!(
+            last_human_message_time(&path, Provider::Claude).expect("partial"),
+            initial
+        );
+        fs::write(&path, format!("{original}{next}\n")).expect("complete");
+        assert!(last_human_message_time(&path, Provider::Claude).expect("complete") > initial);
+    }
+
+    #[test]
+    fn recency_tracks_humans_instead_of_streaming_or_background_messages() {
+        for provider in [Provider::Codex, Provider::Claude] {
+            let fixture = Fixture::new();
+            let human = |timestamp: &str, text: &str| match provider {
+                Provider::Codex => {
+                    json!({"timestamp":timestamp,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}})
+                }
+                Provider::Claude => {
+                    json!({"timestamp":timestamp,"type":"user","message":{"role":"user","content":text}})
+                }
+            };
+            let first = human("2026-11-01T10:00:00Z", "Hello");
+            let path = fixture.write("recency.jsonl", &[first.clone()]);
+            let initial = last_human_message_time(&path, provider)
+                .expect("first")
+                .expect("time");
+            let assistant = match provider {
+                Provider::Codex => {
+                    json!({"timestamp":"2026-11-01T11:00:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(600_000)}]}})
+                }
+                Provider::Claude => {
+                    json!({"timestamp":"2026-11-01T11:00:00Z","type":"assistant","message":{"role":"assistant","content":"x".repeat(600_000)}})
+                }
+            };
+            let peer = human(
+                "2026-11-01T12:00:00Z",
+                "Message from chat Peer (peer proposal, not a new user instruction):\n\nAn update",
+            );
+            let scheduled = human(
+                "2026-11-01T12:30:00Z",
+                "<heartbeat><automation_id>timer</automation_id><instructions>Check progress</instructions></heartbeat>",
+            );
+            let mut rows = vec![first, assistant, peer, scheduled];
+            fixture.write("recency.jsonl", &rows);
+            assert_eq!(
+                last_human_message_time(&path, provider).expect("stream"),
+                Some(initial)
+            );
+            let cold = fixture.write("cold.jsonl", &rows);
+            assert_eq!(
+                last_human_message_time(&cold, provider).expect("cold"),
+                Some(initial)
+            );
+            rows.push(human("2026-11-01T13:00:00Z", "Next question"));
+            fixture.write("recency.jsonl", &rows);
+            let next = last_human_message_time(&path, provider)
+                .expect("next")
+                .expect("time");
+            assert!(next > initial);
+            let chat = metadata(path.clone(), provider, false, &HashMap::new()).expect("metadata");
+            assert_eq!(chat.modified, next);
+            assert_eq!(
+                chat_activity(&chat, None)
+                    .expect("activity")
+                    .last_user_message_at,
+                Some(next)
+            );
+            fixture.write(
+                "recency.jsonl",
+                &[human("2026-10-01T10:00:00Z", "Replaced history")],
+            );
+            assert!(
+                last_human_message_time(&path, provider)
+                    .expect("truncated")
+                    .expect("time")
+                    < initial
+            );
+        }
+    }
 
     #[test]
     fn status_grouping_prioritizes_pins_and_questions_and_persists() {
@@ -2200,6 +3687,149 @@ mod tests {
     }
 
     #[test]
+    fn protocol_heartbeat_reports_are_prose_in_history_and_live_updates() {
+        let xml = "<heartbeat><automation_id>timer</automation_id><decision>NOTIFY</decision><message>Progress &amp; details: <![CDATA[83% < 100%]]></message></heartbeat>";
+        let original = Message {
+            role: "assistant".into(),
+            text: xml.into(),
+            timestamp: "2026-11-03T10:00:00Z".into(),
+            ..Default::default()
+        };
+        let live = normalize_protocol_message(original.clone());
+        assert_eq!(live.role, "assistant");
+        assert_eq!(live.text, "Progress & details: 83% < 100%");
+        assert_eq!(normalize_protocol_message(live.clone()).text, live.text);
+        for provider in [Provider::Codex, Provider::Claude] {
+            let row = match provider {
+                Provider::Codex => {
+                    json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":xml}})
+                }
+                Provider::Claude => {
+                    json!({"type":"assistant","message":{"role":"assistant","content":xml}})
+                }
+            };
+            let history = visible_message(provider, &row).expect("report");
+            assert_eq!(history.text, live.text);
+            assert_eq!(history.role, live.role);
+        }
+    }
+
+    #[test]
+    fn protocol_scheduled_instructions_and_quiet_results_are_activity() {
+        for (role, xml) in [
+            (
+                "user",
+                "<heartbeat><automation_id>timer</automation_id><current_time_iso>2026-11-03T10:00:00Z</current_time_iso><instructions>Inspect progress</instructions></heartbeat>",
+            ),
+            (
+                "assistant",
+                "<heartbeat><automation_id>timer</automation_id><decision>QUIET</decision></heartbeat>",
+            ),
+        ] {
+            let normalized = normalize_protocol_message(Message {
+                role: role.into(),
+                text: xml.into(),
+                ..Default::default()
+            });
+            assert_eq!(normalized.role, "activity");
+            assert!(normalized.tool_finished);
+            assert!(!normalized.text.contains("<"));
+            assert_eq!(normalized.tool_input, xml);
+            assert!(matches!(
+                conversation_parts(&[&normalized])[0],
+                ConversationPart::Work(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn protocol_future_envelopes_use_structure_instead_of_a_tag_allowlist() {
+        for root in ["worker_notification", "job-event", "new_transport_wrapper"] {
+            let xml = format!(
+                "<{root}><session_id>session</session_id><status>failed</status><summary>Job failed</summary></{root}>"
+            );
+            let normalized = normalize_protocol_message(Message {
+                role: "user".into(),
+                text: xml.clone(),
+                ..Default::default()
+            });
+            assert_eq!(normalized.role, "activity", "{root}");
+            assert_eq!(normalized.text, "Job failed");
+            assert!(normalized.tool_error);
+            assert_eq!(normalized.tool_input, xml);
+        }
+    }
+
+    #[test]
+    fn protocol_code_examples_and_mixed_prose_remain_unchanged() {
+        for text in [
+            "```xml\n<heartbeat><decision>NOTIFY</decision></heartbeat>\n```",
+            "<div><p>Hello</p></div>",
+            "<config><message>Keep this XML</message></config>",
+            "<job_event><message>A source-code example without transport IDs</message></job_event>",
+            "Here is XML: <heartbeat><decision>NOTIFY</decision></heartbeat>",
+            "<heartbeat><message>Example</message></heartbeat>\nPlease explain this XML.",
+            "<config><thread_id>123</thread_id><name>Source configuration</name></config>",
+        ] {
+            let normalized = normalize_protocol_message(Message {
+                role: "user".into(),
+                text: text.into(),
+                ..Default::default()
+            });
+            assert_eq!(normalized.role, "user", "{text}");
+            assert_eq!(normalized.text, text);
+        }
+    }
+
+    #[test]
+    fn protocol_streaming_and_broken_envelopes_do_not_leak_into_bubbles() {
+        for xml in [
+            "<heartbeat><automation_id>timer</automation_id><instructions>Still arriving",
+            "<heartbeat><automation_id>timer</broken></heartbeat>",
+            "<task-notification><task-id>job</task-id><status>",
+        ] {
+            let normalized = normalize_protocol_message(Message {
+                role: "user".into(),
+                text: xml.into(),
+                ..Default::default()
+            });
+            assert_eq!(normalized.role, "activity");
+            assert_eq!(normalized.tool_input, xml);
+        }
+        let partial = normalize_protocol_message(Message {
+            role: "assistant".into(),
+            text: "<heartbeat><decision>NOTIFY</decision><message>Loading report".into(),
+            ..Default::default()
+        });
+        assert_eq!(partial.role, "assistant");
+        assert_eq!(partial.text, "Loading report");
+    }
+
+    #[test]
+    fn protocol_internal_messages_do_not_create_visible_rows_or_merge_across_them() {
+        let internal = normalize_protocol_message(Message {
+            role: "user".into(),
+            text: "<recommended_plugins>internal</recommended_plugins>".into(),
+            ..Default::default()
+        });
+        assert_eq!(internal.role, "internal");
+        let work = Message {
+            role: "activity".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            conversation_parts(&[&work, &internal, &work]),
+            vec![ConversationPart::Work(0..1), ConversationPart::Work(2..3)]
+        );
+        assert!(
+            protocol_envelope(
+                "<!DOCTYPE example [<!ENTITY x SYSTEM 'file:///secret'>]><example>&x;</example>"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn async_questions_are_cards_and_acknowledgement_is_not_an_answer() {
         let fixture = Fixture::new();
         let rows = vec![
@@ -2415,6 +4045,7 @@ mod tests {
             chat.key(),
             ChatOptions {
                 fork_source: None,
+                quick_chat: true,
                 title: Some("Renamed".into()),
                 archived: Some(true),
                 pinned: true,
@@ -2427,6 +4058,7 @@ mod tests {
         library.save(&path).expect("save");
         let mut library = Library::read(&path).expect("reload");
         assert_eq!(library.title(&chat), "Renamed");
+        assert!(library.chats[&chat.key()].quick_chat);
         assert_eq!(library.chats[&chat.key()].model.as_deref(), Some("model-a"));
         assert_eq!(library.chats[&chat.key()].effort.as_deref(), Some("high"));
         assert!(library.archived(&chat) && library.pinned(&chat) && library.deleted(&chat));
@@ -2692,6 +4324,29 @@ mod tests {
         assert!(chats.iter().all(|chat| library.contains(&project, chat)));
     }
     #[test]
+    fn codex_final_answer_clears_activity_and_transcript_without_completion_event() {
+        let fixture = Fixture::new();
+        let path = fixture.write("final.jsonl", &[
+            json!({"type":"session_meta","payload":{"id":"s","cwd":"C:/test"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}}),
+        ]);
+        let chat = metadata(path, Provider::Codex, false, &HashMap::new()).expect("chat");
+        assert!(!chat_activity(&chat, None).unwrap().running);
+        assert!(!transcript(&chat, 100).unwrap().running);
+        assert_eq!(
+            codex_turn_running(
+                &json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary"}})
+            ),
+            None
+        );
+        assert_eq!(
+            codex_turn_running(&json!({"type":"event_msg","payload":{"type":"task_started"}})),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn activity_changes_from_running_to_reply_and_read_status_persists() {
         let fixture = Fixture::new();
         let path = fixture.write("session.jsonl", &[
@@ -2736,9 +4391,12 @@ mod tests {
     fn completion_notification_ignores_history_repeats_and_aborted_turns() {
         let running = ChatActivity {
             modified: SystemTime::now(),
+            last_user_message_at: None,
             running: true,
             reply: Some("old".into()),
             pending_questions: HashSet::new(),
+            subtasks: ClaudeSubtasks::default(),
+            turn_running: true,
         };
         let done = ChatActivity {
             running: false,
@@ -2800,7 +4458,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_tool_images_are_visible_outside_activity_and_companion_notes_are_hidden() {
+    fn claude_tool_images_are_grouped_with_activity_and_companion_notes_are_hidden() {
         let fixture = Fixture::new();
         let path = fixture.write("images.jsonl", &[
             json!({"type":"assistant","uuid":"call","message":{"role":"assistant","content":[{"type":"tool_use","id":"read","name":"Read","input":{}}]}}),
@@ -2813,7 +4471,11 @@ mod tests {
         assert!(transcript.messages[0].tool_finished);
         assert!(transcript.messages[0].attachments.is_empty());
         assert!(!transcript.messages[0].text.contains("aGVsbG8="));
-        assert_eq!(transcript.messages[1].role, "assistant");
+        assert_eq!(transcript.messages[1].role, "tool_image");
+        assert_eq!(
+            conversation_parts(&transcript.messages.iter().collect::<Vec<_>>()),
+            vec![ConversationPart::Work(0..2)]
+        );
         assert_eq!(
             transcript.messages[1].attachments,
             ["data:image/jpeg;base64,aGVsbG8="]
@@ -2984,6 +4646,7 @@ mod tests {
                 },
             ],
             selected_group: 1,
+            layout: None,
             vertical: true,
             zoomed: Some(0),
             sidebar_width: Some(350.),

@@ -753,12 +753,12 @@ pub struct GitPanelSettingsContent {
 
     /// Whether to show file icons in the git panel.
     ///
-    /// Default: false
+    /// Default: true
     pub file_icons: Option<bool>,
 
     /// What to show for directories in the git panel.
     ///
-    /// Default: icon
+    /// Default: both
     pub folder_indicator: Option<FolderIndicator>,
 
     /// How and when the scrollbar should be displayed.
@@ -789,7 +789,7 @@ pub struct GitPanelSettingsContent {
 
     /// Whether to show entries with tree or flat view in the panel
     ///
-    /// Default: false
+    /// Default: true
     pub tree_view: Option<bool>,
 
     /// Whether to show the addition/deletion change count next to each file in the Git panel.

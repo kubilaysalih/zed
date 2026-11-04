@@ -218,6 +218,8 @@ impl InlineAssistant {
             return;
         };
 
+        let local_editor = crate::local_editor_agent::enabled(cx)
+            && matches!(&inline_assist_target, InlineAssistTarget::Editor(_));
         let configuration_error = |cx| {
             let model_registry = LanguageModelRegistry::read_global(cx);
             model_registry.configuration_error(model_registry.inline_assistant_model(), cx)
@@ -260,7 +262,9 @@ impl InlineAssistant {
                 }
             };
 
-        if let Some(error) = configuration_error(cx) {
+        if local_editor {
+            handle_assist(window, cx);
+        } else if let Some(error) = configuration_error(cx) {
             if let ConfigurationError::ProviderNotAuthenticated(provider) = error {
                 cx.spawn(async move |_, cx| {
                     cx.update(|cx| provider.authenticate(cx)).await?;
@@ -1243,6 +1247,26 @@ impl InlineAssistant {
         self.prompt_history.push_back(user_prompt.clone());
         if self.prompt_history.len() > PROMPT_HISTORY_MAX_LEN {
             self.prompt_history.pop_front();
+        }
+
+        if crate::local_editor_agent::enabled(cx) {
+            if user_prompt.trim().is_empty()
+                || matches!(assist.codegen.read(cx).status(cx), CodegenStatus::Pending)
+            {
+                return;
+            }
+            let context = load_context(&mention_set, cx);
+            let target_chat = mention_set.read(cx).local_chat_target.clone();
+            let workspace = assist.workspace.clone();
+            if let Some(decorations) = &assist.decorations {
+                decorations.prompt_editor.update(cx, |editor, cx| {
+                    editor.begin_local_turn(user_prompt.clone(), window, cx)
+                });
+            }
+            assist.codegen.update(cx, |codegen, cx| {
+                codegen.start_local(user_prompt, target_chat, context, workspace, window, cx);
+            });
+            return;
         }
 
         let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() else {

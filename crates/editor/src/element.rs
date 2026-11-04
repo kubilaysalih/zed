@@ -2084,8 +2084,13 @@ impl EditorElement {
         }
 
         let icon_size = ui::IconSize::XSmall;
+        let mut slot_columns = 4;
         let mut button = self.editor.update(cx, |editor, cx| {
-            if !editor.has_available_code_actions_for_selection() {
+            if editor.has_available_code_actions_for_selection() && editor.inline_ai_available(cx) {
+                slot_columns = 7;
+            }
+            if !editor.has_available_code_actions_for_selection() && !editor.inline_ai_available(cx)
+            {
                 return None;
             }
             let active = editor
@@ -2108,7 +2113,8 @@ impl EditorElement {
         })?;
 
         let buffer_point = display_point.to_point(&snapshot.display_snapshot);
-        let new_display_row = snapshot.display_row_for_inline_code_action(buffer_point)?;
+        let new_display_row =
+            snapshot.display_row_for_inline_actions(buffer_point, slot_columns)?;
 
         let start_y = content_origin.y
             + (((new_display_row.as_f64() - scroll_position.y) as f32) * line_height)

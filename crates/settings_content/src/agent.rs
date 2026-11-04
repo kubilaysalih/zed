@@ -295,6 +295,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub inline_assistant_use_streaming_tools: Option<bool>,
+
+    /// Use local Codex/Claude chats for editor selections and inline ask/edit.
+    /// Disabled uses Zed's configured agent and inline model.
+    pub use_local_chats_for_editor: Option<bool>,
     /// Model to use for generating git commit messages. Defaults to default_model when not specified.
     pub commit_message_model: Option<LanguageModelSelection>,
     /// Whether to include project rules files (AGENTS.md, CLAUDE.md, .rules, etc.)

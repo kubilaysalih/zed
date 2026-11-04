@@ -40,6 +40,7 @@ pub struct QuickActionBar {
     active_item: Option<Box<dyn ItemHandle>>,
     buffer_search_bar: Entity<BufferSearchBar>,
     show: bool,
+    expanded: bool,
     toggle_selections_handle: PopoverMenuHandle<ContextMenu>,
     toggle_settings_handle: PopoverMenuHandle<ContextMenu>,
     workspace: WeakEntity<Workspace>,
@@ -71,6 +72,7 @@ impl QuickActionBar {
             active_item: None,
             buffer_search_bar,
             show: true,
+            expanded: false,
             toggle_selections_handle: Default::default(),
             toggle_settings_handle: Default::default(),
             workspace: workspace.weak_handle(),
@@ -97,8 +99,24 @@ impl QuickActionBar {
         }
     }
 
+    pub fn has_collapsed_controls(&self) -> bool {
+        !self.show && self.active_editor().is_some()
+    }
+
+    pub fn controls_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    pub fn toggle_controls(&mut self, cx: &mut Context<Self>) {
+        self.expanded = !self.expanded;
+        cx.emit(ToolbarItemEvent::ChangeLocation(
+            self.get_toolbar_item_location(),
+        ));
+        cx.notify();
+    }
+
     fn get_toolbar_item_location(&self) -> ToolbarItemLocation {
-        if self.show && self.active_editor().is_some() {
+        if (self.show || self.expanded) && self.active_editor().is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
             ToolbarItemLocation::Hidden

@@ -339,10 +339,13 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let show_tooltip = !self.context_menu_visible();
-        IconButton::new("inline_code_actions", ui::IconName::BoltFilled)
+        let show_ai = self.inline_ai_available(cx);
+        let code_actions = IconButton::new("inline_code_actions", ui::IconName::BoltFilled)
             .icon_size(icon_size)
             .shape(ui::IconButtonShape::Square)
-            .icon_color(ui::Color::Hidden)
+            .icon_color(ui::Color::Default)
+            .hover_color(ui::Color::Default)
+            .selected_icon_color(ui::Color::Default)
             .toggle_state(is_active)
             .when(show_tooltip, |this| {
                 this.tooltip({
@@ -373,7 +376,41 @@ impl Editor {
                     cx,
                 );
             }))
+            .into_any_element();
+        h_flex()
+            .when(self.has_available_code_actions_for_selection(), |this| {
+                this.child(code_actions)
+            })
+            .when(show_ai, |this| {
+                this.child(
+                    IconButton::new("inline_ai_selection", ui::IconName::Sparkle)
+                        .icon_size(icon_size)
+                        .shape(ui::IconButtonShape::Square)
+                        .icon_color(ui::Color::Default)
+                        .hover_color(ui::Color::Default)
+                        .tooltip(Tooltip::for_action_title(
+                            "Ask AI Inline",
+                            &zed_actions::assistant::InlineAssist::default(),
+                        ))
+                        .on_click(cx.listener(|editor, _, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&editor.focus_handle(cx), cx);
+                            window.dispatch_action(
+                                Box::new(zed_actions::assistant::InlineAssist::default()),
+                                cx,
+                            );
+                        })),
+                )
+            })
             .into_any_element()
+    }
+
+    pub(super) fn inline_ai_available(&self, cx: &App) -> bool {
+        matches!(self.mode, EditorMode::Full { .. })
+            && !DisableAiSettings::is_ai_disabled_for_buffer(
+                self.buffer.read(cx).as_singleton().as_ref(),
+                cx,
+            )
     }
 
     pub(super) fn refresh_code_actions_for_selection(

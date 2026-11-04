@@ -59,6 +59,7 @@ pub struct MentionImage {
 }
 
 pub struct MentionSet {
+    pub(crate) local_chat_target: Option<crate::local_editor_agent::LocalChatTarget>,
     project: WeakEntity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
     mentions: HashMap<CreaseId, (MentionUri, MentionTask)>,
@@ -68,6 +69,7 @@ pub struct MentionSet {
 impl MentionSet {
     pub fn new(project: WeakEntity<Project>, thread_store: Option<Entity<ThreadStore>>) -> Self {
         Self {
+            local_chat_target: None,
             project,
             thread_store,
             mentions: HashMap::default(),

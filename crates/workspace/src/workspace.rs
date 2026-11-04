@@ -4886,7 +4886,7 @@ impl Workspace {
     ) -> Option<Arc<dyn PanelHandle>> {
         let mut result_panel = None;
         let mut serialize = false;
-        for dock in self.all_docks() {
+        for dock in self.all_docks().map(Clone::clone) {
             if let Some(panel_index) = dock.read(cx).panel_index_for_type::<T>() {
                 let mut focus_center = false;
                 let panel = dock.update(cx, |dock, cx| {
@@ -4909,6 +4909,14 @@ impl Workspace {
                         .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx))
                 }
 
+                if !focus_center {
+                    let position = dock.read(cx).position();
+                    cx.defer_in(window, move |workspace, window, cx| {
+                        workspace.reveal_collapsed_dock(position, window, cx);
+                        workspace.serialize_workspace(window, cx);
+                        cx.notify();
+                    });
+                }
                 result_panel = panel;
                 serialize = true;
                 break;
@@ -5225,6 +5233,13 @@ impl Workspace {
                 requested_pane
             };
 
+            if activate {
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.reveal_center_after_activation(window, cx);
+                    workspace.serialize_workspace(window, cx);
+                    cx.notify();
+                })?;
+            }
             pane.update_in(cx, |pane, window, cx| {
                 pane.open_item(
                     project_entry_id,
@@ -6208,6 +6223,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.flush_deferred_saves(window, cx);
+        if self.center.panes().contains(&&pane) {
+            self.reveal_center_after_activation(window, cx);
+        }
 
         // This is explicitly hoisted out of the following check for pane identity as
         // terminal panel panes are not registered as a center panes.
@@ -6340,6 +6358,9 @@ impl Workspace {
                 pane.update(cx, |pane, _| {
                     pane.track_alternate_file_items();
                 });
+                if *local || *focus_changed {
+                    self.reveal_center_after_activation(window, cx);
+                }
                 if *local {
                     self.unfollow_in_pane(pane, window, cx);
                 }
@@ -8983,6 +9004,15 @@ impl Workspace {
         };
         let dock_is_open = dock.read(cx).is_open();
         let a11y_active = window.is_a11y_active();
+        let frame_resize_handle = if dock_is_open
+            && WorkspaceSettings::get_global(cx).pane_layout != settings::PaneLayout::Flat
+        {
+            dock.update(cx, |dock, cx| {
+                dock.resizable(cx).then(|| dock.resize_handle(true, cx))
+            })
+        } else {
+            None
+        };
 
         let mut container = div()
             .id(dock_element_id)
@@ -8995,14 +9025,15 @@ impl Workspace {
                     })
             })
             .flex()
-            .overflow_hidden()
+            .relative()
             .flex_none()
             .child(if dock_is_open {
                 self.frame_pane(dock.clone(), cx)
             } else {
                 dock.clone().into_any_element()
             })
-            .children(leader_border);
+            .children(leader_border)
+            .children(frame_resize_handle);
 
         // Apply sizing only when the dock is open. When closed the dock is still
         // included in the element tree so its focus handle remains mounted — without
@@ -9291,6 +9322,85 @@ impl Workspace {
             dismiss_app_notification(&notification_id, cx);
         } else {
             cx.propagate();
+        }
+    }
+
+    fn reveal_collapsed_dock(
+        &mut self,
+        position: DockPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dock = self.dock_at_position(position);
+        let Some(panel) = dock.read(cx).visible_panel().cloned() else {
+            return;
+        };
+        let size = self
+            .dock_size(dock.read(cx), window, cx)
+            .unwrap_or_default();
+        if size < px(120.) {
+            let extent = if position == DockPosition::Bottom {
+                self.bounds.size.height
+            } else {
+                self.bounds.size.width
+            };
+            self.resize_dock(
+                position,
+                panel.default_size(window, cx).min(extent * 0.5),
+                window,
+                cx,
+            );
+        }
+    }
+
+    fn reveal_center_after_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A sidebar may activate an editor while its own entity is still borrowed.
+        cx.defer_in(window, |workspace, window, cx| {
+            workspace.reveal_collapsed_center(window, cx);
+            workspace.serialize_workspace(window, cx);
+            cx.notify();
+        });
+    }
+
+    fn reveal_collapsed_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side_size = |dock: &Entity<Dock>| {
+            if dock.read(cx).is_open() {
+                self.dock_size(dock.read(cx), window, cx)
+                    .unwrap_or_default()
+            } else {
+                Pixels::ZERO
+            }
+        };
+        let remaining =
+            self.bounds.size.width - side_size(&self.left_dock) - side_size(&self.right_dock);
+        for position in [
+            DockPosition::Right,
+            DockPosition::Left,
+            DockPosition::Bottom,
+        ] {
+            let dock = self.dock_at_position(position);
+            let Some(panel) = dock.read(cx).visible_panel().cloned() else {
+                continue;
+            };
+            if !panel.fills_empty_workspace(cx) {
+                continue;
+            }
+            let size = self
+                .dock_size(dock.read(cx), window, cx)
+                .unwrap_or_default();
+            let (remaining, available) = if position == DockPosition::Bottom {
+                (self.bounds.size.height - size, self.bounds.size.height)
+            } else {
+                (remaining, remaining + size)
+            };
+            if remaining < px(120.) && available > px(120.) {
+                self.resize_dock(
+                    position,
+                    panel.default_size(window, cx).min(available * 0.5),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 
@@ -10108,7 +10218,35 @@ impl Render for Workspace {
                                                     workspace.previous_dock_drag_coordinates =
                                                         Some(e.event.position);
 
-                                                    match e.drag(cx).0 {
+                                                    // The filling dock has no stored width in this layout.
+                                                    // Both overlapping handles must resize its neighbour.
+                                                    let position = match (
+                                                        e.drag(cx).0,
+                                                        workspace.filling_dock(cx),
+                                                    ) {
+                                                        (
+                                                            DockPosition::Right,
+                                                            Some(DockPosition::Right),
+                                                        ) if workspace
+                                                            .left_dock
+                                                            .read(cx)
+                                                            .is_open() =>
+                                                        {
+                                                            DockPosition::Left
+                                                        }
+                                                        (
+                                                            DockPosition::Left,
+                                                            Some(DockPosition::Left),
+                                                        ) if workspace
+                                                            .right_dock
+                                                            .read(cx)
+                                                            .is_open() =>
+                                                        {
+                                                            DockPosition::Right
+                                                        }
+                                                        (position, _) => position,
+                                                    };
+                                                    match position {
                                                         DockPosition::Left => {
                                                             workspace.resize_left_dock(
                                                                 e.event.position.x
@@ -16485,6 +16623,114 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_selecting_content_reopens_collapsed_region(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let right = cx.new(|cx| {
+                let mut panel = TestPanel::new_flexible(DockPosition::Right, 100, cx);
+                panel.fills_empty_workspace = true;
+                panel
+            });
+            workspace.add_panel(right, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.resize_right_dock(workspace.bounds.size.width - px(8.), window, cx);
+        });
+        cx.run_until_parked();
+        let collapsed = cx.debug_bounds("right-dock").unwrap().size.width;
+        assert!(collapsed > px(850.));
+        // Background item updates must not undo a deliberate resize.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, false, false, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("right-dock").unwrap().size.width, collapsed);
+        // Selecting even the already-active file must reveal the editor.
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        let restored = cx.debug_bounds("right-dock").unwrap().size.width;
+        assert!(restored < px(650.));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("right-dock").unwrap().size.width, restored);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.resize_right_dock(px(6.), window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("right-dock").unwrap().size.width <= px(10.));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<TestPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("right-dock").unwrap().size.width > px(250.));
+    }
+
+    #[gpui::test]
+    async fn test_framed_right_dock_drag_spans_gap_and_reopens_from_edge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.pane_layout = Some(settings::PaneLayout::Separated);
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new_flexible(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let before = cx.debug_bounds("right-dock").expect("right dock");
+        // Start in the editor-side half of the frame, outside the dock contents.
+        let start = gpui::point(before.left() - px(2.), before.top() + px(100.));
+        let end = gpui::point(before.right() - px(1.), start.y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(10.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let collapsed = cx.debug_bounds("right-dock").expect("collapsed dock");
+        assert!(
+            collapsed.size.width <= px(10.),
+            "dock did not collapse: {collapsed:?}"
+        );
+        let start = gpui::point(collapsed.left() + px(1.), collapsed.top() + px(100.));
+        let end = start - gpui::point(px(300.), px(0.));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            start - gpui::point(px(10.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("right-dock").unwrap().size.width > px(250.));
+    }
+
+    #[gpui::test]
     async fn test_chat_sidebar_resizes_with_framed_filling_dock(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         cx.update_global(|store: &mut SettingsStore, cx| {
@@ -16510,23 +16756,27 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(1000.), px(700.)));
         cx.run_until_parked();
-        let before = cx.debug_bounds("left-dock").expect("left dock");
-        let start = gpui::point(before.right() - px(5.), before.top() + px(100.));
-        let end = start + gpui::point(px(140.), px(0.));
-        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_move(
-            start + gpui::point(px(10.), px(0.)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
-        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let after = cx.debug_bounds("left-dock").expect("resized left dock");
-        assert!(
-            after.size.width > before.size.width + px(100.),
-            "resize handle or stale chat width blocked dragging: {before:?} -> {after:?}"
-        );
+        let mut final_width = Pixels::ZERO;
+        for offset in [-5., 1., 7.] {
+            let before = cx.debug_bounds("left-dock").expect("left dock");
+            let start = gpui::point(before.right() + px(offset), before.top() + px(100.));
+            let end = start + gpui::point(px(140.), px(0.));
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_move(
+                start + gpui::point(px(10.), px(0.)),
+                MouseButton::Left,
+                Modifiers::default(),
+            );
+            cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+            cx.run_until_parked();
+            let after = cx.debug_bounds("left-dock").expect("resized left dock");
+            assert!(
+                after.size.width > before.size.width + px(100.),
+                "resize handle or stale chat width blocked dragging: {before:?} -> {after:?}"
+            );
+            final_width = after.size.width;
+        }
         cx.simulate_resize(gpui::size(px(1400.), px(800.)));
         cx.run_until_parked();
         assert!(
@@ -16534,7 +16784,7 @@ mod tests {
                 .expect("restored width")
                 .size
                 .width
-                - after.size.width)
+                - final_width)
                 .abs()
                 < px(2.)
         );

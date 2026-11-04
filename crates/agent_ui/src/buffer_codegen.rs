@@ -42,6 +42,7 @@ use std::{
     time::Instant,
 };
 use streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff};
+use util::ResultExt;
 use uuid::Uuid;
 
 /// Use this tool when you cannot or should not make a rewrite. This includes:
@@ -74,6 +75,8 @@ pub struct BufferCodegen {
     initial_transaction_id: Option<TransactionId>,
     builder: Arc<PromptBuilder>,
     pub is_insertion: bool,
+    pub local_provider: crate::local_editor_agent::LocalEditorProvider,
+    pub local_ask: bool,
     session_id: Uuid,
 }
 
@@ -101,6 +104,12 @@ impl BufferCodegen {
         });
         let mut this = Self {
             is_insertion: range.to_offset(&buffer.read(cx).snapshot(cx)).is_empty(),
+            local_provider: if crate::local_editor_agent::enabled(cx) {
+                crate::local_editor_agent::preferred_provider(cx)
+            } else {
+                Default::default()
+            },
+            local_ask: false,
             alternatives: vec![codegen],
             active_alternative: 0,
             seen_alternatives: HashSet::default(),
@@ -141,6 +150,9 @@ impl BufferCodegen {
     }
 
     pub fn alternative_count(&self, cx: &App) -> usize {
+        if crate::local_editor_agent::enabled(cx) {
+            return 1;
+        }
         LanguageModelRegistry::read_global(cx)
             .inline_alternative_models()
             .len()
@@ -211,6 +223,92 @@ impl BufferCodegen {
         }
 
         Ok(())
+    }
+
+    pub fn start_local(
+        &mut self,
+        prompt: String,
+        target_chat: Option<crate::local_editor_agent::LocalChatTarget>,
+        context: Task<Option<LoadedContext>>,
+        workspace: gpui::WeakEntity<workspace::Workspace>,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::local_editor_agent::{InlineRequest, LocalEditorAgent};
+        let provider = self.local_provider;
+        let edit = !self.local_ask && target_chat.is_none();
+        let session_id = self.session_id;
+        // Reactivating the same alternative undoes its merged transaction; a
+        // follow-up must keep all previous preview edits, including Ask turns.
+        if self.active_alternative != 0 {
+            self.activate(0, cx);
+        }
+        self.alternatives.truncate(1);
+        self.active_alternative().update(cx, |alternative, cx| {
+            alternative.edits.clear();
+            alternative.edit_position = None;
+            alternative.completion = None;
+            alternative.line_operations.clear();
+            alternative.last_equal_ranges.clear();
+            // Follow-ups use the current preview, but retain the original snapshot and
+            // transaction so rejecting the assist still rolls back the entire edit.
+            let request_snapshot = alternative.buffer.read(cx).snapshot(cx);
+            let offsets = alternative.range.to_offset(&request_snapshot);
+            let selected_text = request_snapshot.text_for_range(offsets.clone()).collect::<String>();
+            let document = request_snapshot.text();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let bridge = cx.global::<LocalEditorAgent>().clone();
+            let request = InlineRequest {
+                target_chat,
+                document_path: request_snapshot.point_to_buffer_offset(alternative.range.start)
+                    .and_then(|(buffer, _)| buffer.file().and_then(|file| file.as_local().map(|file| file.abs_path(cx)))),
+                session_id, provider, prompt, document: document.clone(), selected_text,
+                selection_start: offsets.start.0, selection_end: offsets.end.0,
+                edit, context, cancelled: cancelled.clone(),
+            };
+            let response = (bridge.run)(request, workspace, window, cx);
+            alternative.status = CodegenStatus::Pending;
+            alternative.description = None;
+            alternative.failure = None;
+            struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for CancelOnDrop {
+                    fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+                }
+            let cancellation = CancelOnDrop(cancelled);
+            alternative.generation = cx.spawn(async move |this, cx| {
+                let _cancellation = cancellation;
+                let response = response.await;
+                let diff = this.update(cx, |this, cx| {
+                    let result = response.and_then(|response| {
+                        if edit {
+                            // Anchors survive edits; the model's assumptions may not. Never
+                            // apply an answer generated from an out-of-date document.
+                            anyhow::ensure!(this.buffer.read(cx).snapshot(cx).text() == document,
+                                "The document changed while the agent was working. Retry with the current selection.");
+                            if let Some(replacement) = response.replacement_text {
+                                this.completion = Some(replacement.clone());
+                                this.edits = vec![(this.range.clone(), replacement)];
+                                this.apply_edits(this.edits.clone(), cx);
+                            }
+                        }
+                        this.description = Some(response.explanation);
+                        Ok(())
+                    });
+                    this.status = match result {
+                        Ok(()) => CodegenStatus::Done,
+                        Err(error) => CodegenStatus::Error(error),
+                    };
+                    this.edit_position = None;
+                    cx.notify();
+                    this.reapply_batch_diff(cx)
+                });
+                if let Ok(diff) = diff {
+                    diff.await;
+                    this.update(cx, |_, cx| { cx.emit(CodegenEvent::Finished); cx.notify(); }).log_err();
+                }
+            });
+            cx.notify();
+        });
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {

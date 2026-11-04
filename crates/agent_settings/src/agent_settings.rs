@@ -222,6 +222,7 @@ pub struct AgentSettings {
     pub subagent_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
+    pub use_local_chats_for_editor: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
     pub commit_message_include_project_rules: bool,
     pub commit_message_instructions: Option<String>,
@@ -797,6 +798,7 @@ impl Settings for AgentSettings {
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
             inline_assistant_model: agent.inline_assistant_model,
+            use_local_chats_for_editor: agent.use_local_chats_for_editor.unwrap_or(false),
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
                 .unwrap_or(true),

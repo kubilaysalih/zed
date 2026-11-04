@@ -12357,6 +12357,14 @@ impl EditorSnapshot {
     }
 
     pub fn display_row_for_inline_code_action(&self, buffer_point: Point) -> Option<DisplayRow> {
+        self.display_row_for_inline_actions(buffer_point, 4)
+    }
+
+    pub(crate) fn display_row_for_inline_actions(
+        &self,
+        buffer_point: Point,
+        slot_columns: u32,
+    ) -> Option<DisplayRow> {
         if self.is_line_folded(MultiBufferRow(buffer_point.row)) {
             return None;
         }
@@ -12369,7 +12377,6 @@ impl EditorSnapshot {
             return None;
         }
 
-        const INLINE_SLOT_CHAR_LIMIT: u32 = 4;
         const MAX_ALTERNATE_DISTANCE: u32 = 8;
 
         let is_valid_row = |row_candidate: u32| -> bool {
@@ -12377,7 +12384,7 @@ impl EditorSnapshot {
                 return false;
             }
             if buffer_point.row == row_candidate {
-                if buffer_point.column < INLINE_SLOT_CHAR_LIMIT {
+                if buffer_point.column < slot_columns {
                     return false;
                 }
             } else {
@@ -12410,7 +12417,7 @@ impl EditorSnapshot {
                     .display_snapshot
                     .buffer_snapshot()
                     .indent_size_for_line(MultiBufferRow(row_candidate));
-                if indent_size.len >= INLINE_SLOT_CHAR_LIMIT {
+                if indent_size.len >= slot_columns {
                     true
                 } else if row_candidate == buffer_point.row {
                     let display_row = self
@@ -12424,7 +12431,7 @@ impl EditorSnapshot {
                     if display_row > line_start_display_row {
                         self.display_snapshot
                             .soft_wrap_indent(DisplayRow(display_row.0 - 1))
-                            .is_some_and(|indent| indent >= INLINE_SLOT_CHAR_LIMIT)
+                            .is_some_and(|indent| indent >= slot_columns)
                     } else {
                         false
                     }
@@ -12477,7 +12484,7 @@ impl EditorSnapshot {
             && self
                 .display_snapshot
                 .soft_wrap_indent(DisplayRow(new_display_row.0 - 1))
-                .is_some_and(|indent| indent < INLINE_SLOT_CHAR_LIMIT)
+                .is_some_and(|indent| indent < slot_columns)
         {
             new_display_row = line_start_display_row;
         }

@@ -962,7 +962,7 @@ impl TerminalPanel {
         execute: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<Result<WeakEntity<Terminal>>> {
         let task = self.add_terminal_shell(false, cwd, RevealStrategy::Always, window, cx);
         cx.spawn(async move |_, cx| {
             let terminal = task.await?;
@@ -981,7 +981,8 @@ impl TerminalPanel {
                     anyhow::bail!("Terminal input changed before the code could be sent. No code was sent.");
                 }
                 anyhow::Ok(())
-            })?
+            })??;
+            Ok(terminal)
         })
     }
 

@@ -4342,7 +4342,7 @@ impl Pane {
     }
 }
 
-fn default_render_tab_bar_buttons(
+pub fn default_render_tab_bar_buttons(
     pane: &mut Pane,
     window: &mut Window,
     cx: &mut Context<Pane>,
