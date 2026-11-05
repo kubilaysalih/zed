@@ -7,13 +7,14 @@ This fork extends Zed with a shared home for local **Codex and Claude Code conve
 
 The features below describe changes in this fork. The original Zed README follows afterward.
 
-## Latest updates
+## Latest updates — custom Windows build 1.28.0.33
 
-- Inline Ask/Edit with local Codex or Claude, saved Quick chats, and searchable `@` mentions for sending code references to an existing conversation.
-- Nested chat-pane splits, editor-style tab controls, and collapsible panels that reopen when their content is selected.
-- A denser Git tree with file-type icons and sticky ancestor folders. History is now a small toolbar button beside the view options and staging controls.
-- Built-in **Neutral Dark**, improved chat code contrast, selectable user messages, and cleaner Claude image and agent-message rendering.
-- Automatic local chat discovery, copyable chat references, terminal-output reading, schedule indicators, and conversation ordering based on your latest message.
+- **Agent Mode** in the current workspace, preserving the open folders and showing their names and paths. Switch back through the command palette without going through General.
+- A shared compact sidebar in normal and Agent modes, with smaller date headings and separators. Project, agent, status, and grouping controls live in the top-right settings menu; filters use aligned native submenus.
+- Drag chat tabs between separate chat panes and the editor's tab bar while retaining the open conversation and its running/unread indicators.
+- Compact editor gutters with separate fold and AI hit areas, AI actions for hovered lines, and restored selection actions. Breakpoint indicators share the line-number area.
+- Correct workspace colors on initial opening and mode changes, readable **Sign In** text, and consistent outer spacing in separated pane layouts.
+- Improved background-task activity indicators, compact Claude continuation summaries, and local Markdown-link opening. Project Search results now include file icons, match highlights, counts, and a viewport scrollbar.
 
 ## Local Codex and Claude chats
 
@@ -23,17 +24,19 @@ The features below describe changes in this fork. The original Zed README follow
 - Use **`/goal <objective>`** in Codex chats to start a goal, optionally with **`/goal --budget <tokens> <objective>`**. Status, pause, resume, and clear commands are supported; the goal indicator appears only when a goal exists.
 - Rename, pin, archive, restore, and move chats to manually created projects. Trash is reversible. These organization changes are stored locally in this fork; they do not rename, archive, or delete chats in the original applications.
 - Group chats by date, by your own projects, or **By status**: Pinned, In progress, Input required, Unread, and Ready. Each project supports **Newest first** or **Custom · drag to reorder** sorting. Project-grouped rows omit the redundant project subtitle.
+- Open the filter/settings button at the top right of **Chats** or **Agent Mode** to choose **Project**, **Agent**, and **Status**. Each opens a native submenu; the current selection appears in its label. Under **View**, **Chats** groups by date, **Projects** groups by project, and **By status** groups by activity. Date headings use smaller muted text, shortened dates, and separators.
 - Time-based ordering follows the latest human message, so streaming replies and background activity do not continually rearrange the sidebar.
 - Existing conversations keep their provider fixed. Model and effort can be selected for the next turn using the options reported by the installed provider.
 - Attach images and local files using the attachment button, drag and drop, or clipboard paste. Images use provider image inputs; other files are referenced by their local paths and remain subject to the agent's normal permissions.
 - View Markdown, tables, and supported local or embedded images, including images in Claude tool results. Click an image to open the preview, zoom with the wheel or buttons, drag to pan, and use **Fit** to reset. Zoom has no fixed UI maximum.
 - Local file attachments and Codex file citations appear as file cards. Citations stay in their original position alongside the message text. Click to open with the system's default application, or right-click to open in Zed, reveal in File Explorer, or copy the path or filename.
+- Local file links in Markdown messages resolve relative to the conversation's working directory and open in the editor, including generated `.md` files.
 - Public progress updates and tool results appear in compact expandable activity groups. Background task notifications are rendered as activity rather than raw XML. Context compaction has its own aligned progress/completion row.
 - Plans appear as selectable-text checklists with pending, running, and completed steps. Claude subtasks can open their linked saved history separately. Automatic goal check-ins and internal continuation messages appear as activity; pasted-content wrappers are removed while preserving their contents.
 - Fenced code blocks have syntax highlighting and a separate toolbar for copying, **Run in Terminal**, and transferring code to the terminal without submitting it. Terminal startup preserves the shell prompt position; multiline transfer requires bracketed-paste support. Temporary file-opening errors can be dismissed.
 - Conversations open at the latest messages; scrolling upward loads older history automatically while preserving the reading position. Image thumbnails, centered loading states, message-hover copy controls, and a growing composer keep the conversation readable.
 - Sent messages appear immediately. Failed sends retain their bubble with retry controls; writer conflicts also offer sending in a new copy. Streaming updates preserve Markdown views, and the activity indicator has reserved space above the composer to avoid shifting the conversation.
-- Running chats show spinners in the sidebar and chat tabs. Completed, unread replies show persistent dots. The latest public activity is shown above the composer.
+- Running chats show spinners in the sidebar and chat tabs, including tracked background Bash tasks and monitors. Completed, unread replies show persistent dots. The latest public activity is shown above the composer; internal Claude continuation summaries stay out of normal message bubbles.
 - Context and account-quota details, refresh actions, and conversation options are available in the composer's **…** menu. Claude usage reports and rate-limit events are supported when exposed by the installed client. Missing limits remain unknown rather than being guessed.
 - Chat text uses the existing **Agent Panel Font** settings: **UI Font Size** for agent replies and **Buffer Font Size** for user messages.
 - Codex chats with saved schedules show a clock icon with cadence and status details and a shortcut to the schedule configuration. Execution remains the responsibility of the provider's scheduler.
@@ -46,7 +49,7 @@ The features below describe changes in this fork. The original Zed README follow
 - Enable **Agent → Use Local Chats for Editor** in Settings (`agent.use_local_chats_for_editor`) to use local Codex or Claude sessions for inline requests and **Add to Agent Thread**. Turn it off to use Zed's built-in agent integration.
 - In the inline prompt, choose **Codex** or **Claude**, then **Ask** for an explanation or **Edit** for a selection replacement. Edits use the editor's existing diff, accept, reject, and undo controls. An answer based on a document that changed while waiting is rejected instead of overwriting newer edits.
 - The last selected inline provider is remembered across workspaces and restarts. New inline prompts open with it already selected; sending does not require choosing a provider again.
-- Open an inline request from the AI button beside code actions or **Ask AI Inline** in the editor context menu. It works with selected code or the current line when nothing is selected. Follow-up messages keep earlier questions and answers visible, with a spinner while waiting.
+- Hover a code line's gutter to reveal its AI action, or use **Ask AI Inline** in the editor context menu. With code selected, AI and available code-action controls appear near the selection. Hovering does not move the cursor or change the selection; clicking opens the inline request. Follow-up messages keep earlier questions and answers visible, with a spinner while waiting.
 - Type **`@`** in an inline prompt to choose an existing chat. Results filter as you type by conversation title, project, and provider, including multiword searches. Sending includes the selected code and file/line reference in that chat; without a recipient, the inline request uses a Quick chat.
 - Composer suggestions can be accepted with **Tab** or the **Tab to accept** button. **Ratata mode** in the conversation menu automatically sends available suggestions until paused or interrupted by an error or approval. It is off by default, does not overwrite drafts, and does not automatically approve requests.
 - Inline requests are saved as **Quick chats**. Select **Quick chats** from the Chats status menu to browse them, see running work, or continue a conversation. Repeated requests in the same inline prompt retain the same provider session.
@@ -71,10 +74,19 @@ Collaboration is local to the running app. Pending deliveries are held in memory
 - Chat-to-project assignments and per-folder project selections are stored in the profile's shared `chat-library.json`. Opening a folder separately preserves those assignments, so projects do not need to be linked again.
 - Pending **Trust and Continue** prompts remain visible when General becomes active, including prompts from projects restored later. Trust or Restricted Mode still applies to the original project; switching views never grants trust automatically.
 
+## Agent Mode in the current workspace
+
+- Open **Ctrl+Shift+P → Toggle Agent Mode** to switch the current project into a chat-focused layout. The Files / Git / Search activity bar is hidden, chats occupy the left sidebar, and conversation panes remain on the right.
+- The sidebar displays the current folder names and paths. Entering Agent Mode starts with **Current folder** scope; the settings menu also offers all projects, workspace projects, individual chat projects, and agent working folders.
+- Normal mode and Agent Mode share the same compact chat rows, date formatting, search, filter submenus, and grouping controls. Existing chat projects and project assignments remain available in either mode.
+- Open generated Markdown and other files in editor panes while staying in Agent Mode. Multiple conversation tabs and independently split chat panes remain available.
+- Use the same command to return to normal mode. The previous editor layout, panel visibility, and chat scope are restored, and the workspace color applies in both modes.
+
 ## Chat tabs and panes
 
 - Choose **Editor tabs** or **Separate chat panel** in Chats settings. The separate panel can sit beside the code editor, with the file tree on the left and independent code-editor splits in the center.
 - Open multiple chats as distinct tabs with editor-style appearance. Drag tabs to reorder or move between chat panes, split right/down, resize dividers, and zoom a pane.
+- Drag a chat tab onto the editor's tab bar to place it alongside files, or drag it back into a chat pane. The same conversation view is moved, preserving its state; clicking it in the sidebar focuses its existing location.
 - Splits can be nested independently, including two chats above one wider chat. Tab context menus provide closing controls, and the saved layout retains the split tree.
 - Move the chat panel between supported dock positions. Chat-only layouts fill the available area when the window resizes, while the left sidebar remains accessible and resizable.
 - The duplicate conversation header is removed. The project-directory shortcut and conversation options are available in the composer.
@@ -99,6 +111,7 @@ Collaboration is local to the running app. Pending deliveries are held in memory
 - The existing Threads sidebar opens on demand instead of automatically: **Ctrl+Alt+J** or **Ctrl+Shift+P → Toggle Workspace Sidebar**. Its visibility is restored. Zed's existing Agent panel remains available through **View → Agent Panel**.
 - Open **Ctrl+Shift+P → Folder Color** for a visual picker with live preview, hue, presets, and HEX input. **Apply** saves, **Cancel** restores the previous color, and **Theme** resets to theme colors. The title, activity, and status bars use the selected color. Color changes work in Restricted Mode without granting trust.
 - Open **Ctrl+Shift+P → Pane Layout** and choose **Flat** or **Separated**. Separated adds rounded panel boundaries and folder-colored spacing around the file panel, editor, bottom terminal, and right panel. Flat remains the default.
+- Separated layouts use matching outer margins and pane separators in normal and Agent modes. Tab icons have additional leading space, and compact gutter controls keep their hover areas clear of line numbers and folding arrows.
 - Activity buttons have square corners and no gaps. Hover states, branch labels, diagnostic icons, and status-bar separators have been adjusted for colored bars. Resize handles remain usable with separated panes and chat-only layouts.
 
 ## Windows builds

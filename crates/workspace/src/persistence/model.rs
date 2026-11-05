@@ -234,6 +234,7 @@ impl Bind for DockData {
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum SerializedPaneGroup {
     Group {
+        is_group_separator: bool,
         axis: SerializedAxis,
         flexes: Option<Vec<f32>>,
         children: Vec<SerializedPaneGroup>,
@@ -270,6 +271,7 @@ impl SerializedPaneGroup {
                 axis,
                 children,
                 flexes,
+                is_group_separator,
             } => {
                 let mut current_active_pane = None;
                 let mut members = Vec::new();
@@ -293,11 +295,9 @@ impl SerializedPaneGroup {
                     return Some((members.remove(0), current_active_pane, items));
                 }
 
-                Some((
-                    Member::Axis(PaneAxis::load(axis.0, members, flexes)),
-                    current_active_pane,
-                    items,
-                ))
+                let mut axis = PaneAxis::load(axis.0, members, flexes);
+                axis.is_group_separator = is_group_separator;
+                Some((Member::Axis(axis), current_active_pane, items))
             }
             SerializedPaneGroup::Pane(serialized_pane) => {
                 let pane = workspace

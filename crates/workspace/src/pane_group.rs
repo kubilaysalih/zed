@@ -100,6 +100,17 @@ impl PaneGroup {
         }
     }
 
+    pub fn split_group(
+        &mut self,
+        old_pane: &Entity<Pane>,
+        new_pane: &Entity<Pane>,
+        direction: SplitDirection,
+        cx: &mut App,
+    ) {
+        self.root.split_group(old_pane, new_pane, direction);
+        self.mark_positions(cx);
+    }
+
     pub fn full_height_column_count(&self) -> usize {
         self.root.full_height_column_count()
     }
@@ -235,15 +246,48 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
-        self.root
+        let content = self
+            .root
             .render(0, zoomed, maximized, render_cx, window, cx)
-            .element
+            .element;
+        match render_cx
+            .frame_color()
+            .filter(|_| !self.root.is_group_separator())
+        {
+            Some(color) => crate::frame_pane_group(content, color),
+            None => content,
+        }
     }
 
     pub fn panes(&self) -> Vec<&Entity<Pane>> {
         let mut panes = Vec::new();
         self.root.collect_panes(&mut panes);
         panes
+    }
+
+    pub fn reveal_pane(&self, pane: &Entity<Pane>) {
+        fn reveal(member: &Member, pane: &Entity<Pane>) {
+            if let Member::Axis(axis) = member {
+                if let Some(index) = axis
+                    .members
+                    .iter()
+                    .position(|member| member.contains_pane(pane))
+                {
+                    let mut flexes = axis.flexes.lock();
+                    if flexes[index] <= f32::EPSILON {
+                        let count = flexes.len() as f32;
+                        let scale = (count - 1.) / count;
+                        for flex in flexes.iter_mut() {
+                            *flex *= scale;
+                        }
+                        flexes[index] = 1.;
+                    }
+                    drop(flexes);
+                    reveal(&axis.members[index], pane);
+                }
+            }
+        }
+        reveal(&self.root, pane);
     }
 
     pub fn first_pane(&self) -> Entity<Pane> {
@@ -299,6 +343,37 @@ pub enum Member {
 }
 
 impl Member {
+    fn is_group_separator(&self) -> bool {
+        matches!(self, Self::Axis(axis) if axis.is_group_separator)
+    }
+
+    fn split_group(
+        &mut self,
+        old_pane: &Entity<Pane>,
+        new_pane: &Entity<Pane>,
+        direction: SplitDirection,
+    ) {
+        if let Self::Axis(axis) = self {
+            if axis.is_group_separator {
+                if let Some(member) = axis
+                    .members
+                    .iter_mut()
+                    .find(|member| member.contains_pane(old_pane))
+                {
+                    member.split_group(old_pane, new_pane, direction);
+                }
+                return;
+            }
+        }
+        let mut members = vec![self.clone(), Self::Pane(new_pane.clone())];
+        if !direction.increasing() {
+            members.reverse();
+        }
+        let mut axis = PaneAxis::new(direction.axis(), members);
+        axis.is_group_separator = true;
+        *self = Self::Axis(axis);
+    }
+
     pub fn mark_positions(&mut self, in_center_group: bool, cx: &mut App) {
         match self {
             Member::Axis(pane_axis) => {
@@ -322,6 +397,7 @@ impl Member {
 
 #[derive(Clone, Copy)]
 pub struct PaneRenderContext<'a> {
+    pub frame_color: Option<Hsla>,
     pub project: &'a Entity<Project>,
     pub follower_states: &'a HashMap<CollaboratorId, FollowerState>,
     pub active_call: Option<&'a dyn AnyActiveCall>,
@@ -337,6 +413,9 @@ pub struct LeaderDecoration {
 }
 
 pub trait PaneLeaderDecorator {
+    fn frame_color(&self) -> Option<Hsla> {
+        None
+    }
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration;
     fn active_pane(&self) -> &Entity<Pane>;
     fn workspace(&self) -> &WeakEntity<Workspace>;
@@ -370,6 +449,9 @@ impl PaneLeaderDecorator for ActivePaneDecorator<'_> {
 }
 
 impl PaneLeaderDecorator for PaneRenderContext<'_> {
+    fn frame_color(&self) -> Option<Hsla> {
+        self.frame_color
+    }
     fn decorate(&self, pane: &Entity<Pane>, cx: &App) -> LeaderDecoration {
         let follower_state = self.follower_states.iter().find_map(|(leader_id, state)| {
             if state.center_pane == *pane {
@@ -646,6 +728,7 @@ impl Member {
 
 #[derive(Debug, Clone)]
 pub struct PaneAxis {
+    pub is_group_separator: bool,
     pub axis: Axis,
     pub members: Vec<Member>,
     pub flexes: Arc<Mutex<Vec<f32>>>,
@@ -658,6 +741,7 @@ impl PaneAxis {
         let bounding_boxes = Arc::new(Mutex::new(vec![None; members.len()]));
         Self {
             axis,
+            is_group_separator: false,
             members,
             flexes,
             bounding_boxes,
@@ -676,6 +760,7 @@ impl PaneAxis {
         let bounding_boxes = Arc::new(Mutex::new(vec![None; members.len()]));
         Self {
             axis,
+            is_group_separator: false,
             members,
             flexes,
             bounding_boxes,
@@ -697,7 +782,7 @@ impl PaneAxis {
                 }
                 Member::Pane(pane) => {
                     if pane == old_pane {
-                        if direction.axis() == self.axis {
+                        if direction.axis() == self.axis && !self.is_group_separator {
                             if direction.increasing() {
                                 idx += 1;
                             }
@@ -1018,6 +1103,11 @@ impl PaneAxis {
                 if result.contains_active_pane {
                     contains_active_pane = true;
                 }
+                if self.is_group_separator && !member.is_group_separator() {
+                    if let Some(color) = render_cx.frame_color() {
+                        return crate::frame_pane_group(result.element, color);
+                    }
+                }
                 result.element.into_any_element()
             })
             .collect::<Vec<_>>();
@@ -1028,6 +1118,10 @@ impl PaneAxis {
             self.flexes.clone(),
             self.bounding_boxes.clone(),
             render_cx.workspace().clone(),
+            self.is_group_separator
+                .then(|| render_cx.frame_color())
+                .flatten(),
+            self.is_group_separator,
         )
         .with_is_leaf_pane_mask(is_leaf_pane)
         .children(rendered_children)
@@ -1142,8 +1236,8 @@ mod element {
 
     use gpui::{
         Along, AnyElement, App, Axis, BorderStyle, Bounds, Element, GlobalElementId,
-        HitboxBehavior, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-        Pixels, Point, Size, Style, WeakEntity, Window, px, relative, size,
+        HitboxBehavior, Hsla, IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+        ParentElement, Pixels, Point, Size, Style, WeakEntity, Window, px, relative, size,
     };
     use gpui::{CursorStyle, Hitbox};
     use parking_lot::Mutex;
@@ -1166,6 +1260,8 @@ mod element {
         flexes: Arc<Mutex<Vec<f32>>>,
         bounding_boxes: Arc<Mutex<Vec<Option<Bounds<Pixels>>>>>,
         workspace: WeakEntity<Workspace>,
+        frame_color: Option<Hsla>,
+        allow_collapse: bool,
     ) -> PaneAxisElement {
         PaneAxisElement {
             axis,
@@ -1176,10 +1272,14 @@ mod element {
             active_pane_ix: None,
             workspace,
             is_leaf_pane_mask: Vec::new(),
+            frame_color,
+            allow_collapse,
         }
     }
 
     pub struct PaneAxisElement {
+        frame_color: Option<Hsla>,
+        allow_collapse: bool,
         axis: Axis,
         basis: usize,
         /// Equivalent to ColumnWidths (but in terms of flexes instead of percentages)
@@ -1226,18 +1326,26 @@ mod element {
             e: &MouseMoveEvent,
             ix: usize,
             axis: Axis,
+            allow_collapse: bool,
             child_start: Point<Pixels>,
             container_size: Size<Pixels>,
             workspace: WeakEntity<Workspace>,
             window: &mut Window,
             cx: &mut App,
         ) {
-            let min_size = match axis {
-                Axis::Horizontal => px(HORIZONTAL_MIN_SIZE),
-                Axis::Vertical => px(VERTICAL_MIN_SIZE),
+            let min_size = if allow_collapse {
+                Pixels::ZERO
+            } else {
+                match axis {
+                    Axis::Horizontal => px(HORIZONTAL_MIN_SIZE),
+                    Axis::Vertical => px(VERTICAL_MIN_SIZE),
+                }
             };
             let mut flexes = flexes.lock();
             debug_assert!(flex_values_in_bounds(flexes.as_slice()));
+            if container_size.along(axis) <= Pixels::ZERO {
+                return;
+            }
 
             // Math to convert a flex value to a pixel value
             let size = move |ix, flexes: &[f32]| {
@@ -1251,13 +1359,16 @@ mod element {
 
             // This is basically a "bucket" of pixel changes that need to be applied in response to this
             // mouse event. Probably a small, fractional number like 0.5 or 1.5 pixels
-            let mut proposed_current_pixel_change =
-                (e.position - child_start).along(axis) - size(ix, flexes.as_slice());
+            let mut desired_size = (e.position - child_start).along(axis);
+            if allow_collapse && desired_size < px(HANDLE_HITBOX_SIZE * 2.) {
+                desired_size = Pixels::ZERO;
+            }
+            let mut proposed_current_pixel_change = desired_size - size(ix, flexes.as_slice());
 
             // This takes a pixel change, and computes the flex changes that correspond to this pixel change
             // as well as the next one, for some reason
             let flex_changes = |pixel_dx, target_ix, next: isize, flexes: &[f32]| {
-                let flex_change = pixel_dx / container_size.along(axis);
+                let flex_change = pixel_dx / container_size.along(axis) * flexes.len() as f32;
                 let current_target_flex = flexes[target_ix] + flex_change;
                 let next_target_flex = flexes[(target_ix as isize + next) as usize] - flex_change;
                 (current_target_flex, next_target_flex)
@@ -1289,10 +1400,13 @@ mod element {
                     break;
                 };
 
-                let next_target_size = Pixels::max(
+                let mut next_target_size = Pixels::max(
                     size(current_ix + 1, flexes.as_slice()) - proposed_current_pixel_change,
                     min_size,
                 );
+                if allow_collapse && next_target_size < px(HANDLE_HITBOX_SIZE * 2.) {
+                    next_target_size = Pixels::ZERO;
+                }
 
                 let current_target_size = Pixels::max(
                     size(current_ix, flexes.as_slice()) + size(current_ix + 1, flexes.as_slice())
@@ -1432,7 +1546,9 @@ mod element {
 
                 bounding_boxes.push(Some(child_bounds));
                 child.layout_as_root(child_size.into(), window, cx);
-                child.prepaint_at(origin, window, cx);
+                if child_size.along(self.axis) > Pixels::ZERO {
+                    child.prepaint_at(origin, window, cx);
+                }
 
                 origin = origin.apply_along(self.axis, |val| val + child_size.along(self.axis));
 
@@ -1471,7 +1587,9 @@ mod element {
             cx: &mut App,
         ) {
             for child in &mut layout.children {
-                child.element.paint(window, cx);
+                if child.bounds.size.along(self.axis) > Pixels::ZERO {
+                    child.element.paint(window, cx);
+                }
             }
 
             let overlay_opacity = WorkspaceSettings::get(None, cx)
@@ -1545,7 +1663,8 @@ mod element {
 
                     window.paint_quad(gpui::fill(
                         handle.divider_bounds,
-                        cx.theme().colors().pane_group_border,
+                        self.frame_color
+                            .unwrap_or(cx.theme().colors().pane_group_border),
                     ));
 
                     window.on_mouse_event({
@@ -1575,6 +1694,7 @@ mod element {
                         let flexes = self.flexes.clone();
                         let child_bounds = child.bounds;
                         let axis = self.axis;
+                        let allow_collapse = self.allow_collapse;
                         move |e: &MouseMoveEvent, phase, window, cx| {
                             let dragged_handle = dragged_handle.borrow();
                             if phase.bubble() && *dragged_handle == Some(ix) {
@@ -1583,6 +1703,7 @@ mod element {
                                     e,
                                     ix,
                                     axis,
+                                    allow_collapse,
                                     child_bounds.origin,
                                     bounds.size,
                                     workspace.clone(),

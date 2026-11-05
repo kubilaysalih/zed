@@ -219,6 +219,8 @@ pub enum SplitMode {
     ClonePane,
     /// Create an empty new pane.
     EmptyPane,
+    /// Create a separate outer group, preserving the current group's splits.
+    NewGroup,
     /// Move the item into a new pane. This will map to nop if only one pane exists.
     MovePane,
 }
@@ -527,6 +529,28 @@ pub struct DraggedTab {
     pub ix: usize,
     pub detail: usize,
     pub is_active: bool,
+}
+
+#[derive(Clone)]
+pub struct DraggedPanelTab {
+    pub panel: EntityId,
+    pub index: usize,
+    pub group: usize,
+    pub position: usize,
+    pub title: String,
+    pub icon: IconName,
+    pub item: Box<dyn ItemHandle>,
+    pub detach: Rc<dyn Fn(&mut Window, &mut App) -> bool>,
+}
+
+impl Render for DraggedPanelTab {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Tab::new("dragged-panel-tab")
+            .content_padding(gpui::px(10.))
+            .toggle_state(true)
+            .start_slot(Icon::new(self.icon).size(IconSize::Small))
+            .child(Label::new(self.title.clone()).single_line())
+    }
 }
 
 impl EventEmitter<Event> for Pane {}
@@ -3008,6 +3032,15 @@ impl Pane {
 
                 styled_tab
             })
+            .drag_over::<DraggedPanelTab>(|tab, _, _, cx| {
+                tab.bg(cx.theme().colors().drop_target_background)
+                    .border_l_2()
+                    .border_color(cx.theme().colors().drop_target_border)
+            })
+            .on_drop(cx.listener(move |pane, tab: &DraggedPanelTab, window, cx| {
+                pane.drag_split_direction = None;
+                pane.handle_panel_tab_drop(tab, ix, window, cx);
+            }))
             .drag_over::<DraggedSelection>(|tab, _, _, cx| {
                 tab.bg(cx.theme().colors().drop_target_background)
             })
@@ -3744,6 +3777,13 @@ impl Pane {
             .drag_over::<DraggedTab>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
+            .drag_over::<DraggedPanelTab>(|bar, _, _, cx| {
+                bar.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, tab: &DraggedPanelTab, window, cx| {
+                this.drag_split_direction = None;
+                this.handle_panel_tab_drop(tab, this.items.len(), window, cx);
+            }))
             .drag_over::<DraggedSelection>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
@@ -3790,6 +3830,13 @@ impl Pane {
             .drag_over::<DraggedTab>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
+            .drag_over::<DraggedPanelTab>(|bar, _, _, cx| {
+                bar.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, tab: &DraggedPanelTab, window, cx| {
+                this.drag_split_direction = None;
+                this.handle_panel_tab_drop(tab, this.pinned_tab_count, window, cx);
+            }))
             .drag_over::<DraggedSelection>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
@@ -3989,6 +4036,34 @@ impl Pane {
                 });
             })
             .log_err();
+    }
+
+    pub fn handle_panel_tab_drop(
+        &mut self,
+        dragged: &DraggedPanelTab,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dragged = dragged.clone();
+        let mut target = cx.entity();
+        let split = self.drag_split_direction.take();
+        self.workspace
+            .update(cx, |_, cx| {
+                cx.defer_in(window, move |workspace, window, cx| {
+                    if !(dragged.detach)(window, cx) {
+                        return;
+                    }
+                    if let Some(split) = split {
+                        target = workspace.split_pane(target, split, window, cx);
+                    }
+                    target.update(cx, |pane, cx| {
+                        pane.add_item(dragged.item, true, true, Some(index), window, cx);
+                    });
+                });
+            })
+            .log_err();
+        cx.stop_propagation();
     }
 
     fn handle_pinned_tab_bar_drop(
@@ -4355,6 +4430,7 @@ pub fn default_render_tab_bar_buttons(
         Some(_) => (false, pane.items_len() > 1),
         None => (false, false),
     };
+    let can_create_group = pane.in_center_group;
     // Ideally we would return a vec of elements here to pass directly to the [TabBar]'s
     // `end_slot`, but due to needing a view here that isn't possible.
     let right_children = h_flex()
@@ -4387,27 +4463,41 @@ pub fn default_render_tab_bar_buttons(
         .child(
             PopoverMenu::new("pane-tab-bar-split")
                 .trigger_with_tooltip(
-                    IconButton::new("split", IconName::Split)
-                        .icon_size(IconSize::Small)
-                        .disabled(!can_clone && !can_split_move),
+                    IconButton::new("split", IconName::Split).icon_size(IconSize::Small),
                     Tooltip::text("Split Pane"),
                 )
                 .anchor(Anchor::TopRight)
                 .with_handle(pane.split_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     ContextMenu::build(window, cx, |menu, _, _| {
-                        let mode = SplitMode::MovePane;
-                        if can_split_move {
-                            menu.action("Split Right", SplitRight { mode }.boxed_clone())
-                                .action("Split Left", SplitLeft { mode }.boxed_clone())
-                                .action("Split Up", SplitUp { mode }.boxed_clone())
-                                .action("Split Down", SplitDown { mode }.boxed_clone())
+                        let mode = if can_split_move {
+                            SplitMode::MovePane
+                        } else if can_clone {
+                            SplitMode::ClonePane
                         } else {
-                            menu.action("Split Right", SplitRight::default().boxed_clone())
-                                .action("Split Left", SplitLeft::default().boxed_clone())
-                                .action("Split Up", SplitUp::default().boxed_clone())
-                                .action("Split Down", SplitDown::default().boxed_clone())
-                        }
+                            SplitMode::EmptyPane
+                        };
+                        menu.when(can_create_group, |menu| {
+                            menu.action(
+                                "New Pane Right",
+                                SplitRight {
+                                    mode: SplitMode::NewGroup,
+                                }
+                                .boxed_clone(),
+                            )
+                            .action(
+                                "New Pane Down",
+                                SplitDown {
+                                    mode: SplitMode::NewGroup,
+                                }
+                                .boxed_clone(),
+                            )
+                            .separator()
+                        })
+                        .action("Split Right", SplitRight { mode }.boxed_clone())
+                        .action("Split Left", SplitLeft { mode }.boxed_clone())
+                        .action("Split Up", SplitUp { mode }.boxed_clone())
+                        .action("Split Down", SplitDown { mode }.boxed_clone())
                     })
                     .into()
                 }),
@@ -4468,6 +4558,7 @@ impl Render for Pane {
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .flex_none()
+            .bg(cx.theme().colors().editor_background)
             .overflow_hidden()
             .on_action(cx.listener(|pane, split: &SplitLeft, window, cx| {
                 pane.split(SplitDirection::Left, split.mode, window, cx)
@@ -4625,9 +4716,10 @@ impl Render for Pane {
                     cx.propagate();
                 }
             }))
-            .when(self.active_item().is_some() && display_tab_bar, |pane| {
-                pane.child((self.render_tab_bar.clone())(self, window, cx))
-            })
+            .when(
+                (self.active_item().is_some() || self.in_center_group) && display_tab_bar,
+                |pane| pane.child((self.render_tab_bar.clone())(self, window, cx)),
+            )
             .child({
                 let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();
                 // main content
@@ -4637,6 +4729,7 @@ impl Render for Pane {
                     .group("")
                     .overflow_hidden()
                     .on_drag_move::<DraggedTab>(cx.listener(Self::handle_drag_move))
+                    .on_drag_move::<DraggedPanelTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
                     .when(accepts_external_paths, |div| {
                         div.on_drag_move::<ExternalPaths>(cx.listener(Self::handle_drag_move))
@@ -4688,6 +4781,7 @@ impl Render for Pane {
                             .absolute()
                             .bg(cx.theme().colors().drop_target_background)
                             .group_drag_over::<DraggedTab>("", |style| style.visible())
+                            .group_drag_over::<DraggedPanelTab>("", |style| style.visible())
                             .group_drag_over::<DraggedSelection>("", |style| style.visible())
                             .when(accepts_external_paths, |div| {
                                 div.group_drag_over::<ExternalPaths>("", |style| style.visible())
@@ -4695,6 +4789,9 @@ impl Render for Pane {
                             .when_some(self.can_drop_predicate.clone(), |this, p| {
                                 this.can_drop(move |a, window, cx| p(a, window, cx))
                             })
+                            .on_drop(cx.listener(move |this, tab: &DraggedPanelTab, window, cx| {
+                                this.handle_panel_tab_drop(tab, this.items.len(), window, cx);
+                            }))
                             .on_drop(cx.listener(move |this, dragged_tab, window, cx| {
                                 this.handle_tab_drop(
                                     dragged_tab,
@@ -6107,6 +6204,69 @@ mod tests {
             pane.unpin_tab_at(ix, window, cx);
         });
         assert_item_labels(&pane, ["C", "A", "B*"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_handle_panel_tab_drop_preserves_item_and_insertion(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let source = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item = add_labeled_item(&source, "Chat", false, cx);
+        let target = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.split_pane(source.clone(), SplitDirection::Down, window, cx)
+        });
+        add_labeled_item(&target, "Before", false, cx);
+        add_labeled_item(&target, "After", false, cx);
+        let item_id = item.item_id();
+        let detached = Rc::new(Cell::new(0));
+        let payload = DraggedPanelTab {
+            panel: source.entity_id(),
+            index: 0,
+            group: 0,
+            position: 0,
+            title: "Chat".into(),
+            icon: IconName::Chat,
+            item: item.boxed_clone(),
+            detach: Rc::new({
+                let source = source.clone();
+                let detached = detached.clone();
+                move |window, cx| {
+                    detached.set(detached.get() + 1);
+                    source.update(cx, |pane, cx| {
+                        pane.remove_item(item_id, false, false, window, cx)
+                    });
+                    true
+                }
+            }),
+        };
+        target.update_in(cx, |pane, window, cx| {
+            pane.handle_panel_tab_drop(&payload, 1, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(detached.get(), 1);
+        assert!(source.read_with(cx, |pane, _| pane.index_for_item_id(item_id).is_none()));
+        assert_eq!(
+            target.read_with(cx, |pane, _| pane.index_for_item_id(item_id)),
+            Some(1)
+        );
+        assert_eq!(
+            target.read_with(cx, |pane, _| pane.active_item().unwrap().item_id()),
+            item_id
+        );
+        assert_item_labels(&target, ["Before", "Chat*", "After"], cx);
+
+        let rejected = DraggedPanelTab {
+            detach: Rc::new(|_, _| false),
+            ..payload
+        };
+        source.update_in(cx, |pane, window, cx| {
+            pane.handle_panel_tab_drop(&rejected, 0, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(source.read_with(cx, |pane, _| pane.index_for_item_id(item_id).is_none()));
     }
 
     #[gpui::test]
@@ -9487,7 +9647,7 @@ mod tests {
 
         // check labels for all split operations
         match operation {
-            SplitMode::EmptyPane => {
+            SplitMode::EmptyPane | SplitMode::NewGroup => {
                 assert_item_labels_active_index(&pane_before, &pane_labels, num_labels - 1, cx);
                 assert_item_labels(&pane_after, [], cx);
             }
@@ -9543,7 +9703,7 @@ mod tests {
 
         // check pane axes for all operations
         match operation {
-            SplitMode::EmptyPane | SplitMode::ClonePane => {
+            SplitMode::EmptyPane | SplitMode::NewGroup | SplitMode::ClonePane => {
                 assert_pane_ids_on_axis(&workspace, expected_ids, expected_axis, cx);
             }
             SplitMode::MovePane => {

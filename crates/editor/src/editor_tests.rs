@@ -37106,17 +37106,96 @@ fn hover_over_gutter_row_zero(cx: &mut EditorTestContext) {
         let _ = window.draw(cx);
     });
 
-    let gutter_bounds = cx.update_editor(|editor, _, _| {
-        editor
+    let hover_position = cx.update_editor(|editor, _, _| {
+        let position_map = editor
             .last_position_map
             .as_ref()
-            .expect("expected editor position map")
-            .gutter_hitbox
-            .bounds
+            .expect("expected editor position map");
+        position_map.gutter_hitbox.bounds.origin
+            + point(
+                editor.gutter_dimensions.left_padding + px(2.),
+                position_map.line_height / 2.,
+            )
     });
 
-    let hover_position = gutter_bounds.center();
     cx.simulate_mouse_move(hover_position, None, Modifiers::none());
+}
+
+#[gpui::test]
+async fn test_gutter_ai_follows_hover_without_moving_selection(cx: &mut TestAppContext) {
+    let mut cx = build_gutter_hover_test_editor(true, cx).await;
+    cx.update_editor(|editor, window, cx| {
+        editor.set_text("one\ntwo\nthree\nfour\n", window, cx);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 1)..Point::new(0, 1)]);
+        });
+    });
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let hover_position = cx.update_editor(|editor, _, _| {
+        let map = editor.last_position_map.as_ref().unwrap();
+        map.text_hitbox.bounds.origin + point(px(20.), map.line_height * 2.5)
+    });
+    cx.simulate_mouse_move(hover_position, None, Modifiers::none());
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(editor.hovered_gutter_ai_row, Some(DisplayRow(2)));
+        let snapshot = editor.snapshot(window, cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest::<Point>(&snapshot.display_snapshot)
+                .head(),
+            Point::new(0, 1)
+        );
+        let target =
+            snapshot.display_point_to_anchor(DisplayPoint::new(DisplayRow(2), 0), Bias::Right);
+        editor.select_gutter_ai_target(target, window, cx);
+        let snapshot = editor.snapshot(window, cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest::<Point>(&snapshot.display_snapshot)
+                .head(),
+            Point::new(2, 0)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_gutter_ai_preserves_selected_lines_and_excludes_end_boundary(
+    cx: &mut TestAppContext,
+) {
+    let mut cx = build_gutter_hover_test_editor(true, cx).await;
+    cx.update_editor(|editor, window, cx| {
+        editor.set_text("one\ntwo\nthree\nfour\n", window, cx);
+        let range = Point::new(0, 1)..Point::new(2, 0);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([range.clone()]);
+        });
+        let snapshot = editor.snapshot(window, cx);
+        let inside =
+            snapshot.display_point_to_anchor(DisplayPoint::new(DisplayRow(1), 0), Bias::Right);
+        editor.select_gutter_ai_target(inside, window, cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest::<Point>(&snapshot.display_snapshot)
+                .range(),
+            range
+        );
+        let outside =
+            snapshot.display_point_to_anchor(DisplayPoint::new(DisplayRow(2), 0), Bias::Right);
+        editor.select_gutter_ai_target(outside, window, cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest::<Point>(&snapshot.display_snapshot)
+                .range(),
+            Point::new(2, 0)..Point::new(2, 0)
+        );
+    });
 }
 
 #[gpui::test]
@@ -37175,16 +37254,18 @@ fn right_click_gutter_row_zero(cx: &mut EditorTestContext) {
         let _ = window.draw(cx);
     });
 
-    let gutter_bounds = cx.update_editor(|editor, _, _| {
-        editor
+    let click_position = cx.update_editor(|editor, _, _| {
+        let map = editor
             .last_position_map
             .as_ref()
-            .expect("expected editor position map")
-            .gutter_hitbox
-            .bounds
+            .expect("expected editor position map");
+        map.gutter_hitbox.bounds.origin
+            + point(
+                editor.gutter_dimensions.left_padding + px(2.),
+                map.line_height / 2.,
+            )
     });
 
-    let click_position = gutter_bounds.center();
     cx.simulate_mouse_down(click_position, MouseButton::Right, Modifiers::none());
 }
 

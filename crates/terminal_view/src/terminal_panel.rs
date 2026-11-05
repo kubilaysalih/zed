@@ -503,7 +503,7 @@ impl TerminalPanel {
             }
             &pane::Event::Split { direction, mode } => {
                 match mode {
-                    SplitMode::ClonePane | SplitMode::EmptyPane => {
+                    SplitMode::ClonePane | SplitMode::EmptyPane | SplitMode::NewGroup => {
                         let clone = matches!(mode, SplitMode::ClonePane);
                         let new_pane = self.new_pane_with_active_terminal(clone, window, cx);
                         let pane = pane.clone();
@@ -1570,6 +1570,7 @@ impl Render for TerminalPanel {
                         workspace.zoomed_item(),
                         None,
                         &workspace::PaneRenderContext {
+                            frame_color: None,
                             follower_states: &HashMap::default(),
                             active_call: workspace.active_call(),
                             active_pane: &self.active_pane,

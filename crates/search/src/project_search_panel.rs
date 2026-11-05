@@ -1,15 +1,16 @@
 use crate::{SearchOption, SearchOptions};
 use editor::{Editor, EditorEvent, SelectionEffects, scroll::Autoscroll};
+use file_icons::FileIcons;
 use futures::StreamExt;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity, Window,
-    uniform_list,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, StyledText,
+    Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use language::Buffer;
 use project::{Project, search::SearchResult};
 use std::{ops::Range, time::Duration};
 use text::{Anchor, Point};
-use ui::{SpinnerLabel, Tooltip, prelude::*};
+use ui::{ScrollAxes, Scrollbars, SpinnerLabel, TintColor, Tooltip, WithScrollbar, prelude::*};
 use util::{
     ResultExt,
     paths::{PathMatcher, PathStyle},
@@ -75,6 +76,10 @@ struct ResultRow {
     range: Range<Anchor>,
     label: String,
     heading: bool,
+    directory: String,
+    match_count: usize,
+    line: u32,
+    highlight: Range<usize>,
 }
 
 pub struct ProjectSearchPanel {
@@ -86,6 +91,7 @@ pub struct ProjectSearchPanel {
     options: SearchOptions,
     filters: bool,
     rows: Vec<ResultRow>,
+    scroll_handle: UniformListScrollHandle,
     count: usize,
     running: bool,
     limited: bool,
@@ -108,8 +114,8 @@ impl ProjectSearchPanel {
             })
         };
         let query = input("Search all files…");
-        let include = input("Files to include (e.g. src/**)");
-        let exclude = input("Files to exclude (e.g. **/vendor/**)");
+        let include = input("e.g. src/**, tests/**");
+        let exclude = input("e.g. **/vendor/**");
         for editor in [&query, &include, &exclude] {
             cx.subscribe(editor, |this, _, event, cx| {
                 if matches!(event, EditorEvent::Edited { .. }) {
@@ -127,6 +133,7 @@ impl ProjectSearchPanel {
             options: SearchOptions::NONE,
             filters: false,
             rows: Vec::new(),
+            scroll_handle: UniformListScrollHandle::new(),
             count: 0,
             running: false,
             limited: false,
@@ -201,11 +208,21 @@ impl ProjectSearchPanel {
                                             .file()
                                             .map(|file| file.path().as_unix_str().to_owned())
                                             .unwrap_or_else(|| "Untitled".into());
+                                        let (directory, filename) = label
+                                            .rsplit_once('/')
+                                            .map(|(directory, filename)| {
+                                                (directory.to_owned(), filename.to_owned())
+                                            })
+                                            .unwrap_or_else(|| (String::new(), label));
                                         this.rows.push(ResultRow {
                                             buffer: buffer.clone(),
                                             range: first.clone(),
-                                            label: format!("{} ({})", label, ranges.len()),
+                                            label: filename,
                                             heading: true,
+                                            directory,
+                                            match_count: ranges.len(),
+                                            line: 0,
+                                            highlight: 0..0,
                                         });
                                     }
                                     for range in ranges {
@@ -225,11 +242,29 @@ impl ProjectSearchPanel {
                                             )
                                             .take(240)
                                             .collect::<String>();
+                                        let end: Point = snapshot.summary_for_anchor(&range.end);
+                                        let trim = preview.len() - preview.trim_start().len();
+                                        let label = preview.trim().to_owned();
+                                        let highlight_start =
+                                            (point.column - start.column) as usize;
+                                        let highlight_end = if end.row == point.row {
+                                            (end.column - start.column) as usize
+                                        } else {
+                                            preview.len()
+                                        };
+                                        let highlight = highlight_start
+                                            .saturating_sub(trim)
+                                            .min(label.len())
+                                            ..highlight_end.saturating_sub(trim).min(label.len());
                                         this.rows.push(ResultRow {
                                             buffer: buffer.clone(),
                                             range,
-                                            label: format!("{}  {}", point.row + 1, preview.trim()),
+                                            label,
                                             heading: false,
+                                            directory: String::new(),
+                                            match_count: 0,
+                                            line: point.row + 1,
+                                            highlight,
                                         });
                                         this.count += 1;
                                     }
@@ -322,7 +357,7 @@ impl Panel for ProjectSearchPanel {
 }
 
 impl Render for ProjectSearchPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .overflow_hidden()
@@ -345,6 +380,7 @@ impl Render for ProjectSearchPanel {
                         .map(|option| {
                             IconButton::new(option.label(), option.icon())
                                 .toggle_state(self.options.contains(option.as_options()))
+                                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                                 .tooltip(Tooltip::text(option.label()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.options.toggle(option.as_options());
@@ -355,6 +391,7 @@ impl Render for ProjectSearchPanel {
                     .child(
                         IconButton::new("search-filters", IconName::Filter)
                             .toggle_state(self.filters)
+                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                             .tooltip(Tooltip::text("Include / exclude files"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.filters = !this.filters;
@@ -366,6 +403,9 @@ impl Render for ProjectSearchPanel {
                 div()
                     .mx_3()
                     .p_2()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_sm()
                     .bg(cx.theme().colors().editor_background)
                     .child(self.query.clone()),
             )
@@ -375,8 +415,18 @@ impl Render for ProjectSearchPanel {
                         .px_3()
                         .py_2()
                         .gap_2()
-                        .child(self.include.clone())
-                        .child(self.exclude.clone()),
+                        .children([
+                            ("Files to include", self.include.clone()),
+                            ("Files to exclude", self.exclude.clone()),
+                        ].into_iter().map(|(label, editor)| {
+                            v_flex().gap_1()
+                                .child(Label::new(label).size(LabelSize::Small))
+                                .child(div().p_2().border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .rounded_sm()
+                                    .bg(cx.theme().colors().editor_background)
+                                    .child(editor))
+                        })),
                 )
             })
             .child(
@@ -409,6 +459,7 @@ impl Render for ProjectSearchPanel {
                 this.child(div().px_3().child(Label::new(error).color(Color::Error)))
             })
             .child(
+                div().id("search-results-viewport").flex_1().min_h_0().relative().overflow_hidden().child(
                 uniform_list(
                     "project-search-results",
                     self.rows.len(),
@@ -417,10 +468,14 @@ impl Render for ProjectSearchPanel {
                             .filter_map(|index| {
                                 this.rows.get(index).cloned().map(|row| {
                                     let heading = row.heading;
+                                    let icon = row.buffer.read(cx).file()
+                                        .and_then(|file| FileIcons::get_icon(file.path().as_std_path(), cx))
+                                        .map(Icon::from_path)
+                                        .unwrap_or_else(|| Icon::new(IconName::File));
                                     h_flex()
                                         .id(index)
                                         .w_full()
-                                        .h(px(28.))
+                                        .h(px(26.))
                                         .gap_1()
                                         .px_3()
                                         .when(!heading, |this| this.pl_6())
@@ -428,15 +483,29 @@ impl Render for ProjectSearchPanel {
                                         .hover(|style| style.bg(cx.theme().colors().element_hover))
                                         .when(heading, |this| {
                                             this.child(
-                                                Icon::new(IconName::File).size(IconSize::Small),
+                                                icon.size(IconSize::Small),
                                             )
                                         })
-                                        .child(
+                                        .when(heading, |this| this.child(
+                                            h_flex().flex_1().min_w_0().gap_2().overflow_hidden().child(
                                             Label::new(row.label.clone())
                                                 .size(LabelSize::Small)
                                                 .single_line()
-                                                .truncate(),
-                                        )
+                                                .truncate())
+                                            .child(Label::new(row.directory.clone()).size(LabelSize::Small).color(Color::Muted).truncate())
+                                        ).child(div().px_1p5().rounded_full().bg(cx.theme().colors().element_background)
+                                            .child(Label::new(row.match_count.to_string()).size(LabelSize::XSmall))))
+                                        .when(!heading, |this| this
+                                            .child(div().w(px(32.)).flex_shrink_0().child(Label::new(row.line.to_string()).size(LabelSize::Small).color(Color::Muted)))
+                                            .child(div().flex_1().min_w_0().text_size(rems(0.875)).text_ellipsis().child(
+                                                StyledText::new(row.label.clone()).with_highlights([(
+                                                    row.highlight.clone(), HighlightStyle {
+                                                        background_color: Some(cx.theme().colors().search_match_background),
+                                                        font_weight: Some(gpui::FontWeight::BOLD),
+                                                        ..Default::default()
+                                                    }
+                                                )])
+                                            )))
                                         .tooltip(Tooltip::text(row.label.clone()))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.open_result(row.clone(), window, cx)
@@ -446,8 +515,11 @@ impl Render for ProjectSearchPanel {
                             .collect::<Vec<_>>()
                     }),
                 )
-                .flex_1()
-                .min_h_0(),
+                .track_scroll(&self.scroll_handle)
+                .size_full())
+                .custom_scrollbars(Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .tracked_scroll_handle(&self.scroll_handle)
+                    .with_track_along(ScrollAxes::Vertical, cx.theme().colors().panel_background), window, cx),
             )
     }
 }

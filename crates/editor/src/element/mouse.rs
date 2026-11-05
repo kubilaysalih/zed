@@ -44,6 +44,12 @@ impl EditorElement {
 
         let point_for_position = position_map.point_for_position(event.position);
         let valid_point = point_for_position.nearest_valid;
+        let hovered_gutter_ai_row =
+            (text_hovered || gutter_hovered).then_some(point_for_position.exact_unclipped.row());
+        if editor.hovered_gutter_ai_row != hovered_gutter_ai_row {
+            editor.hovered_gutter_ai_row = hovered_gutter_ai_row;
+            cx.notify();
+        }
 
         // Update diff review drag state if we're dragging
         if editor.diff_review_drag_state.is_some() {
@@ -177,6 +183,9 @@ impl EditorElement {
         });
 
         let gutter_hover_button = if gutter_hovered
+            && (!position_map.snapshot.buffer_snapshot().is_singleton()
+                || event.position.x
+                    < gutter_hitbox.bounds.right() - editor.gutter_dimensions.right_padding)
             && !is_on_diff_review_button_row
             && split_side != Some(SplitSide::Left)
         {

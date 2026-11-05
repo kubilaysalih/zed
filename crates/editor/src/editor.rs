@@ -1103,6 +1103,7 @@ pub struct Editor {
     pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     prev_pressure_stage: Option<PressureStage>,
     gutter_hovered: bool,
+    hovered_gutter_ai_row: Option<DisplayRow>,
     hovered_link_state: Option<HoveredLinkState>,
     edit_prediction_provider: Option<RegisteredEditPredictionDelegate>,
     code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
@@ -1304,6 +1305,7 @@ pub struct NavigationOverlayLabel {
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct GutterDimensions {
+    pub ai_width: Pixels,
     pub left_padding: Pixels,
     pub right_padding: Pixels,
     pub width: Pixels,
@@ -2507,6 +2509,7 @@ impl Editor {
             word_completions_enabled: full_mode,
             inline_value_cache: InlineValueCache::new(inlay_hint_settings.show_value_hints),
             gutter_hovered: false,
+            hovered_gutter_ai_row: None,
             pixel_position_of_newest_cursor: None,
             last_bounds: None,
             last_position_map: None,
@@ -12571,10 +12574,10 @@ impl EditorSnapshot {
                     ch_width * 4.0
                 // runnables, breakpoints and bookmarks are shown in the same place
                 // if all three are there only the runnable is shown
-                } else if show_runnables || show_breakpoints || show_bookmarks {
+                } else if !show_line_numbers
+                    && (show_runnables || show_breakpoints || show_bookmarks)
+                {
                     ch_width * 3.0
-                } else if show_git_gutter && show_line_numbers {
-                    ch_width * 2.0
                 } else if show_git_gutter || show_line_numbers {
                     ch_width
                 } else {
@@ -12594,6 +12597,7 @@ impl EditorSnapshot {
             };
 
             GutterDimensions {
+                ai_width: Pixels::ZERO,
                 left_padding,
                 right_padding,
                 width: line_gutter_width + left_padding + right_padding,

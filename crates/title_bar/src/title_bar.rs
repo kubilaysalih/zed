@@ -1218,11 +1218,18 @@ impl TitleBar {
         }
     }
 
-    pub fn render_sign_in_button(&mut self, _: &mut Context<Self>) -> Button {
+    pub fn render_sign_in_button(&mut self, cx: &mut Context<Self>) -> Button {
         let client = self.client.clone();
         let workspace = self.workspace.clone();
+        let foreground = Color::Custom(if cx.theme().appearance.is_light() {
+            gpui::black()
+        } else {
+            gpui::white()
+        });
         Button::new("sign_in", "Sign In")
             .label_size(LabelSize::Small)
+            .color(foreground)
+            .selected_label_color(foreground)
             .tab_index(0isize)
             .on_click(move |_, window, cx| {
                 let client = client.clone();

@@ -6,7 +6,7 @@ use super::chat_runtime::{self as runtime, Control};
 use agent_settings::AgentSettings;
 use agent_ui::{AgentNotification, AgentNotificationEvent};
 use base64::Engine as _;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Datelike, Local};
 use editor::{Editor, EditorElement, EditorEvent, EditorStyle};
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ListAlignment,
@@ -17,6 +17,7 @@ use settings::{NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
+    rc::Rc,
     sync::mpsc::Sender,
     time::{Duration, SystemTime},
 };
@@ -27,12 +28,94 @@ use workspace::{
     Item, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     item::ItemEvent,
+    pane::{DraggedPanelTab as DraggedChatTab, DraggedTab},
 };
 
 actions!(
     chat_history,
     [ToggleFocus, ToggleRightChat, StartChatBridgeDemo]
 );
+
+fn chat_link_path(link: &str, cwd: &str) -> anyhow::Result<Option<PathBuf>> {
+    let link = link.trim().trim_matches('`');
+    if link.starts_with('#') {
+        anyhow::bail!("This link does not name a file");
+    }
+    if link.to_ascii_lowercase().starts_with("file:") {
+        let mut url = url::Url::parse(link)?;
+        url.set_fragment(None);
+        url.set_query(None);
+        return url
+            .to_file_path()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("Invalid file URL: {link}"));
+    }
+    let windows_drive = link.as_bytes().get(1) == Some(&b':')
+        && link.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    if !windows_drive
+        && url::Url::parse(link).is_ok()
+        && (link.contains("://") || util::paths::PathWithPosition::parse_str(link).row.is_none())
+    {
+        return Ok(None);
+    }
+    let path = link.split_once('#').map_or(link, |(path, _)| path);
+    let decoded = urlencoding::decode(path)?;
+    let path = util::paths::PathWithPosition::parse_str(&decoded).path;
+    Ok(Some(if path.is_absolute() {
+        path
+    } else {
+        PathBuf::from(cwd).join(path)
+    }))
+}
+
+#[cfg(test)]
+mod chat_link_tests {
+    use super::chat_link_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn relative_markdown_links_use_chat_directory() {
+        let root = std::env::temp_dir().join("chat-link-test");
+        let cwd = root.to_string_lossy();
+        for link in [
+            "sevk-aws-maliyet-ozeti.md",
+            "sevk-aws-maliyet-ozeti.md#cost",
+            "sevk-aws-maliyet-ozeti.md:12:3",
+        ] {
+            assert_eq!(
+                chat_link_path(link, &cwd).unwrap(),
+                Some(root.join("sevk-aws-maliyet-ozeti.md"))
+            );
+        }
+        assert_eq!(
+            chat_link_path("docs/cost%20report.md", &cwd).unwrap(),
+            Some(root.join("docs/cost report.md"))
+        );
+        assert_eq!(
+            chat_link_path("https://example.com/report.md", &cwd).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn absolute_and_file_urls_are_files() {
+        let path = std::env::temp_dir().join("cost report.md");
+        let url = url::Url::from_file_path(&path).unwrap();
+        assert_eq!(
+            chat_link_path(url.as_str(), "ignored").unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(
+            chat_link_path(&path.to_string_lossy(), "ignored").unwrap(),
+            Some(path)
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            chat_link_path("C:/Projects/sevk/report.md", "ignored").unwrap(),
+            Some(PathBuf::from("C:/Projects/sevk/report.md"))
+        );
+    }
+}
 
 pub fn open_bridge_demo(workspace: &Workspace, window: &mut Window, cx: &mut App) {
     if let Some(panel) = workspace.panel::<ChatHistoryPanel>(cx) {
@@ -55,6 +138,8 @@ struct GeneralChatWindows {
     restored_startup: bool,
     opening: HashSet<gpui::WindowId>,
     readers: HashMap<gpui::WindowId, Vec<WeakEntity<ChatHistoryView>>>,
+    return_workspaces: HashMap<gpui::WindowId, WeakEntity<Workspace>>,
+    editor_sidebar_open: HashSet<gpui::WindowId>,
 }
 impl gpui::Global for GeneralChatWindows {}
 
@@ -183,6 +268,23 @@ fn open_general_chats(workspace: &Workspace, window: &mut Window, cx: &mut App) 
         let Some(multi) = window.root::<workspace::MultiWorkspace>().flatten() else {
             return;
         };
+        let current = multi.read(cx).workspace().clone();
+        if !current.read(cx).global_chat_mode() {
+            let id = window.window_handle().window_id();
+            if multi.read(cx).sidebar_open() {
+                cx.global_mut::<GeneralChatWindows>()
+                    .editor_sidebar_open
+                    .insert(id);
+            } else {
+                cx.global_mut::<GeneralChatWindows>()
+                    .editor_sidebar_open
+                    .remove(&id);
+            }
+            cx.global_mut::<GeneralChatWindows>()
+                .return_workspaces
+                .insert(id, current.downgrade());
+        }
+        multi.update(cx, |multi, cx| multi.close_sidebar(window, cx));
         let existing = {
             multi
                 .read(cx)
@@ -250,6 +352,161 @@ fn open_general_chats(workspace: &Workspace, window: &mut Window, cx: &mut App) 
         })
         .detach_and_log_err(cx);
     });
+}
+
+fn leave_agent_mode(workspace: &Workspace, window: &mut Window, cx: &mut App) {
+    let app_state = workspace.app_state().clone();
+    window.defer(cx, move |window, cx| {
+        let Some(multi) = window.root::<workspace::MultiWorkspace>().flatten() else {
+            return;
+        };
+        let previous = cx
+            .global::<GeneralChatWindows>()
+            .return_workspaces
+            .get(&window.window_handle().window_id())
+            .and_then(WeakEntity::upgrade)
+            .filter(|previous| {
+                multi
+                    .read(cx)
+                    .workspaces()
+                    .any(|candidate| candidate == previous)
+            })
+            .or_else(|| {
+                multi
+                    .read(cx)
+                    .workspaces()
+                    .find(|candidate| !candidate.read(cx).global_chat_mode())
+                    .cloned()
+            });
+        if let Some(previous) = previous {
+            multi.update(cx, |multi, cx| {
+                multi.activate(previous.clone(), None, window, cx)
+            });
+            previous.update(cx, |workspace, cx| {
+                if !workspace.agent_mode() {
+                    toggle_project_agent_mode(workspace, window, cx);
+                }
+            });
+        } else if let Some(handle) = window
+            .window_handle()
+            .downcast::<workspace::MultiWorkspace>()
+        {
+            Workspace::new_local(
+                Vec::new(),
+                app_state,
+                Some(handle),
+                None,
+                None,
+                workspace::OpenMode::Activate,
+                cx,
+            )
+            .detach_and_log_err(cx);
+        }
+        if cx
+            .global::<GeneralChatWindows>()
+            .editor_sidebar_open
+            .contains(&window.window_handle().window_id())
+        {
+            multi.update(cx, |multi, cx| multi.open_sidebar(cx));
+        }
+        Library::read(&library_path())
+            .and_then(|mut library| {
+                library.general_workspace.active = false;
+                library.save(&library_path())
+            })
+            .log_err();
+    });
+}
+
+fn toggle_project_agent_mode(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let enabled = !workspace.agent_mode();
+    let roots = workspace
+        .root_paths(cx)
+        .into_iter()
+        .map(|path| path.to_path_buf())
+        .collect::<Vec<_>>();
+    let Some(chats) = workspace.panel::<ChatHistoryPanel>(cx) else {
+        return;
+    };
+    let Some(right) = workspace.panel::<RightChatPanel>(cx) else {
+        return;
+    };
+    if enabled {
+        workspace.set_agent_mode(true, window, cx);
+    }
+    let old_position = right.read(cx).position;
+    let position = if enabled {
+        DockPosition::Right
+    } else {
+        right
+            .read(cx)
+            .editor_position
+            .unwrap_or(DockPosition::Right)
+    };
+    if old_position != position {
+        workspace.remove_panel(&right, window, cx);
+    }
+    right.update(cx, |right, cx| {
+        right.editor_position = enabled.then_some(old_position);
+        right.agent_mode = enabled;
+        right.position = position;
+        cx.notify();
+    });
+    if old_position != position {
+        workspace.add_panel(right, window, cx);
+    }
+    chats.update(cx, |panel, cx| {
+        panel.agent_mode = enabled;
+        panel.agent_current_folder = enabled;
+        panel.agent_mode_roots = roots;
+        if enabled {
+            panel.editor_scope = Some((
+                panel.project.take(),
+                panel.workspace_projects,
+                panel.agent_folder.take(),
+            ));
+            panel.workspace_projects = false;
+        } else if let Some((project, workspace_projects, agent_folder)) = panel.editor_scope.take()
+        {
+            panel.project = project;
+            panel.workspace_projects = workspace_projects;
+            panel.agent_folder = agent_folder;
+        }
+        panel.refilter(cx);
+    });
+    if enabled {
+        workspace.focus_panel::<ChatHistoryPanel>(window, cx);
+        workspace.focus_panel::<RightChatPanel>(window, cx);
+    } else {
+        workspace.set_agent_mode(false, window, cx);
+    }
+    if let Some(multi) = workspace.multi_workspace().and_then(WeakEntity::upgrade) {
+        window.defer(cx, move |window, cx| {
+            let id = window.window_handle().window_id();
+            if enabled {
+                if multi.read(cx).sidebar_open() {
+                    cx.global_mut::<GeneralChatWindows>()
+                        .editor_sidebar_open
+                        .insert(id);
+                } else {
+                    cx.global_mut::<GeneralChatWindows>()
+                        .editor_sidebar_open
+                        .remove(&id);
+                }
+                multi.update(cx, |multi, cx| multi.close_sidebar(window, cx));
+            } else if cx
+                .global_mut::<GeneralChatWindows>()
+                .editor_sidebar_open
+                .remove(&id)
+            {
+                multi.update(cx, |multi, cx| multi.open_sidebar(cx));
+            }
+        });
+    }
 }
 
 fn provider_icon(provider: Provider) -> IconName {
@@ -615,6 +872,8 @@ pub fn install(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
     workspace.add_panel(panel, window, cx);
     let right = cx.new(|cx| RightChatPanel {
         general,
+        agent_mode: false,
+        editor_position: None,
         restoring_layout: general,
         save_layout_task: Task::ready(()),
         save_layout_pending: false,
@@ -672,6 +931,13 @@ pub fn install(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
     workspace.add_panel(right, window, cx);
     workspace.register_action(|workspace, _: &workspace::OpenGlobalChats, window, cx| {
         open_general_chats(workspace, window, cx);
+    });
+    workspace.register_action(|workspace, _: &workspace::ToggleAgentMode, window, cx| {
+        if workspace.global_chat_mode() {
+            leave_agent_mode(workspace, window, cx);
+        } else {
+            toggle_project_agent_mode(workspace, window, cx);
+        }
     });
     if let Some(multi) = workspace.multi_workspace().and_then(WeakEntity::upgrade) {
         cx.subscribe_in(&multi, window, |this, multi, event, _, cx| {
@@ -812,6 +1078,8 @@ pub fn install(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<
 
 struct RightChatPanel {
     general: bool,
+    agent_mode: bool,
+    editor_position: Option<DockPosition>,
     restoring_layout: bool,
     save_layout_task: Task<()>,
     save_layout_pending: bool,
@@ -844,7 +1112,7 @@ impl Panel for RightChatPanel {
         self.position
     }
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        !self.general || position == DockPosition::Right
+        (!self.general && !self.agent_mode) || position == DockPosition::Right
     }
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         self.position = position;
@@ -865,7 +1133,7 @@ impl Panel for RightChatPanel {
         cx.notify();
     }
     fn fills_empty_workspace(&self) -> bool {
-        self.general || self.groups.iter().any(|group| !group.tabs.is_empty())
+        self.general || self.agent_mode || self.groups.iter().any(|group| !group.tabs.is_empty())
     }
     fn has_flexible_size(&self, _: &Window, _: &App) -> bool {
         true
@@ -911,24 +1179,6 @@ struct ChatTabGroup {
     weight: f32,
 }
 
-#[derive(Clone)]
-struct DraggedChatTab {
-    panel: gpui::EntityId,
-    index: usize,
-    group: usize,
-    position: usize,
-    title: String,
-    provider: Provider,
-}
-
-impl Render for DraggedChatTab {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        ui::Tab::new("dragged-chat-tab")
-            .toggle_state(true)
-            .start_slot(Icon::new(provider_icon(self.provider)).size(IconSize::Small))
-            .child(Label::new(self.title.clone()).single_line())
-    }
-}
 impl Default for ChatTabGroup {
     fn default() -> Self {
         Self {
@@ -996,6 +1246,46 @@ impl RightChatPanel {
             })
             .log_err();
         });
+    }
+
+    fn drop_editor_tab(
+        &mut self,
+        dragged: &DraggedTab,
+        group: usize,
+        insertion: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(view) = dragged.item.to_any_view().downcast::<ChatHistoryView>() else {
+            return;
+        };
+        if group >= self.groups.len()
+            || dragged
+                .pane
+                .read(cx)
+                .items()
+                .position(|item| item.item_id() == view.entity_id())
+                .is_none()
+        {
+            return;
+        }
+        dragged.pane.update(cx, |pane, cx| {
+            pane.remove_item(view.entity_id(), false, true, window, cx);
+        });
+        self.current_group = group;
+        self.insert_view(view.clone(), true, window, cx);
+        if let Some(index) = self.views.iter().position(|existing| existing == &view) {
+            for source in &mut self.groups {
+                source.tabs.retain(|tab| *tab != index);
+                if source.active == Some(index) {
+                    source.active = source.tabs.last().copied();
+                }
+            }
+            let insertion = insertion.min(self.groups[group].tabs.len());
+            self.groups[group].tabs.insert(insertion, index);
+            self.select(group, index, window, cx);
+        }
+        cx.stop_propagation();
     }
 
     fn drop_tab(
@@ -1229,6 +1519,7 @@ impl RightChatPanel {
                     ui::TabPosition::Middle(position.cmp(&active_position))
                 };
                 let tab = ui::Tab::new(("right-chat-tab", index))
+                    .content_padding(px(10.))
                     .position(tab_position)
                     .toggle_state(selected)
                     .start_slot(Icon::new(provider_icon(chat.chat.provider)).size(IconSize::Small))
@@ -1286,7 +1577,35 @@ impl RightChatPanel {
                             group,
                             position,
                             title: chat.chat.title.clone(),
-                            provider: chat.chat.provider,
+                            icon: provider_icon(chat.chat.provider),
+                            item: Box::new(view.clone()),
+                            detach: Rc::new({
+                                let panel = cx.weak_entity();
+                                let item_id = view.entity_id();
+                                move |window, cx| {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            let Some(index) = panel
+                                                .views
+                                                .iter()
+                                                .position(|view| view.entity_id() == item_id)
+                                            else {
+                                                return false;
+                                            };
+                                            let Some(group) = panel
+                                                .groups
+                                                .iter()
+                                                .position(|group| group.tabs.contains(&index))
+                                            else {
+                                                return false;
+                                            };
+                                            panel.close_tab(group, index, window, cx);
+                                            true
+                                        })
+                                        .log_err()
+                                        .unwrap_or(false)
+                                }
+                            }),
                         },
                         |tab, _, _, cx| cx.new(|_| tab.clone()),
                     )
@@ -1294,7 +1613,18 @@ impl RightChatPanel {
                         value
                             .downcast_ref::<DraggedChatTab>()
                             .is_some_and(|tab| tab.panel == panel_id)
+                            || value.downcast_ref::<DraggedTab>().is_some_and(|tab| {
+                                tab.item.to_any_view().downcast::<ChatHistoryView>().is_ok()
+                            })
                     })
+                    .drag_over::<DraggedTab>(|tab, _, _, cx| {
+                        tab.bg(cx.theme().colors().drop_target_background)
+                            .border_l_2()
+                            .border_color(cx.theme().colors().drop_target_border)
+                    })
+                    .on_drop(cx.listener(move |this, tab: &DraggedTab, window, cx| {
+                        this.drop_editor_tab(tab, group, position, window, cx);
+                    }))
                     .drag_over::<DraggedChatTab>(move |tab, dragged, _, cx| {
                         let tab = tab
                             .bg(cx.theme().colors().drop_target_background)
@@ -1457,7 +1787,16 @@ impl RightChatPanel {
                 value
                     .downcast_ref::<DraggedChatTab>()
                     .is_some_and(|tab| tab.panel == panel_id)
+                    || value.downcast_ref::<DraggedTab>().is_some_and(|tab| {
+                        tab.item.to_any_view().downcast::<ChatHistoryView>().is_ok()
+                    })
             })
+            .drag_over::<DraggedTab>(|pane, _, _, cx| {
+                pane.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, tab: &DraggedTab, window, cx| {
+                this.drop_editor_tab(tab, group, tab_count, window, cx);
+            }))
             .drag_over::<DraggedChatTab>(|pane, _, _, cx| {
                 pane.bg(cx.theme().colors().drop_target_background)
             })
@@ -1707,6 +2046,10 @@ enum EditName {
 pub struct ChatHistoryPanel {
     collaboration: Option<super::chat_bridge::Connection>,
     general: bool,
+    agent_mode: bool,
+    agent_mode_roots: Vec<PathBuf>,
+    agent_current_folder: bool,
+    editor_scope: Option<(Option<String>, bool, Option<String>)>,
     restored_general: bool,
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
@@ -1758,7 +2101,8 @@ fn day_label(time: SystemTime) -> String {
     match (today - day).num_days() {
         0 => "Today".into(),
         1 => "Yesterday".into(),
-        _ => day.format("%d %B %Y").to_string(),
+        _ if day.year() == today.year() => day.format("%d %b").to_string(),
+        _ => day.format("%d %b %Y").to_string(),
     }
 }
 
@@ -1784,6 +2128,10 @@ impl ChatHistoryPanel {
         let mut panel = Self {
             collaboration: None,
             general,
+            agent_mode: false,
+            agent_mode_roots: Vec::new(),
+            agent_current_folder: false,
+            editor_scope: None,
             restored_general: false,
             workspace,
             focus: cx.focus_handle(),
@@ -2221,7 +2569,7 @@ impl ChatHistoryPanel {
                         this.installations = installations;
                         this.chats = catalog.chats;
                         this.library = library;
-                        if restore_scope {
+                        if restore_scope && !this.agent_mode {
                             this.restore_scope(cx);
                         }
                         this.warning = catalog.warnings.first().cloned();
@@ -2431,6 +2779,10 @@ impl ChatHistoryPanel {
     }
 
     fn remember_scope(&mut self, cx: &mut Context<Self>) {
+        if self.agent_mode {
+            self.refilter(cx);
+            return;
+        }
         let key = self.scope_key(cx);
         let scope = self
             .project
@@ -2493,11 +2845,11 @@ impl ChatHistoryPanel {
             .filter(|reader| reader.read(cx).chat.key() == key)
             .collect::<Vec<_>>();
         if !readers.is_empty() {
-            running = readers.iter().any(|reader| {
+            running |= readers.iter().any(|reader| {
                 let reader = reader.read(cx);
                 reader.busy || reader.running
             });
-            needs_input = readers.iter().any(|reader| reader.read(cx).needs_input());
+            needs_input |= readers.iter().any(|reader| reader.read(cx).needs_input());
         }
         (running, needs_input)
     }
@@ -2523,6 +2875,19 @@ impl ChatHistoryPanel {
             .iter()
             .enumerate()
             .filter(|(_, chat)| {
+                if self.agent_mode
+                    && self.agent_current_folder
+                    && self.adding_project.is_none()
+                    && self.project.is_none()
+                    && self.agent_folder.is_none()
+                    && !self.agent_mode_roots.is_empty()
+                    && !self
+                        .agent_mode_roots
+                        .iter()
+                        .any(|root| store::path_contains(&root.to_string_lossy(), &chat.cwd))
+                {
+                    return false;
+                }
                 self.provider
                     .is_none_or(|provider| provider == chat.provider)
                     && self.library.deleted(chat) == (self.trash && self.adding_project.is_none())
@@ -2625,7 +2990,18 @@ impl ChatHistoryPanel {
                     .map(|index| &self.chats[*index])
                     .filter(|chat| self.library.chat_project(chat) == project)
                     .collect::<Vec<_>>();
-                if chats.is_empty() {
+                let show_empty_project = !project.is_empty()
+                    && query.is_empty()
+                    && self.provider.is_none()
+                    && !self.archived
+                    && !self.trash
+                    && !self.quick_chats
+                    && (self.project.as_deref() == Some(project)
+                        || (self.project.is_none()
+                            && self.agent_folder.is_none()
+                            && !self.workspace_projects
+                            && !self.agent_current_folder));
+                if chats.is_empty() && !show_empty_project {
                     continue;
                 }
                 self.library.sort_project_chats(project, &mut chats);
@@ -2689,6 +3065,7 @@ impl ChatHistoryPanel {
                 EditName::Chat(key) => library.chats.entry(key).or_default().title = Some(name),
                 EditName::NewProject => {
                     let id = uuid::Uuid::new_v4().to_string();
+                    library.chat_grouping = store::ChatGrouping::Project;
                     library.projects.push(Project {
                         id: id.clone(),
                         name,
@@ -2710,6 +3087,7 @@ impl ChatHistoryPanel {
             self.edit = None;
             if let Some(id) = new_project {
                 self.project = Some(id.clone());
+                self.agent_current_folder = false;
                 self.agent_folder = None;
                 self.remember_scope(cx);
             }
@@ -3067,7 +3445,25 @@ impl ChatHistoryPanel {
         if activate {
             self.reader = Some(view.downgrade());
             view.update(cx, |view, cx| view.set_unread(false, cx));
-            self.present(view, window, cx);
+            let existing_pane = self
+                .workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace.panes().iter().find_map(|pane| {
+                        pane.read(cx)
+                            .items()
+                            .position(|item| item.item_id() == view.entity_id())
+                            .map(|index| (pane.clone(), index))
+                    })
+                })
+                .ok()
+                .flatten();
+            if let Some((pane, index)) = existing_pane {
+                pane.update(cx, |pane, cx| {
+                    pane.activate_item(index, true, true, window, cx)
+                });
+            } else {
+                self.present(view, window, cx);
+            }
         } else {
             self.workspace
                 .update(cx, |workspace, cx| {
@@ -3081,7 +3477,7 @@ impl ChatHistoryPanel {
     }
 
     fn present(&self, view: Entity<ChatHistoryView>, window: &mut Window, cx: &mut Context<Self>) {
-        let right_mode = self.general || self.library.chat_in_right_panel;
+        let right_mode = self.general || self.agent_mode || self.library.chat_in_right_panel;
         self.workspace
             .update(cx, |workspace, cx| {
                 if right_mode {
@@ -3121,9 +3517,10 @@ impl ChatHistoryPanel {
 
     fn layout_menu(&self, cx: &Context<Self>) -> impl IntoElement {
         let panel = cx.weak_entity();
-        let general = self.general;
+        let general = self.general || self.agent_mode;
         let right = self.library.chat_in_right_panel;
         let grouping = self.library.chat_grouping;
+        let can_add_chats = self.project.is_some() && self.adding_project.is_none();
         let notification_setting = AgentSettings::get_global(cx).notify_when_agent_waiting;
         let sound_setting = AgentSettings::get_global(cx).play_sound_when_agent_done;
         let auto_dismiss = self.library.notification_auto_dismiss;
@@ -3135,11 +3532,27 @@ impl ChatHistoryPanel {
         PopoverMenu::new("chat-layout")
             .trigger(
                 IconButton::new("chat-layout-button", IconName::Filter)
-                    .tooltip(Tooltip::text("Chat layout and notifications")),
+                    .tooltip(Tooltip::text("Chat settings and filters")),
             )
             .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |mut menu, _, _| {
-                    menu = menu.header("Group chats");
+                Some(ContextMenu::build(window, cx, |mut menu, _, cx| {
+                    menu = menu.header("Filters");
+                    if let Some(filters_panel) = panel.upgrade() {
+                        menu = filters_panel.update(cx, |panel, cx| {
+                            let menu = if panel.adding_project.is_none() {
+                                panel.project_filter_menu(menu, cx)
+                            } else {
+                                menu
+                            };
+                            let menu = panel.provider_filter_menu(menu, cx);
+                            if panel.adding_project.is_none() {
+                                panel.status_filter_menu(menu, cx)
+                            } else {
+                                menu
+                            }
+                        });
+                    }
+                    menu = menu.separator().header("View");
                     let demo_panel = panel.clone();
                     menu = menu.entry("Codex ↔ Claude demo", None, move |window, cx| {
                         demo_panel
@@ -3153,8 +3566,8 @@ impl ChatHistoryPanel {
                             .log_err();
                     });
                     for (label, value) in [
-                        ("By date", store::ChatGrouping::Recent),
-                        ("By project", store::ChatGrouping::Project),
+                        ("Chats", store::ChatGrouping::Recent),
+                        ("Projects", store::ChatGrouping::Project),
                         ("By status", store::ChatGrouping::Status),
                     ] {
                         let panel = panel.clone();
@@ -3173,7 +3586,37 @@ impl ChatHistoryPanel {
                                 }),
                         );
                     }
-                    menu = menu.separator();
+                    let projects_panel = panel.clone();
+                    menu = menu
+                        .separator()
+                        .entry("New project", None, move |window, cx| {
+                            projects_panel
+                                .update(cx, |panel, cx| {
+                                    panel.start_name(
+                                        EditName::NewProject,
+                                        String::new(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        });
+                    let add_panel = panel.clone();
+                    menu = menu
+                        .item(
+                            ui::ContextMenuEntry::new("Add existing chats to project")
+                                .disabled(!can_add_chats)
+                                .handler(move |window, cx| {
+                                    add_panel
+                                        .update(cx, |panel, cx| {
+                                            if panel.project.is_some() {
+                                                panel.begin_add_chats(window, cx);
+                                            }
+                                        })
+                                        .log_err();
+                                }),
+                        )
+                        .separator();
                     for (label, right_mode) in
                         [("Editor tabs", false), ("Separate chat panel", true)]
                     {
@@ -3538,15 +3981,18 @@ impl ChatHistoryPanel {
                     .unwrap_or_else(|| "No project".into());
                 let selected = self.library.project_sort(&project);
                 let panel = cx.weak_entity();
+                let add_project = project.clone();
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .px_4()
-                    .pt_4()
-                    .pb_2()
+                    .pt_2()
+                    .pb_1()
                     .gap_2()
                     .child(
                         Icon::new(IconName::Folder)
                             .size(IconSize::Small)
-                            .color(Color::Muted),
+                            .color(Color::Default),
                     )
                     .child(
                         div().flex_1().min_w_0().child(
@@ -3556,6 +4002,19 @@ impl ChatHistoryPanel {
                                 .weight(FontWeight::SEMIBOLD),
                         ),
                     )
+                    .when(!project.is_empty(), |row| {
+                        row.child(
+                            IconButton::new(("project-add-chats", index), IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Add existing chats to this project"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.project = Some(add_project.clone());
+                                    this.agent_current_folder = false;
+                                    this.agent_folder = None;
+                                    this.begin_add_chats(window, cx);
+                                })),
+                        )
+                    })
                     .child(
                         PopoverMenu::new(("project-chat-order", index))
                             .trigger(
@@ -3605,22 +4064,30 @@ impl ChatHistoryPanel {
                     )
                     .into_any_element()
             }
-            Some(ChatRow::Heading(label)) => div()
-                .px_4()
-                .pt_4()
-                .pb_2()
+            Some(ChatRow::Heading(label)) => h_flex()
+                .px_5()
+                .pt_3()
+                .when(index == 0, |row| row.pt_1())
+                .pb_1()
+                .gap_2()
                 .child(
                     Label::new(label)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .weight(FontWeight::SEMIBOLD),
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_px()
+                        .bg(cx.theme().colors().border_variant.opacity(0.6)),
                 )
                 .into_any_element(),
             Some(ChatRow::Chat(chat_index)) => {
                 let chat = self.chats[chat_index].clone();
                 let title = self.library.title(&chat);
                 let project = self.library.chat_project(&chat).to_owned();
-                let manual_order = self.library.chat_grouping == store::ChatGrouping::Project
+                let grouped_by_project = self.library.chat_grouping == store::ChatGrouping::Project;
+                let manual_order = grouped_by_project
                     && self.library.project_sort(&project) == store::ChatSort::Custom
                     && self.adding_project.is_none();
                 let panel_id = cx.entity_id();
@@ -3647,7 +4114,8 @@ impl ChatHistoryPanel {
                     .w_full()
                     .min_w_0()
                     .px_3()
-                    .py_3()
+                    .py_1()
+                    .when(grouped_by_project, |row| row.pl(px(40.)).py_1())
                     .gap_2()
                     .rounded_md()
                     .cursor_pointer()
@@ -3706,28 +4174,10 @@ impl ChatHistoryPanel {
                         ))
                     })
                     .child(
-                        Icon::new(provider_icon(chat.provider))
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap_1()
-                            .child(Label::new(title.clone()).single_line().truncate())
-                            .when(
-                                self.library.chat_grouping != store::ChatGrouping::Project,
-                                |this| {
-                                    this.child(
-                                        Label::new(folder.to_owned())
-                                            .single_line()
-                                            .truncate()
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                },
-                            ),
+                            .child(Label::new(title.clone()).single_line().truncate()),
                     )
                     .when_some(schedule_menu(&chat, cx), |row, menu| row.child(menu))
                     .when(needs_input, |row| {
@@ -3751,6 +4201,17 @@ impl ChatHistoryPanel {
                             )
                         },
                     )
+                    .child(
+                        div()
+                            .id(("chat-provider", index))
+                            .flex_shrink_0()
+                            .child(
+                                Icon::new(provider_icon(chat.provider))
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text(chat.provider.name())),
+                    )
                     .when(self.adding_project.is_none(), |row| {
                         row.child(self.chat_menu(&chat, menu_handle.clone(), cx))
                             .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
@@ -3768,7 +4229,7 @@ impl ChatHistoryPanel {
                             .size(IconSize::Small),
                         )
                     })
-                    .tooltip(Tooltip::text(format!("{title}\n{}", chat.cwd)))
+                    .tooltip(Tooltip::text(format!("{title}\n{folder}\n{}", chat.cwd)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if this.adding_project.is_some() {
                             let key = chat.key();
@@ -3822,46 +4283,38 @@ impl ChatHistoryPanel {
         self.refilter(cx);
     }
 
-    fn provider_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn provider_filter_menu(&self, menu: ContextMenu, cx: &Context<Self>) -> ContextMenu {
         let panel = cx.weak_entity();
         let selected = self.provider;
-        PopoverMenu::new("chat-provider-filter")
-            .trigger(
-                Button::new(
-                    "provider-filter",
-                    selected.map(Provider::name).unwrap_or("All agents"),
-                )
-                .start_icon(
-                    Icon::new(selected.map(provider_icon).unwrap_or(IconName::Chat))
-                        .size(IconSize::Small),
-                )
-                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
-            )
-            .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |mut menu, _, _| {
-                    for provider in [None, Some(Provider::Codex), Some(Provider::Claude)] {
-                        let panel = panel.clone();
-                        menu = menu.item(
-                            ui::ContextMenuEntry::new(
-                                provider.map(Provider::name).unwrap_or("All agents"),
-                            )
-                            .toggle(ui::IconPosition::End, selected == provider)
-                            .handler(move |_, cx| {
-                                panel
-                                    .update(cx, |this, cx| {
-                                        this.provider = provider;
-                                        this.refilter(cx);
-                                    })
-                                    .log_err();
-                            }),
-                        );
-                    }
-                    menu
-                }))
-            })
+        menu.submenu(
+            format!(
+                "Agent: {}",
+                selected.map(Provider::name).unwrap_or("All agents")
+            ),
+            move |mut menu, _, _| {
+                for provider in [None, Some(Provider::Codex), Some(Provider::Claude)] {
+                    let panel = panel.clone();
+                    menu = menu.item(
+                        ui::ContextMenuEntry::new(
+                            provider.map(Provider::name).unwrap_or("All agents"),
+                        )
+                        .toggle(ui::IconPosition::End, selected == provider)
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |this, cx| {
+                                    this.provider = provider;
+                                    this.refilter(cx);
+                                })
+                                .log_err();
+                        }),
+                    );
+                }
+                menu
+            },
+        )
     }
 
-    fn status_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn status_filter_menu(&self, menu: ContextMenu, cx: &Context<Self>) -> ContextMenu {
         let panel = cx.weak_entity();
         let selected = if self.quick_chats {
             3
@@ -3874,52 +4327,46 @@ impl ChatHistoryPanel {
         };
         let label = ["Active", "Archived", "Trash", "Quick chats"][selected];
         let background = self.background;
-        PopoverMenu::new("chat-status-filter")
-            .trigger(
-                Button::new("status-filter", label)
-                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
+        menu.submenu(format!("Status: {label}"), move |mut menu, _, _| {
+            for (index, label) in ["Active", "Archived", "Trash", "Quick chats"]
+                .into_iter()
+                .enumerate()
+            {
+                let panel = panel.clone();
+                menu = menu.item(
+                    ui::ContextMenuEntry::new(label)
+                        .toggle(ui::IconPosition::End, selected == index)
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |this, cx| {
+                                    this.archived = index == 1;
+                                    this.trash = index == 2;
+                                    this.quick_chats = index == 3;
+                                    this.refilter(cx);
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            let panel = panel.clone();
+            menu.separator().item(
+                ui::ContextMenuEntry::new("Include background chats")
+                    .toggle(ui::IconPosition::End, background)
+                    .handler(move |_, cx| {
+                        panel
+                            .update(cx, |this, cx| {
+                                this.background = !background;
+                                this.refilter(cx);
+                            })
+                            .log_err();
+                    }),
             )
-            .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |mut menu, _, _| {
-                    for (index, label) in ["Active", "Archived", "Trash", "Quick chats"]
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let panel = panel.clone();
-                        menu = menu.item(
-                            ui::ContextMenuEntry::new(label)
-                                .toggle(ui::IconPosition::End, selected == index)
-                                .handler(move |_, cx| {
-                                    panel
-                                        .update(cx, |this, cx| {
-                                            this.archived = index == 1;
-                                            this.trash = index == 2;
-                                            this.quick_chats = index == 3;
-                                            this.refilter(cx);
-                                        })
-                                        .log_err();
-                                }),
-                        );
-                    }
-                    let panel = panel.clone();
-                    menu.separator().item(
-                        ui::ContextMenuEntry::new("Include background chats")
-                            .toggle(ui::IconPosition::End, background)
-                            .handler(move |_, cx| {
-                                panel
-                                    .update(cx, |this, cx| {
-                                        this.background = !background;
-                                        this.refilter(cx);
-                                    })
-                                    .log_err();
-                            }),
-                    )
-                }))
-            })
+        })
     }
 
-    fn project_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn project_filter_menu(&self, menu: ContextMenu, cx: &Context<Self>) -> ContextMenu {
         let panel = cx.weak_entity();
+        let agent_mode = self.agent_mode;
         let projects = self.library.projects.clone();
         let selected = self.project.clone();
         let mut agent_folders = self
@@ -3935,6 +4382,9 @@ impl ChatHistoryPanel {
             .find(|project| Some(&project.id) == selected.as_ref())
             .map(|project| project.name.clone())
             .unwrap_or_else(|| {
+                if self.agent_current_folder {
+                    return "Current folder".into();
+                }
                 if let Some(folder) = &self.agent_folder {
                     return format!(
                         "Folder: {}",
@@ -3951,68 +4401,104 @@ impl ChatHistoryPanel {
                 }
                 .into()
             });
-        PopoverMenu::new("chat-projects")
-            .trigger(
-                Button::new("project-picker", label)
-                    .start_icon(Icon::new(IconName::Folder).size(IconSize::Small))
-                    .end_icon(Icon::new(IconName::ChevronDown)),
-            )
-            .menu(move |window, cx| {
-                panel
-                    .update(cx, |panel, cx| panel.sync_library(cx))
-                    .log_err();
-                let library = Library::read(&library_path()).log_err().unwrap_or_default();
-                let projects = library.projects.clone();
-                Some(ContextMenu::build(window, cx, |menu, _, _| {
-                    let mut menu = menu
-                        .entry("All projects", None, {
-                            let panel = panel.clone();
-                            move |_, cx| {
-                                panel
-                                    .update(cx, |panel, cx| {
-                                        panel.project = None;
-                                        panel.workspace_projects = false;
-                                        panel.agent_folder = None;
-                                        panel.remember_scope(cx);
-                                    })
-                                    .log_err();
-                            }
+        menu.submenu(format!("Project: {label}"), move |menu, _, cx| {
+            panel
+                .update(cx, |panel, cx| panel.sync_library(cx))
+                .log_err();
+            let library = Library::read(&library_path()).log_err().unwrap_or_default();
+            let projects = library.projects.clone();
+            let mut menu = menu
+                .entry("All projects", None, {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.project = None;
+                                panel.agent_current_folder = false;
+                                panel.workspace_projects = false;
+                                panel.agent_folder = None;
+                                panel.remember_scope(cx);
+                            })
+                            .log_err();
+                    }
+                })
+                .entry("Workspace projects", None, {
+                    let panel = panel.clone();
+                    move |_, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.project = None;
+                                panel.agent_current_folder = false;
+                                panel.workspace_projects = true;
+                                panel.agent_folder = None;
+                                panel.remember_scope(cx);
+                            })
+                            .log_err();
+                    }
+                });
+            if agent_mode {
+                let panel = panel.clone();
+                menu = menu.entry("Current folder", None, move |_, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.project = None;
+                            panel.workspace_projects = false;
+                            panel.agent_folder = None;
+                            panel.agent_current_folder = true;
+                            panel.refilter(cx);
                         })
-                        .entry("Workspace projects", None, {
-                            let panel = panel.clone();
-                            move |_, cx| {
-                                panel
-                                    .update(cx, |panel, cx| {
-                                        panel.project = None;
-                                        panel.workspace_projects = true;
-                                        panel.agent_folder = None;
-                                        panel.remember_scope(cx);
-                                    })
-                                    .log_err();
-                            }
-                        });
-                    menu = menu.separator().header("Your projects");
-                    for project in &projects {
+                        .log_err();
+                });
+            }
+            menu = menu.separator().header("Your projects");
+            for project in &projects {
+                let panel = panel.clone();
+                let id = project.id.clone();
+                menu = menu.entry(project.name.clone(), None, move |_, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.project = Some(id.clone());
+                            panel.agent_current_folder = false;
+                            panel.agent_folder = None;
+                            panel.remember_scope(cx);
+                        })
+                        .log_err();
+                });
+            }
+            menu = menu.separator().entry("New project…", None, {
+                let panel = panel.clone();
+                move |window, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.start_name(EditName::NewProject, String::new(), window, cx)
+                        })
+                        .log_err();
+                }
+            });
+            if let Some(project) = projects
+                .iter()
+                .find(|project| Some(&project.id) == selected.as_ref())
+            {
+                menu = menu
+                    .entry("Add working folders…", None, {
                         let panel = panel.clone();
                         let id = project.id.clone();
-                        menu = menu.entry(project.name.clone(), None, move |_, cx| {
+                        move |window, cx| {
                             panel
-                                .update(cx, |panel, cx| {
-                                    panel.project = Some(id.clone());
-                                    panel.agent_folder = None;
-                                    panel.remember_scope(cx);
-                                })
+                                .update(cx, |panel, cx| panel.add_folders(id.clone(), window, cx))
                                 .log_err();
-                        });
-                    }
-                    menu = menu.separator().entry("New project…", None, {
+                        }
+                    })
+                    .entry("Rename project…", None, {
                         let panel = panel.clone();
+                        let id = project.id.clone();
+                        let name = project.name.clone();
                         move |window, cx| {
                             panel
                                 .update(cx, |panel, cx| {
                                     panel.start_name(
-                                        EditName::NewProject,
-                                        String::new(),
+                                        EditName::Project(id.clone()),
+                                        name.clone(),
                                         window,
                                         cx,
                                     )
@@ -4020,125 +4506,87 @@ impl ChatHistoryPanel {
                                 .log_err();
                         }
                     });
-                    if let Some(project) = projects
-                        .iter()
-                        .find(|project| Some(&project.id) == selected.as_ref())
-                    {
-                        menu = menu
-                            .entry("Add working folders…", None, {
-                                let panel = panel.clone();
-                                let id = project.id.clone();
-                                move |window, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.add_folders(id.clone(), window, cx)
-                                        })
-                                        .log_err();
-                                }
-                            })
-                            .entry("Rename project…", None, {
-                                let panel = panel.clone();
-                                let id = project.id.clone();
-                                let name = project.name.clone();
-                                move |window, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.start_name(
-                                                EditName::Project(id.clone()),
-                                                name.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                        .log_err();
-                                }
-                            });
-                        for folder in &project.folders {
-                            let panel = panel.clone();
-                            let id = project.id.clone();
-                            let folder = folder.clone();
-                            menu = menu.entry(
-                                format!("Unlink {}", folder.display()),
-                                None,
-                                move |_, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.change_library(
-                                                |library| {
-                                                    if let Some(project) = library
-                                                        .projects
-                                                        .iter_mut()
-                                                        .find(|project| project.id == id)
-                                                    {
-                                                        project
-                                                            .folders
-                                                            .retain(|path| path != &folder);
-                                                    }
-                                                },
-                                                cx,
-                                            )
-                                        })
-                                        .log_err();
-                                },
-                            );
-                        }
-                        menu = menu
-                            .separator()
-                            .entry("Remove project (keep chats)", None, {
-                                let panel = panel.clone();
-                                let id = project.id.clone();
-                                move |_, cx| {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.change_library(
-                                                |library| {
-                                                    library
-                                                        .projects
-                                                        .retain(|project| project.id != id);
-                                                    for options in library.chats.values_mut() {
-                                                        if options.project.as_ref() == Some(&id) {
-                                                            options.project = None;
-                                                        }
-                                                    }
-                                                },
-                                                cx,
-                                            );
-                                            if panel.warning.is_none() {
-                                                panel.project = None;
-                                                panel.refilter(cx);
+                for folder in &project.folders {
+                    let panel = panel.clone();
+                    let id = project.id.clone();
+                    let folder = folder.clone();
+                    menu = menu.entry(
+                        format!("Unlink {}", folder.display()),
+                        None,
+                        move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.change_library(
+                                        |library| {
+                                            if let Some(project) = library
+                                                .projects
+                                                .iter_mut()
+                                                .find(|project| project.id == id)
+                                            {
+                                                project.folders.retain(|path| path != &folder);
                                             }
-                                        })
-                                        .log_err();
-                                }
-                            });
-                    }
-                    if !agent_folders.is_empty() {
+                                        },
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        },
+                    );
+                }
+                menu = menu
+                    .separator()
+                    .entry("Remove project (keep chats)", None, {
                         let panel = panel.clone();
-                        let folders = agent_folders.clone();
-                        menu = menu.separator().submenu(
-                            "Agent working folders",
-                            move |mut menu, _, _| {
-                                for folder in &folders {
-                                    let folder = folder.clone();
-                                    let panel = panel.clone();
-                                    menu = menu.entry(folder.clone(), None, move |_, cx| {
-                                        panel
-                                            .update(cx, |panel, cx| {
-                                                panel.project = None;
-                                                panel.workspace_projects = false;
-                                                panel.agent_folder = Some(folder.clone());
-                                                panel.refilter(cx);
-                                            })
-                                            .log_err();
-                                    });
-                                }
-                                menu
-                            },
-                        );
-                    }
-                    menu
-                }))
-            })
+                        let id = project.id.clone();
+                        move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.change_library(
+                                        |library| {
+                                            library.projects.retain(|project| project.id != id);
+                                            for options in library.chats.values_mut() {
+                                                if options.project.as_ref() == Some(&id) {
+                                                    options.project = None;
+                                                }
+                                            }
+                                        },
+                                        cx,
+                                    );
+                                    if panel.warning.is_none() {
+                                        panel.project = None;
+                                        panel.refilter(cx);
+                                    }
+                                })
+                                .log_err();
+                        }
+                    });
+            }
+            if !agent_folders.is_empty() {
+                let panel = panel.clone();
+                let folders = agent_folders.clone();
+                menu = menu
+                    .separator()
+                    .submenu("Agent working folders", move |mut menu, _, _| {
+                        for folder in &folders {
+                            let folder = folder.clone();
+                            let panel = panel.clone();
+                            menu = menu.entry(folder.clone(), None, move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.project = None;
+                                        panel.agent_current_folder = false;
+                                        panel.workspace_projects = false;
+                                        panel.agent_folder = Some(folder.clone());
+                                        panel.refilter(cx);
+                                    })
+                                    .log_err();
+                            });
+                        }
+                        menu
+                    });
+            }
+            menu
+        })
     }
 }
 
@@ -4203,10 +4651,19 @@ impl Render for ChatHistoryPanel {
             .bg(cx.theme().colors().panel_background)
             .child(
                 h_flex()
-                    .px_4()
-                    .py_3()
+                    .px_3()
+                    .py_2()
                     .justify_between()
-                    .child(Label::new("Chats").weight(FontWeight::SEMIBOLD))
+                    .child(
+                        Label::new(if self.agent_mode {
+                            "Agent Mode"
+                        } else if self.general {
+                            "General · All chats"
+                        } else {
+                            "Chats"
+                        })
+                        .weight(FontWeight::SEMIBOLD),
+                    )
                     .child(div().flex_1())
                     .children(self.installations.iter().map(|(provider, installed)| {
                         div()
@@ -4241,30 +4698,49 @@ impl Render for ChatHistoryPanel {
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
             )
-            .child(
-                h_flex()
-                    .px_3()
-                    .gap_1()
-                    .w_full()
-                    .when(self.adding_project.is_none(), |row| {
-                        row.child(div().flex_1().min_w_0().child(self.project_menu(cx)))
-                    })
-                    .when(self.adding_project.is_some(), |row| {
-                        row.child(Label::new("Add existing chats").weight(FontWeight::SEMIBOLD))
-                    })
-                    .when(
-                        self.project.is_some() && self.adding_project.is_none(),
-                        |row| {
-                            row.child(
-                                IconButton::new("add-project-chats", IconName::Plus)
-                                    .tooltip(Tooltip::text("Add existing chats to this project"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_add_chats(window, cx)
-                                    })),
-                            )
-                        },
-                    ),
-            )
+            .when(self.agent_mode, |this| {
+                this.child(
+                    v_flex()
+                        .px_3()
+                        .pb_2()
+                        .children(self.agent_mode_roots.iter().map(|root| {
+                            let path = root.to_string_lossy().into_owned();
+                            let name = root
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.clone());
+                            div()
+                                .id(SharedString::from(format!("agent-root-{path}")))
+                                .child(
+                                    v_flex()
+                                        .child(
+                                            Label::new(name)
+                                                .weight(FontWeight::SEMIBOLD)
+                                                .single_line()
+                                                .truncate(),
+                                        )
+                                        .child(
+                                            Label::new(path.clone())
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .single_line()
+                                                .truncate(),
+                                        ),
+                                )
+                                .tooltip(Tooltip::text(path))
+                        }))
+                        .when(self.agent_mode_roots.is_empty(), |this| {
+                            this.child(Label::new("No folder open").size(LabelSize::Small))
+                        }),
+                )
+            })
+            .when(self.adding_project.is_some(), |this| {
+                this.child(
+                    div()
+                        .px_3()
+                        .child(Label::new("Add existing chats").weight(FontWeight::SEMIBOLD)),
+                )
+            })
             .when(self.edit.is_some(), |this| {
                 this.child(
                     v_flex()
@@ -4301,16 +4777,6 @@ impl Render for ChatHistoryPanel {
                     .rounded_md()
                     .bg(cx.theme().colors().editor_background)
                     .child(self.filter.clone()),
-            )
-            .child(
-                h_flex()
-                    .px_3()
-                    .gap_2()
-                    .justify_between()
-                    .child(self.provider_menu(cx))
-                    .when(self.adding_project.is_none(), |row| {
-                        row.child(self.status_menu(cx))
-                    }),
             )
             .when(self.adding_project.is_some(), |this| {
                 this.child(
@@ -4549,8 +5015,18 @@ struct PendingApproval {
 }
 
 fn chat_content_style(window: &Window, cx: &App) -> MarkdownStyle {
-    let font_size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
+    let settings = ThemeSettings::get_global(cx);
+    let font_size = settings.agent_ui_font_size(cx);
     let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    // Chat typography is independent of the source editor, including embedded code.
+    for text in [&mut style.inline_code, &mut style.code_block.text] {
+        text.font_family = Some(settings.agent_ui_font_family().clone());
+        text.font_size = Some(font_size.into());
+        text.font_fallbacks = settings.ui_font.fallbacks.clone();
+        text.font_features = Some(settings.ui_font.features.clone());
+        text.font_weight = Some(settings.ui_font.weight);
+        text.line_height = Some(relative(1.5));
+    }
     style.base_text_style.line_height = relative(1.5);
     style.paragraph_line_height = relative(1.5);
     style.inline_code.color = Some(cx.theme().colors().text);
@@ -4576,7 +5052,7 @@ fn chat_content_style(window: &Window, cx: &App) -> MarkdownStyle {
 pub struct ChatHistoryView {
     inline_response: Option<futures::channel::oneshot::Sender<Result<String, String>>>,
     terminal_commands: HashMap<String, (String, bool)>,
-    content_font_sizes: Option<(Pixels, Pixels)>,
+    content_font_sizes: Option<(Pixels, SharedString)>,
     bridge_watch: Task<()>,
     fork_source: Option<Chat>,
     chat: Chat,
@@ -5216,7 +5692,7 @@ impl ChatHistoryView {
                         if this.busy {
                             return false;
                         }
-                        if !changed && this.running != activity.running {
+                        if this.running != activity.running {
                             this.running = activity.running;
                             cx.notify();
                         }
@@ -5718,7 +6194,7 @@ impl ChatHistoryView {
                                         }
                                         suggestion_revision = Some(this.draft_revision);
                                         this.pending_subtasks = this.messages.iter().filter(|entry| {
-                                            store::is_claude_subtask(&entry.message) && entry.message.subtask.as_ref().is_some_and(|task| task.running())
+                                            entry.message.role == "activity" && !entry.message.tool_id.starts_with("task:") && entry.message.subtask.as_ref().is_some_and(|task| task.running())
                                         }).count();
                                         if error.is_none()
                                             && let Some(entry) = outgoing_index.and_then(|index| this.messages.get_mut(index))
@@ -6330,9 +6806,9 @@ impl ChatHistoryView {
         }
         if self.pending_subtasks > 0 {
             return if self.pending_subtasks == 1 {
-                "Waiting for subagent…".into()
+                "Background task running…".into()
             } else {
-                format!("Waiting for {} subagents…", self.pending_subtasks)
+                format!("{} background tasks running…", self.pending_subtasks)
             };
         }
         self.messages
@@ -6744,6 +7220,17 @@ impl ChatHistoryView {
                     menu
                 }))
             })
+    }
+
+    fn open_chat_link(&mut self, link: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        match chat_link_path(&link, &self.chat.cwd) {
+            Ok(Some(path)) => self.open_chat_file(path, true, window, cx),
+            Ok(None) => cx.open_url(&link),
+            Err(error) => {
+                self.error = Some(format!("Cannot open link: {error}"));
+                cx.notify();
+            }
+        }
     }
 
     fn open_chat_file(
@@ -7517,11 +8004,7 @@ impl ChatHistoryView {
                         ),
                         store::MessageBodyPart::Text(text) if user => {
                             let long = text.chars().count() > 700;
-                            let mut style = chat_content_style(window, cx);
-                            let settings = ThemeSettings::get_global(cx);
-                            style.base_text_style.font_size =
-                                settings.agent_buffer_font_size(cx).into();
-                            style = style.with_agent_buffer_font(cx);
+                            let style = chat_content_style(window, cx);
                             v_flex()
                                 .max_w(px(560.))
                                 .when(long, |this| this.w_full())
@@ -7564,7 +8047,15 @@ impl ChatHistoryView {
                                 style.code_block_overflow_x_scroll = false;
                                 style.code_block.text.line_height = Some(relative(1.5));
                                 let reader = reader.clone();
+                                let link_reader = reader.clone();
                                 MarkdownElement::new(markdown, style)
+                                    .on_url_click(move |link, window, cx| {
+                                        link_reader
+                                            .update(cx, |this, cx| {
+                                                this.open_chat_link(link, window, cx);
+                                            })
+                                            .log_err();
+                                    })
                                     .code_block_renderer(markdown::CodeBlockRenderer::Default {
                                         copy_button_visibility:
                                             markdown::CopyButtonVisibility::AlwaysVisible,
@@ -7739,16 +8230,8 @@ impl ChatHistoryView {
                                     }))
                                 })
                                 .child(div().flex_1().min_w_0().overflow_hidden()
-                                    .text_size(if user {
-                                        ThemeSettings::get_global(cx).agent_buffer_font_size(cx)
-                                    } else {
-                                        ThemeSettings::get_global(cx).agent_ui_font_size(cx)
-                                    })
-                                    .font_family(if user {
-                                        ThemeSettings::get_global(cx).agent_buffer_font_family().clone()
-                                    } else {
-                                        ThemeSettings::get_global(cx).agent_ui_font_family().clone()
-                                    })
+                                    .text_size(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+                                    .font_family(ThemeSettings::get_global(cx).agent_ui_font_family().clone())
                                     .line_height(relative(1.5))
                                     .child(body)),
                         )
@@ -7928,6 +8411,32 @@ impl Focusable for ChatHistoryView {
 }
 impl Item for ChatHistoryView {
     type Event = ItemEvent;
+    fn tab_content(
+        &self,
+        params: workspace::item::TabContentParams,
+        _: &Window,
+        cx: &App,
+    ) -> AnyElement {
+        h_flex()
+            .gap_2()
+            .child(
+                Label::new(self.chat.title.clone())
+                    .single_line()
+                    .color(params.text_color()),
+            )
+            .when(self.busy || self.running, |row| {
+                row.child(SpinnerLabel::new())
+            })
+            .when(self.unread && !self.busy && !self.running, |row| {
+                row.child(
+                    div()
+                        .size(px(7.))
+                        .rounded_full()
+                        .bg(cx.theme().colors().text_accent),
+                )
+            })
+            .into_any_element()
+    }
     fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
         self.chat.title.clone().into()
     }
@@ -7946,9 +8455,9 @@ impl Render for ChatHistoryView {
         let settings = ThemeSettings::get_global(cx);
         let font_sizes = (
             settings.agent_ui_font_size(cx),
-            settings.agent_buffer_font_size(cx),
+            settings.agent_ui_font_family().clone(),
         );
-        if self.content_font_sizes != Some(font_sizes) {
+        if self.content_font_sizes.as_ref() != Some(&font_sizes) {
             self.content_font_sizes = Some(font_sizes);
             self.list.remeasure();
         }
@@ -8435,23 +8944,21 @@ impl Render for ChatHistoryView {
                                             text: gpui::TextStyle {
                                                 color: cx.theme().colors().text,
                                                 font_family: settings
-                                                    .agent_buffer_font_family()
+                                                    .agent_ui_font_family()
                                                     .clone(),
                                                 font_fallbacks: settings
-                                                    .buffer_font
+                                                    .ui_font
                                                     .fallbacks
                                                     .clone(),
                                                 font_features: settings
-                                                    .buffer_font
+                                                    .ui_font
                                                     .features
                                                     .clone(),
                                                 font_size: settings
-                                                    .agent_buffer_font_size(cx)
+                                                    .agent_ui_font_size(cx)
                                                     .into(),
-                                                font_weight: settings.buffer_font.weight,
-                                                line_height: relative(
-                                                    settings.buffer_line_height.value(),
-                                                ),
+                                                font_weight: settings.ui_font.weight,
+                                                line_height: relative(1.5),
                                                 ..Default::default()
                                             },
                                             syntax: cx.theme().syntax().clone(),

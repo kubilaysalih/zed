@@ -395,6 +395,8 @@ actions!(
         ActivateLastPane,
         /// Opens the project-independent chat workspace.
         OpenGlobalChats,
+        /// Toggles Agent Mode in the current project.
+        ToggleAgentMode,
         /// Moves focus to the next major region of the window (editor, open
         /// panels, status bar), cycling and wrapping around. Intended as a
         /// discoverable, screen-reader-friendly way to navigate the window.
@@ -1578,6 +1580,13 @@ struct DispatchingKeystrokes {
 /// A `Workspace` usually consists of 1 or more projects, a central pane group, 3 docks and a status bar.
 /// The `Workspace` owns everybody's state and serves as a default, "global context",
 /// that can be used to register a global action to be triggered from any place in the window.
+struct AgentModeState {
+    docks: DockStructure,
+    zoomed: Option<AnyWeakView>,
+    zoomed_position: Option<DockPosition>,
+    maximized_pane: Option<WeakEntity<Pane>>,
+}
+
 pub struct Workspace {
     weak_self: WeakEntity<Self>,
     workspace_actions: Vec<Box<dyn Fn(Div, &Workspace, &mut Window, &mut Context<Self>) -> Div>>,
@@ -1597,6 +1606,8 @@ pub struct Workspace {
     status_bar: Entity<StatusBar>,
     activity_bar: Entity<PanelButtons>,
     global_chat_mode: bool,
+    agent_mode: Option<AgentModeState>,
+    agent_mode_files_visible: bool,
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
@@ -2025,6 +2036,7 @@ impl Workspace {
                 if last_title_settings != Some(title_settings) {
                     this.update_window_title(window, cx);
                 }
+                cx.notify();
                 cx.refresh_windows();
             }),
             cx.subscribe_in(
@@ -2105,6 +2117,8 @@ impl Workspace {
             status_bar,
             activity_bar: left_dock_buttons,
             global_chat_mode: false,
+            agent_mode: None,
+            agent_mode_files_visible: false,
             modal_layer,
             toast_layer,
             titlebar_item: None,
@@ -2910,6 +2924,35 @@ impl Workspace {
         self.global_chat_mode
     }
 
+    pub fn agent_mode(&self) -> bool {
+        self.agent_mode.is_some()
+    }
+
+    pub fn set_agent_mode(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if enabled == self.agent_mode() {
+            return;
+        }
+        if enabled {
+            self.agent_mode = Some(AgentModeState {
+                docks: self.capture_dock_state(window, cx),
+                zoomed: self.zoomed.take(),
+                zoomed_position: self.zoomed_position.take(),
+                maximized_pane: self.maximized_pane.take(),
+            });
+            for dock in self.all_docks() {
+                dock.update(cx, |dock, cx| dock.set_open(false, window, cx));
+            }
+        } else if let Some(saved) = self.agent_mode.take() {
+            self.set_dock_structure(saved.docks, window, cx);
+            self.zoomed = saved.zoomed;
+            self.zoomed_position = saved.zoomed_position;
+            self.maximized_pane = saved.maximized_pane;
+            self.focus_center_pane(window, cx);
+        }
+        self.agent_mode_files_visible = false;
+        cx.notify();
+    }
+
     pub fn set_global_chat_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.global_chat_mode = enabled;
         cx.notify();
@@ -2919,13 +2962,14 @@ impl Workspace {
         &mut self,
         multi_workspace: WeakEntity<MultiWorkspace>,
         active_workspace_id: Rc<Cell<EntityId>>,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
         self.status_bar.update(cx, |status_bar, cx| {
             status_bar.set_multi_workspace(multi_workspace.clone(), cx);
         });
         self.multi_workspace = Some(multi_workspace);
         self.active_workspace_id = Some(active_workspace_id);
+        cx.notify();
     }
 
     pub fn app_state(&self) -> &Arc<AppState> {
@@ -6335,6 +6379,12 @@ impl Workspace {
                     SplitMode::EmptyPane => {
                         self.split_pane(pane.clone(), *direction, window, cx);
                     }
+                    SplitMode::NewGroup => {
+                        let new_pane = self.add_pane(window, cx);
+                        self.center.split_group(pane, &new_pane, *direction, cx);
+                        window.focus(&new_pane.focus_handle(cx), cx);
+                        cx.notify();
+                    }
                     SplitMode::MovePane => {
                         self.split_and_move(pane.clone(), *direction, window, cx);
                     }
@@ -6359,6 +6409,7 @@ impl Workspace {
                     pane.track_alternate_file_items();
                 });
                 if *local || *focus_changed {
+                    self.center.reveal_pane(pane);
                     self.reveal_center_after_activation(window, cx);
                 }
                 if *local {
@@ -7940,7 +7991,9 @@ impl Workspace {
                     members,
                     flexes,
                     bounding_boxes: _,
+                    is_group_separator,
                 }) => SerializedPaneGroup::Group {
+                    is_group_separator: *is_group_separator,
                     axis: SerializedAxis(*axis),
                     children: members
                         .iter()
@@ -8894,63 +8947,15 @@ impl Workspace {
             return content.into_any_element();
         }
         let frame_color = self.pane_frame_color(cx);
-        div()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
-            .p(px(3.0))
-            .bg(frame_color)
-            .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .rounded(px(6.0))
-                    .overflow_hidden()
-                    .child(content)
-                    // GPUI clips children to rectangles; cover the corner wedges after painting them.
-                    .child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, _, window, _| {
-                                let radius = px(6.0)
-                                    .min(bounds.size.width / 2.0)
-                                    .min(bounds.size.height / 2.0);
-                                if radius <= px(0.0) {
-                                    return;
-                                }
-                                let control = radius * (1.0 - 0.55228475);
-                                let mut path = gpui::PathBuilder::fill();
-                                for (corner, horizontal, vertical) in [
-                                    (bounds.origin, 1.0, 1.0),
-                                    (gpui::point(bounds.right(), bounds.top()), -1.0, 1.0),
-                                    (gpui::point(bounds.right(), bounds.bottom()), -1.0, -1.0),
-                                    (gpui::point(bounds.left(), bounds.bottom()), 1.0, -1.0),
-                                ] {
-                                    path.move_to(corner);
-                                    path.line_to(
-                                        corner + gpui::point(radius * horizontal, px(0.0)),
-                                    );
-                                    path.cubic_bezier_to(
-                                        corner + gpui::point(px(0.0), radius * vertical),
-                                        corner + gpui::point(control * horizontal, px(0.0)),
-                                        corner + gpui::point(px(0.0), control * vertical),
-                                    );
-                                    path.close();
-                                }
-                                if let Some(path) = path.build().log_err() {
-                                    window.paint_path(path, frame_color);
-                                }
-                            },
-                        )
-                        .absolute()
-                        .inset_0()
-                        .size_full(),
-                    ),
-            )
-            .into_any_element()
+        frame_pane_group(content, frame_color)
     }
 
     fn filling_dock(&self, cx: &App) -> Option<DockPosition> {
+        if self.agent_mode() && !self.agent_mode_files_visible {
+            if self.right_dock.read(cx).visible_panel().is_some_and(|panel| panel.fills_empty_workspace(cx)) {
+                return Some(DockPosition::Right);
+            }
+        }
         if self
             .center
             .panes()
@@ -9004,8 +9009,10 @@ impl Workspace {
         };
         let dock_is_open = dock.read(cx).is_open();
         let a11y_active = window.is_a11y_active();
-        let frame_resize_handle = if dock_is_open
-            && WorkspaceSettings::get_global(cx).pane_layout != settings::PaneLayout::Flat
+        let collapsed_by_drag = dock.read(cx).collapsed_by_drag();
+        let frame_resize_handle = if collapsed_by_drag
+            || (dock_is_open
+                && WorkspaceSettings::get_global(cx).pane_layout != settings::PaneLayout::Flat)
         {
             dock.update(cx, |dock, cx| {
                 dock.resizable(cx).then(|| dock.resize_handle(true, cx))
@@ -9030,10 +9037,21 @@ impl Workspace {
             .child(if dock_is_open {
                 self.frame_pane(dock.clone(), cx)
             } else {
-                dock.clone().into_any_element()
+                div()
+                    .size_0()
+                    .overflow_hidden()
+                    .child(dock.clone())
+                    .into_any_element()
             })
             .children(leader_border)
-            .children(frame_resize_handle);
+            .children(frame_resize_handle)
+            .when(!dock_is_open, |this| {
+                let this = this.min_w_0().min_h_0();
+                match position {
+                    DockPosition::Left | DockPosition::Right => this.w(px(0.)),
+                    DockPosition::Bottom => this.h(px(0.)),
+                }
+            });
 
         // Apply sizing only when the dock is open. When closed the dock is still
         // included in the element tree so its focus handle remains mounted — without
@@ -9243,18 +9261,15 @@ impl Workspace {
             })
             .size_full()
             .child(
-                self.frame_pane(
-                    self.center
-                        .render(
-                            self.zoomed.as_ref(),
-                            self.maximized_pane.as_ref(),
-                            render_cx,
-                            window,
-                            cx,
-                        )
-                        .into_any_element(),
-                    cx,
-                ),
+                self.center
+                    .render(
+                        self.zoomed.as_ref(),
+                        self.maximized_pane.as_ref(),
+                        render_cx,
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
             )
     }
 
@@ -9356,6 +9371,7 @@ impl Workspace {
     fn reveal_center_after_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A sidebar may activate an editor while its own entity is still borrowed.
         cx.defer_in(window, |workspace, window, cx| {
+            workspace.agent_mode_files_visible = true;
             workspace.reveal_collapsed_center(window, cx);
             workspace.serialize_workspace(window, cx);
             cx.notify();
@@ -9382,9 +9398,6 @@ impl Workspace {
             let Some(panel) = dock.read(cx).visible_panel().cloned() else {
                 continue;
             };
-            if !panel.fills_empty_workspace(cx) {
-                continue;
-            }
             let size = self
                 .dock_size(dock.read(cx), window, cx)
                 .unwrap_or_default();
@@ -10080,6 +10093,7 @@ impl Render for Workspace {
             app_state: &self.app_state,
             project: &self.project,
             workspace: &self.weak_self,
+            frame_color: separated_panes.then_some(frame_color),
         };
 
         div()
@@ -10145,7 +10159,7 @@ impl Render for Workspace {
                         h_flex()
                             .flex_1()
                             .min_h_0()
-                            .when(!self.global_chat_mode, |this| {
+                            .when(!self.global_chat_mode && !self.agent_mode(), |this| {
                                 this.child(self.activity_bar.clone())
                             })
                             .child(
@@ -10165,6 +10179,8 @@ impl Render for Workspace {
                                     .border_color(colors.border)
                                     .when(separated_panes, |this| {
                                         this.bg(frame_color).border_color(frame_color)
+                                            .pr(PANE_FRAME_PADDING)
+                                            .when(self.agent_mode() || self.global_chat_mode, |this| this.pl(PANE_FRAME_PADDING))
                                     })
                                     .child({
                                         let this = cx.entity();
@@ -16220,6 +16236,7 @@ mod tests {
                 app_state: &workspace.app_state,
                 project: &workspace.project,
                 workspace: &workspace.weak_self,
+                frame_color: None,
             },
             window,
             cx,
@@ -16569,6 +16586,83 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_mode_updates_folder_color_without_switching_modes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/agent-color"), json!({
+            ".gitignore": ".zed/",
+            ".zed": { "settings.json": r##"{"folder_color":"#FF3333"}"## }
+        })).await;
+        let project = Project::test(fs.clone(), [path!("/agent-color").as_ref()], cx).await;
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            let mut workspace = Workspace::test_new(project, window, cx);
+            workspace.set_agent_mode(true, window, cx);
+            workspace
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.agent_mode());
+            assert_eq!(workspace.pane_frame_color(cx), gpui::rgb(0xFF3333).into());
+        });
+        fs.save(path!("/agent-color/.zed/settings.json").as_ref(),
+            &r##"{"folder_color":"#3366FF"}"##.into(), Default::default()).await.unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.agent_mode());
+            assert_eq!(workspace.pane_frame_color(cx), gpui::rgb(0x3366FF).into());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_mode_keeps_project_files_and_restores_docks(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/agent-project"), serde_json::json!({"notes.md": "hello"})).await;
+        let project = Project::test(fs, [path!("/agent-project").as_ref()], cx).await;
+        let (workspace, cx) = cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            let right = cx.new(|cx| {
+                let mut panel = TestPanel::new_flexible(DockPosition::Right, 200, cx);
+                panel.fills_empty_workspace = true;
+                panel
+            });
+            workspace.add_panel(left, window, cx);
+            workspace.add_panel(right, window, cx);
+            workspace.finish_dock_restoration(cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        let (pane, roots) = workspace.read_with(cx, |workspace, cx| (workspace.active_pane().clone(), workspace.root_paths(cx)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.left_dock.read(cx).is_open());
+            assert!(!workspace.right_dock.read(cx).is_open());
+            workspace.set_agent_mode(true, window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            assert_eq!(workspace.project(), &project);
+            assert_eq!(workspace.root_paths(cx), roots);
+            assert!(!workspace.global_chat_mode());
+            assert_eq!(workspace.active_pane(), &pane);
+            assert_eq!(pane.read(cx).items_len(), 1);
+            assert_eq!(workspace.filling_dock(cx), Some(DockPosition::Right));
+        });
+        pane.update_in(cx, |pane, window, cx| pane.activate_item(0, true, true, window, cx));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.agent_mode());
+            assert_eq!(workspace.filling_dock(cx), None, "files can open without leaving Agent Mode");
+            workspace.set_agent_mode(false, window, cx);
+            assert!(!workspace.agent_mode());
+            assert!(workspace.left_dock.read(cx).is_open());
+            assert!(!workspace.right_dock.read(cx).is_open());
+            assert_eq!(workspace.root_paths(cx), roots);
+            assert_eq!(pane.read(cx).items_len(), 1);
+        });
+    }
+
+    #[gpui::test]
     async fn test_empty_editor_chat_dock_keeps_sidebar_visible_after_resize(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -16679,6 +16773,138 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_selecting_content_reopens_editor_above_empty_bottom_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.resize_bottom_dock(workspace.bounds.size.height - px(8.), window, cx);
+        });
+        cx.run_until_parked();
+        let collapsed = cx.debug_bounds("bottom-dock").unwrap().size.height;
+        assert!(collapsed > px(500.));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, false, false, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("bottom-dock").unwrap().size.height,
+            collapsed
+        );
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, true, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("bottom-dock").unwrap().size.height <= px(350.));
+    }
+
+    #[gpui::test]
+    async fn test_outer_pane_preserves_inner_splits(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            let first = workspace.active_pane().clone();
+            let second = workspace.split_pane(first.clone(), SplitDirection::Down, window, cx);
+            let outer = workspace.add_pane(window, cx);
+            workspace
+                .center
+                .split_group(&first, &outer, SplitDirection::Right, cx);
+            let inner = workspace.split_pane(outer.clone(), SplitDirection::Right, window, cx);
+            let Member::Axis(groups) = &workspace.center.root else {
+                panic!("missing outer groups")
+            };
+            assert!(groups.is_group_separator);
+            assert_eq!(groups.members.len(), 2);
+            assert!(groups.members[0].contains_pane(&first));
+            assert!(groups.members[0].contains_pane(&second));
+            let Member::Axis(splits) = &groups.members[1] else {
+                panic!("missing inner splits")
+            };
+            assert!(!splits.is_group_separator);
+            assert_eq!(splits.members.len(), 2);
+            assert!(splits.members[0].contains_pane(&outer));
+            assert!(splits.members[1].contains_pane(&inner));
+            workspace
+                .center
+                .remove(&inner, cx)
+                .expect("remove inner split");
+            let Member::Axis(groups) = &workspace.center.root else {
+                panic!("outer group was removed")
+            };
+            assert!(groups.is_group_separator);
+            assert_eq!(groups.members.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_outer_pane_collapses_without_gap_and_reveals_selected_item(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.pane_layout = Some(settings::PaneLayout::Separated)
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let first = workspace.update_in(cx, |workspace, window, cx| {
+            let first = workspace.active_pane().clone();
+            let item = cx.new(TestItem::new);
+            workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            let second = workspace.add_pane(window, cx);
+            workspace
+                .center
+                .split_group(&first, &second, SplitDirection::Right, cx);
+            first
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let before = workspace.read_with(cx, |workspace, _| {
+            workspace.center.bounding_box_for_pane(&first).unwrap()
+        });
+        let start = gpui::point(before.right() - px(1.), before.top() + px(100.));
+        let end = gpui::point(before.left() + px(1.), start.y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            start - gpui::point(px(10.), px(0.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let collapsed = workspace.read_with(cx, |workspace, _| {
+            workspace.center.bounding_box_for_pane(&first).unwrap()
+        });
+        assert_eq!(collapsed.size.width, Pixels::ZERO);
+        first.update_in(cx, |pane, window, cx| {
+            pane.activate_item(0, true, true, window, cx)
+        });
+        cx.run_until_parked();
+        let restored = workspace.read_with(cx, |workspace, _| {
+            workspace.center.bounding_box_for_pane(&first).unwrap()
+        });
+        assert!(restored.size.width > px(300.));
+    }
+
+    #[gpui::test]
     async fn test_framed_right_dock_drag_spans_gap_and_reopens_from_edge(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -16713,10 +16939,10 @@ mod tests {
         cx.run_until_parked();
         let collapsed = cx.debug_bounds("right-dock").expect("collapsed dock");
         assert!(
-            collapsed.size.width <= px(10.),
+            collapsed.size.width == px(0.),
             "dock did not collapse: {collapsed:?}"
         );
-        let start = gpui::point(collapsed.left() + px(1.), collapsed.top() + px(100.));
+        let start = gpui::point(collapsed.left() - px(1.), collapsed.top() + px(100.));
         let end = start - gpui::point(px(300.), px(0.));
         cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_move(
@@ -21533,4 +21759,62 @@ mod tests {
             self.zoomed = zoomed;
         }
     }
+}
+
+const PANE_FRAME_PADDING: Pixels = px(3.0);
+
+/// Frame a complete tab group, including its shared tab strip and active content.
+pub(crate) fn frame_pane_group(content: impl IntoElement, frame_color: Hsla) -> AnyElement {
+    div()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .p(PANE_FRAME_PADDING)
+        .bg(frame_color)
+        .child(
+            div()
+                .relative()
+                .size_full()
+                .rounded(px(6.0))
+                .overflow_hidden()
+                .child(content)
+                // GPUI clips children to rectangles; cover the corner wedges after painting them.
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds, _, window, _| {
+                            let radius = px(6.0)
+                                .min(bounds.size.width / 2.0)
+                                .min(bounds.size.height / 2.0);
+                            if radius <= px(0.0) {
+                                return;
+                            }
+                            let control = radius * (1.0 - 0.55228475);
+                            let mut path = gpui::PathBuilder::fill();
+                            for (corner, horizontal, vertical) in [
+                                (bounds.origin, 1.0, 1.0),
+                                (gpui::point(bounds.right(), bounds.top()), -1.0, 1.0),
+                                (gpui::point(bounds.right(), bounds.bottom()), -1.0, -1.0),
+                                (gpui::point(bounds.left(), bounds.bottom()), 1.0, -1.0),
+                            ] {
+                                path.move_to(corner);
+                                path.line_to(corner + gpui::point(radius * horizontal, px(0.0)));
+                                path.cubic_bezier_to(
+                                    corner + gpui::point(px(0.0), radius * vertical),
+                                    corner + gpui::point(control * horizontal, px(0.0)),
+                                    corner + gpui::point(px(0.0), control * vertical),
+                                );
+                                path.close();
+                            }
+                            if let Some(path) = path.build().log_err() {
+                                window.paint_path(path, frame_color);
+                            }
+                        },
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                ),
+        )
+        .into_any_element()
 }

@@ -290,6 +290,7 @@ pub struct Dock {
     panel_entries: Vec<PanelEntry>,
     workspace: WeakEntity<Workspace>,
     is_open: bool,
+    collapsed_by_drag: bool,
     active_panel_index: Option<usize>,
     focus_handle: FocusHandle,
     restoration: DockRestoreState,
@@ -415,7 +416,7 @@ fn resize_panel_entry(
     window: &mut Window,
     cx: &mut App,
 ) -> (&'static str, PanelSizeState) {
-    let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
+    let size = size.map(|size| size.max(Pixels::ZERO).round());
     let uses_flexible_width = panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx);
     if uses_flexible_width {
         entry.size_state.flex = flex;
@@ -457,6 +458,7 @@ impl Dock {
                 panel_entries: Default::default(),
                 active_panel_index: None,
                 is_open: false,
+                collapsed_by_drag: false,
                 focus_handle: focus_handle.clone(),
                 _subscriptions: [focus_subscription, zoom_subscription],
                 restoration: DockRestoreState::Restoring { pending: None },
@@ -579,6 +581,7 @@ impl Dock {
     }
 
     pub fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed_by_drag = false;
         if open != self.is_open {
             self.restoration.discard_pending();
         }
@@ -1135,6 +1138,14 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if size.is_some_and(|size| size <= RESIZE_HANDLE_SIZE) {
+            self.set_open(false, window, cx);
+            self.collapsed_by_drag = true;
+            return;
+        }
+        if self.collapsed_by_drag {
+            self.set_open(true, window, cx);
+        }
         if self.should_resize_all_panels(cx) {
             self.resize_all_panels(size, flex, window, cx);
         } else {
@@ -1279,6 +1290,10 @@ impl Dock {
 }
 
 impl Dock {
+    pub(crate) fn collapsed_by_drag(&self) -> bool {
+        self.collapsed_by_drag
+    }
+
     // In framed mode the hit area spans the entire gap, including the adjacent frame.
     pub(crate) fn resize_handle(&self, framed: bool, cx: &mut Context<Self>) -> AnyElement {
         let handle = div()
@@ -1312,7 +1327,13 @@ impl Dock {
             DockPosition::Left => deferred(
                 handle
                     .absolute()
-                    .right(if framed { px(-3.) } else { px(0.) })
+                    .right(if self.collapsed_by_drag {
+                        px(-12.)
+                    } else if framed {
+                        px(-3.)
+                    } else {
+                        px(0.)
+                    })
                     .top(px(0.))
                     .h_full()
                     .w(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
@@ -1321,7 +1342,13 @@ impl Dock {
             DockPosition::Bottom => deferred(
                 handle
                     .absolute()
-                    .top(if framed { px(-3.) } else { px(0.) })
+                    .top(if self.collapsed_by_drag {
+                        px(-12.)
+                    } else if framed {
+                        px(-3.)
+                    } else {
+                        px(0.)
+                    })
                     .left(px(0.))
                     .w_full()
                     .h(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
@@ -1331,7 +1358,13 @@ impl Dock {
                 handle
                     .absolute()
                     .top(px(0.))
-                    .left(if framed { px(-3.) } else { px(0.) })
+                    .left(if self.collapsed_by_drag {
+                        px(-12.)
+                    } else if framed {
+                        px(-3.)
+                    } else {
+                        px(0.)
+                    })
                     .h_full()
                     .w(if framed { px(12.) } else { RESIZE_HANDLE_SIZE })
                     .cursor_col_resize(),

@@ -5,7 +5,11 @@ impl GutterDimensions {
     /// use alongside 'justify_end' and `gutter_width` to
     /// right align content with the line numbers
     pub fn fold_area_width(&self) -> Pixels {
-        self.margin + self.right_padding
+        if self.ai_width > Pixels::ZERO {
+            self.right_padding - self.ai_width
+        } else {
+            self.margin + self.right_padding
+        }
     }
 }
 
@@ -58,6 +62,7 @@ impl EditorSnapshot {
         if folded || (is_foldable && (row_contains_cursor || self.gutter_hovered)) {
             Some(
                 Disclosure::new(("gutter_crease", buffer_row.0), !folded)
+                    .shape(ui::IconButtonShape::Square)
                     .toggle_state(folded)
                     .on_click(window.listener_for(&editor, move |this, _e, window, cx| {
                         if folded {

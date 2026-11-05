@@ -154,6 +154,7 @@ pub(crate) fn build_serialized_pane_layout(pane_group: &Member, cx: &App) -> Ser
             members,
             flexes,
             bounding_boxes: _,
+            is_group_separator: _,
         }) => SerializedPaneLayout::Group {
             axis: *axis,
             children: members

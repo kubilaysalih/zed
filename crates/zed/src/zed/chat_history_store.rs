@@ -78,11 +78,13 @@ impl ClaudeSubtask {
 pub fn claude_async_subtask(value: &Value, block: &Value) -> Option<ClaudeSubtask> {
     let result = &value["toolUseResult"];
     let output = content_text(&block["content"]);
-    let structured = result["isAsync"] == true || result["status"] == "async_launched";
+    let background_id = result["backgroundTaskId"].as_str();
+    let monitor_id = output.starts_with("Monitor started (task ").then(|| result["taskId"].as_str()).flatten();
+    let structured = result["isAsync"] == true || result["status"] == "async_launched" || background_id.is_some() || monitor_id.is_some();
     if !structured && !output.starts_with("Async agent launched successfully.") {
         return None;
     }
-    let id = result["agentId"].as_str().or_else(|| {
+    let id = background_id.or(monitor_id).or_else(|| result["agentId"].as_str()).or_else(|| {
         output
             .lines()
             .find_map(|line| line.strip_prefix("agentId: ")?.split_whitespace().next())
@@ -141,6 +143,45 @@ pub struct ClaudeSubtasks {
 }
 
 impl ClaudeSubtasks {
+    fn observe_notification(&mut self, text: &str, timestamp: &str) {
+        let Some(notification) = task_notification(text, timestamp) else { return };
+        self.observe(&notification);
+        if let Some(status) = notification.subtask.as_ref().map(|task| &task.status) {
+            for id in text.split("<task-id>").skip(1)
+                .filter_map(|part| part.split_once("</task-id>").map(|(id, _)| id.trim()))
+            {
+                for task in self.tasks.values_mut().filter(|task| task.id == id) {
+                    task.status = status.clone();
+                }
+            }
+        }
+    }
+
+    fn observe_status_record(&mut self, value: &Value) {
+        if value["isSidechain"] == true || !value["parent_tool_use_id"].is_null() {
+            return;
+        }
+        if value["type"] == "attachment"
+            && value["attachment"]["type"] == "queued_command"
+            && value["attachment"]["commandMode"] == "task-notification"
+            && let Some(text) = value["attachment"]["prompt"].as_str()
+        {
+            self.observe_notification(text, &string(value, "timestamp"));
+        }
+        if value["type"] == "user" {
+            self.observe_notification(&content_text(&value["message"]["content"]), &string(value, "timestamp"));
+        }
+        let result = &value["toolUseResult"];
+        if value["type"] == "user"
+            && let Some(id) = result["task_id"].as_str()
+            && result["message"].as_str().is_some_and(|message| message.starts_with(&format!("Successfully stopped task: {id} ")))
+        {
+            for task in self.tasks.values_mut().filter(|task| task.id == id) {
+                task.status = "stopped".into();
+            }
+        }
+    }
+
     pub fn pending(&self) -> usize {
         self.tasks.values().filter(|task| task.running()).count()
     }
@@ -265,6 +306,7 @@ impl ClaudeSubtasks {
             let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                 continue;
             };
+            self.observe_status_record(&value);
             if !matches!(value["type"].as_str(), Some("user" | "system"))
                 || value["isSidechain"] == true
                 || !value["parent_tool_use_id"].is_null()
@@ -1809,6 +1851,9 @@ pub fn task_notification(text: &str, timestamp: &str) -> Option<Message> {
         status = "waiting".into();
     }
     let event = field("event");
+    if status.is_empty() && event.starts_with("[Monitor expired after ") {
+        status = "stopped".into();
+    }
     let summary = field("summary");
     if id.is_empty() || (status.is_empty() && event.is_empty() && summary.is_empty()) {
         return None;
@@ -1875,6 +1920,9 @@ pub fn claude_skill_message(value: &Value) -> Option<Message> {
 }
 
 fn visible_message(provider: Provider, value: &Value) -> Option<Message> {
+    if provider == Provider::Claude && value["isCompactSummary"] == true {
+        return None;
+    }
     if provider == Provider::Claude
         && let Some(message) = claude_skill_message(value)
     {
@@ -2818,6 +2866,9 @@ pub fn transcript(chat: &Chat, limit: usize) -> Result<Transcript> {
             value["parent_tool_use_id"] = Value::Null;
         }
         transcript.metrics.observe(chat.provider, &value);
+        if chat.provider == Provider::Claude {
+            subtasks.observe_status_record(&value);
+        }
         if chat.provider == Provider::Codex
             && let Some(running) = codex_turn_running(&value)
         {
@@ -3048,6 +3099,77 @@ mod tests {
             json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Waiting for the agent."}],"stop_reason":"end_turn"}}),
             json!({"type":"system","subtype":"turn_duration"}),
         ]
+    }
+
+    #[test]
+    fn orphan_task_notification_stops_every_listed_task() {
+        let mut tasks = ClaudeSubtasks::default();
+        for id in ["job-1", "job-2"] {
+            tasks.tasks.insert(id.into(), ClaudeSubtask { id: id.into(), status: "running".into() });
+        }
+        tasks.observe_status_record(&json!({"type":"user","message":{"role":"user","content":"<task-notification><task-id>job-1</task-id><task-id>job-2</task-id><task-id>__orphan_summary__:shell</task-id><status>stopped</status><summary>Previous session ended</summary></task-notification>"}}));
+        assert_eq!(tasks.pending(), 0);
+    }
+
+    #[test]
+    fn background_command_survives_silence_and_completes_from_queued_notification() {
+        let fixture = Fixture::new();
+        let mut rows = vec![
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"shell-call","name":"Bash","input":{"run_in_background":true}}],"stop_reason":"tool_use"}}),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"shell-call","content":"Command running in background"}]},"toolUseResult":{"backgroundTaskId":"job-1"}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Export is running."}],"stop_reason":"end_turn"}}),
+        ];
+        let path = fixture.write("background.jsonl", &rows);
+        let chat = metadata(path.clone(), Provider::Claude, false, &HashMap::new()).expect("chat");
+        File::options().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - std::time::Duration::from_secs(600))).unwrap();
+        let before = chat_activity(&chat, None).unwrap();
+        assert!(before.running);
+        assert!(chat_activity(&chat, Some(&before)).unwrap().running);
+        assert_eq!(transcript(&chat, 1).unwrap().pending_subtasks, 1);
+        rows.push(json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification><task-id>job-1</task-id><status>completed</status><summary>Export done</summary></task-notification>"}}));
+        fixture.write("background.jsonl", &rows);
+        assert!(!chat_activity(&chat, Some(&before)).unwrap().running);
+        assert!(!transcript(&chat, 1).unwrap().running);
+    }
+
+    #[test]
+    fn monitor_events_keep_work_running_until_expiry_or_task_stop() {
+        let fixture = Fixture::new();
+        let mut rows = vec![
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"monitor-call","name":"Monitor","input":{}}],"stop_reason":"tool_use"}}),
+            json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"monitor-call","content":"Monitor started (task watch-1, expires in 30m)"}]},"toolUseResult":{"taskId":"watch-1","timeoutMs":1800000}}),
+            json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Texture stage started."}],"stop_reason":"end_turn"}}),
+        ];
+        let path = fixture.write("monitor.jsonl", &rows);
+        let chat = metadata(path, Provider::Claude, false, &HashMap::new()).unwrap();
+        let before = chat_activity(&chat, None).unwrap();
+        assert!(before.running);
+        rows.push(json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification><task-id>watch-1</task-id><event>Textures 3/45</event></task-notification>"}}));
+        fixture.write("monitor.jsonl", &rows);
+        assert!(chat_activity(&chat, Some(&before)).unwrap().running);
+        let active_rows = rows.clone();
+        rows.push(json!({"type":"attachment","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification><task-id>watch-1</task-id><event>[Monitor expired after 30m with 3 events delivered.]</event></task-notification>"}}));
+        fixture.write("monitor.jsonl", &rows);
+        assert!(!chat_activity(&chat, None).unwrap().running);
+        assert_eq!(transcript(&chat, 20).unwrap().pending_subtasks, 0);
+        let mut rows = active_rows;
+        rows.push(json!({"type":"user","toolUseResult":{"task_id":"watch-1","message":"Successfully stopped task: watch-1 (monitor)"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"stop-call","content":"stopped"}]}}));
+        rows.push(json!({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Stopped."}],"stop_reason":"end_turn"}}));
+        fixture.write("monitor.jsonl", &rows);
+        assert!(!chat_activity(&chat, None).unwrap().running);
+        assert_eq!(transcript(&chat, 20).unwrap().pending_subtasks, 0);
+    }
+
+    #[test]
+    fn claude_compact_summary_is_hidden_without_hiding_a_users_pasted_summary() {
+        let text = "This session is being continued from a previous conversation that ran out of context.\nSummary: private context";
+        let mut value = json!({"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"timestamp":"2026-11-05T19:11:30Z","message":{"role":"user","content":text}});
+        assert!(records(Provider::Claude, &value).is_empty());
+        assert!(human_message_time(Provider::Claude, &value).is_none());
+        value["isCompactSummary"] = json!(false);
+        assert_eq!(records(Provider::Claude, &value)[0].text, text);
+        assert!(human_message_time(Provider::Claude, &value).is_some());
     }
 
     #[test]

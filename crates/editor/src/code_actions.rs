@@ -336,10 +336,10 @@ impl Editor {
         icon_size: ui::IconSize,
         display_row: DisplayRow,
         is_active: bool,
+        show_ai: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let show_tooltip = !self.context_menu_visible();
-        let show_ai = self.inline_ai_available(cx);
         let code_actions = IconButton::new("inline_code_actions", ui::IconName::BoltFilled)
             .icon_size(icon_size)
             .shape(ui::IconButtonShape::Square)
@@ -378,6 +378,7 @@ impl Editor {
             }))
             .into_any_element();
         h_flex()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(self.has_available_code_actions_for_selection(), |this| {
                 this.child(code_actions)
             })
@@ -386,8 +387,6 @@ impl Editor {
                     IconButton::new("inline_ai_selection", ui::IconName::Sparkle)
                         .icon_size(icon_size)
                         .shape(ui::IconButtonShape::Square)
-                        .icon_color(ui::Color::Default)
-                        .hover_color(ui::Color::Default)
                         .tooltip(Tooltip::for_action_title(
                             "Ask AI Inline",
                             &zed_actions::assistant::InlineAssist::default(),
@@ -402,6 +401,58 @@ impl Editor {
                         })),
                 )
             })
+            .into_any_element()
+    }
+
+    pub(super) fn select_gutter_ai_target(
+        &mut self,
+        target: Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.snapshot(window, cx);
+        let point = target.to_point(&snapshot);
+        let selection = self.selections.newest::<Point>(&snapshot.display_snapshot);
+        let last_selected_row = if !selection.is_empty() && selection.end.column == 0 {
+            selection.end.row.saturating_sub(1)
+        } else {
+            selection.end.row
+        };
+        if !(selection.start.row..=last_selected_row).contains(&point.row) {
+            self.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([point..point]);
+            });
+        }
+    }
+
+    pub(super) fn render_gutter_ai_action(
+        &self,
+        target: Anchor,
+        display_row: DisplayRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                IconButton::new(("gutter_ai", display_row.0), ui::IconName::Sparkle)
+                    .icon_size(ui::IconSize::XSmall)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_color(ui::Color::Default)
+                    .hover_color(ui::Color::Default)
+                    .tooltip(Tooltip::for_action_title(
+                        "Ask AI Inline",
+                        &zed_actions::assistant::InlineAssist::default(),
+                    ))
+                    .on_click(cx.listener(move |editor, _, window, cx| {
+                        cx.stop_propagation();
+                        editor.select_gutter_ai_target(target, window, cx);
+                        window.focus(&editor.focus_handle(cx), cx);
+                        window.dispatch_action(
+                            Box::new(zed_actions::assistant::InlineAssist::default()),
+                            cx,
+                        );
+                    })),
+            )
             .into_any_element()
     }
 

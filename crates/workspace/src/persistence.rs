@@ -2313,11 +2313,25 @@ impl WorkspaceDb {
         .map(|(group_id, axis, pane_id, active, pinned_count, flexes)| {
             let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
             if let Some((group_id, axis)) = group_id.zip(axis) {
-                let flexes = flexes
-                    .map(|flexes: String| serde_json::from_str::<Vec<f32>>(&flexes))
+                let layout = flexes
+                    .map(|flexes: String| serde_json::from_str::<serde_json::Value>(&flexes))
                     .transpose()?;
+                let is_group_separator = layout
+                    .as_ref()
+                    .and_then(|layout| layout.get("is_group_separator"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let flexes = layout
+                    .map(|layout| {
+                        serde_json::from_value::<Option<Vec<f32>>>(
+                            layout.get("flexes").cloned().unwrap_or(layout),
+                        )
+                    })
+                    .transpose()?
+                    .flatten();
 
                 Ok(SerializedPaneGroup::Group {
+                    is_group_separator,
                     axis,
                     children: self.get_pane_group(workspace_id, Some(group_id))?,
                     flexes,
@@ -2355,12 +2369,20 @@ impl WorkspaceDb {
                 axis,
                 children,
                 flexes,
+                is_group_separator,
             } => {
                 let (parent_id, position) = parent.unzip();
 
-                let flex_string = flexes
-                    .as_ref()
-                    .map(|flexes| serde_json::json!(flexes).to_string());
+                let flex_string = if *is_group_separator {
+                    Some(
+                        serde_json::json!({"flexes": flexes, "is_group_separator": true})
+                            .to_string(),
+                    )
+                } else {
+                    flexes
+                        .as_ref()
+                        .map(|flexes| serde_json::json!(flexes).to_string())
+                };
 
                 let group_id = conn.select_row_bound::<_, i64>(sql!(
                     INSERT INTO pane_groups(
@@ -3398,6 +3420,7 @@ mod tests {
     fn group(axis: Axis, children: Vec<SerializedPaneGroup>) -> SerializedPaneGroup {
         SerializedPaneGroup::Group {
             axis: SerializedAxis(axis),
+            is_group_separator: false,
             flexes: None,
             children,
         }
@@ -3480,6 +3503,19 @@ mod tests {
 
         let round_trip_workspace = db.workspace_for_roots(&["/tmp", "/tmp2"]);
         assert_eq!(workspace, round_trip_workspace.unwrap());
+
+        let mut framed_workspace = workspace.clone();
+        if let SerializedPaneGroup::Group {
+            is_group_separator, ..
+        } = &mut framed_workspace.center_group
+        {
+            *is_group_separator = true;
+        }
+        db.save_workspace(framed_workspace.clone()).await;
+        assert_eq!(
+            Some(framed_workspace),
+            db.workspace_for_roots(&["/tmp", "/tmp2"])
+        );
 
         assert!(db.delete_workspace_by_id(workspace.id).await.is_ok());
         assert!(db.recent_navigation_history(workspace.id).is_empty());

@@ -43,6 +43,7 @@ fn build_serialized_pane_group(
             members,
             flexes,
             bounding_boxes: _,
+            is_group_separator: _,
         }) => SerializedPaneGroup::Group {
             axis: SerializedAxis(*axis),
             children: members

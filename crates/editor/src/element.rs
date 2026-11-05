@@ -75,7 +75,7 @@ use smallvec::{SmallVec, smallvec};
 use std::{
     any::TypeId,
     borrow::Cow,
-    cell::Cell,
+    cell::{Cell, RefCell},
     cmp::{self, Ordering},
     fmt::{self, Write},
     iter, mem,
@@ -2084,13 +2084,27 @@ impl EditorElement {
         }
 
         let icon_size = ui::IconSize::XSmall;
-        let mut slot_columns = 4;
+        let selection = self
+            .editor
+            .read(cx)
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot);
+        let has_selection = !selection.is_empty();
+        let buffer_point = if has_selection {
+            selection.start
+        } else {
+            display_point.to_point(&snapshot.display_snapshot)
+        };
+        let show_ai = has_selection && self.editor.read(cx).inline_ai_available(cx);
+        let has_code_actions = self
+            .editor
+            .read(cx)
+            .has_available_code_actions_for_selection();
+        let slot_columns = if show_ai && has_code_actions { 7 } else { 4 };
+        let new_display_row =
+            snapshot.display_row_for_inline_actions(buffer_point, slot_columns)?;
         let mut button = self.editor.update(cx, |editor, cx| {
-            if editor.has_available_code_actions_for_selection() && editor.inline_ai_available(cx) {
-                slot_columns = 7;
-            }
-            if !editor.has_available_code_actions_for_selection() && !editor.inline_ai_available(cx)
-            {
+            if !has_code_actions && !(has_selection && show_ai) {
                 return None;
             }
             let active = editor
@@ -2109,12 +2123,14 @@ impl EditorElement {
                     }
                 })
                 .is_some_and(|source| matches!(source, CodeActionSource::Indicator(..)));
-            Some(editor.render_inline_code_actions(icon_size, display_point.row(), active, cx))
+            Some(editor.render_inline_code_actions(
+                icon_size,
+                display_point.row(),
+                active,
+                show_ai,
+                cx,
+            ))
         })?;
-
-        let buffer_point = display_point.to_point(&snapshot.display_snapshot);
-        let new_display_row =
-            snapshot.display_row_for_inline_actions(buffer_point, slot_columns)?;
 
         let start_y = content_origin.y
             + (((new_display_row.as_f64() - scroll_position.y) as f32) * line_height)
@@ -2132,6 +2148,37 @@ impl EditorElement {
             window,
             cx,
         );
+        Some(button)
+    }
+
+    fn layout_gutter_ai_action(
+        &self,
+        display_row: DisplayRow,
+        gutter_origin: gpui::Point<Pixels>,
+        gutter_dimensions: &GutterDimensions,
+        scroll_position: gpui::Point<ScrollOffset>,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if gutter_dimensions.ai_width <= px(0.) {
+            return None;
+        }
+        let mut button = self.editor.update(cx, |editor, cx| {
+            let target = editor
+                .snapshot(window, cx)
+                .display_point_to_anchor(DisplayPoint::new(display_row, 0), Bias::Right);
+            editor.render_gutter_ai_action(target, display_row, cx)
+        });
+        let button_size = button.layout_as_root(AvailableSpace::min_size(), window, cx);
+        let origin = point(
+            gutter_origin.x + gutter_dimensions.width - gutter_dimensions.ai_width
+                + (gutter_dimensions.ai_width - button_size.width) / 2.,
+            gutter_origin.y
+                + ((display_row.as_f64() - scroll_position.y) as f32) * line_height
+                + (line_height - button_size.height) / 2.,
+        );
+        button.prepaint_as_root(origin, AvailableSpace::min_size(), window, cx);
         Some(button)
     }
 
@@ -2952,6 +2999,7 @@ impl EditorElement {
                 };
 
                 let segment = LineNumberSegment {
+                    display_row,
                     shaped_line,
                     hitbox,
                 };
@@ -5353,10 +5401,14 @@ impl EditorElement {
 
         for line_layout in layout.line_numbers.values() {
             for LineNumberSegment {
+                display_row,
                 shaped_line,
                 hitbox,
             } in &line_layout.segments
             {
+                if layout.gutter_indicator_rows.contains(display_row) {
+                    continue;
+                }
                 let Some(hitbox) = hitbox else {
                     continue;
                 };
@@ -7045,6 +7097,7 @@ impl EditorElement {
 }
 
 struct Gutter<'a> {
+    indicator_rows: RefCell<HashSet<DisplayRow>>,
     line_height: Pixels,
     range: Range<DisplayRow>,
     scroll_position: gpui::Point<ScrollOffset>,
@@ -7117,7 +7170,14 @@ impl Gutter<'_> {
         let git_gutter_width = EditorElement::gutter_strip_width(self.line_height, cx)
             + self.dimensions.git_blame_entries_width.unwrap_or_default();
 
-        let x = git_gutter_width + px(2.);
+        let line_number_width =
+            self.dimensions.width - self.dimensions.left_padding - self.dimensions.right_padding;
+        let x = if self.snapshot.buffer_snapshot().is_singleton() && line_number_width > px(0.) {
+            self.indicator_rows.borrow_mut().insert(row);
+            self.dimensions.left_padding + (line_number_width - indicator_size.width) / 2.
+        } else {
+            git_gutter_width + px(2.)
+        };
 
         let mut y = Pixels::from(
             (row.as_f64() - self.scroll_position.y) * ScrollPixelOffset::from(self.line_height),
@@ -8616,8 +8676,26 @@ impl Element for EditorElement {
                     let em_layout_width = window.text_system().em_layout_width(font_id, font_size);
                     let glyph_grid_cell = size(em_advance, line_height);
 
-                    let gutter_dimensions =
+                    let mut gutter_dimensions =
                         snapshot.gutter_dimensions(font_id, font_size, style, window, cx);
+                    if snapshot.show_gutter
+                        && self.split_side.is_none()
+                        && self.editor.read(cx).inline_ai_available(cx)
+                    {
+                        let width = IconSize::XSmall.square(window, cx) + px(4.);
+                        gutter_dimensions.ai_width = width;
+                        let fold_width = if snapshot.buffer_snapshot().is_singleton()
+                            && EditorSettings::get_global(cx).gutter.folds
+                        {
+                            IconSize::Small.square(window, cx) + px(4.)
+                        } else {
+                            px(0.)
+                        };
+                        let extra_width =
+                            (width + fold_width - gutter_dimensions.right_padding).max(px(0.));
+                        gutter_dimensions.width += extra_width;
+                        gutter_dimensions.right_padding += extra_width;
+                    }
                     let text_width = bounds.size.width - gutter_dimensions.width;
 
                     let settings = EditorSettings::get_global(cx);
@@ -9080,6 +9158,7 @@ impl Element for EditorElement {
                     }
 
                     let gutter = Gutter {
+                        indicator_rows: RefCell::default(),
                         line_height,
                         range: start_row..end_row,
                         scroll_position,
@@ -9507,6 +9586,33 @@ impl Element for EditorElement {
 
                     let mut inline_blame_layout = None;
                     let mut inline_code_actions = None;
+                    let mut gutter_ai_action = None;
+                    if let Some(display_row) = self.editor.read(cx).hovered_gutter_ai_row
+                        && self
+                            .editor
+                            .read(cx)
+                            .selections
+                            .newest::<Point>(&snapshot.display_snapshot)
+                            .is_empty()
+                        && (start_row..end_row).contains(&display_row)
+                        && !row_block_types.contains_key(&display_row)
+                        && row_infos
+                            .get((display_row.0 - start_row.0) as usize)
+                            .is_some_and(|info| {
+                                info.buffer_row.is_some()
+                                    && !info.diff_status.is_some_and(|status| status.is_deleted())
+                            })
+                    {
+                        gutter_ai_action = self.layout_gutter_ai_action(
+                            display_row,
+                            gutter_hitbox.bounds.origin,
+                            &gutter_dimensions,
+                            scroll_position,
+                            line_height,
+                            window,
+                            cx,
+                        );
+                    }
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
                         if (start_row..end_row).contains(&display_row)
@@ -9787,7 +9893,16 @@ impl Element for EditorElement {
                         + gutter_dimensions
                             .git_blame_entries_width
                             .unwrap_or_default();
-                    let available_width = gutter_dimensions.left_padding - git_gutter_width;
+                    let line_number_width = gutter_dimensions.width
+                        - gutter_dimensions.left_padding
+                        - gutter_dimensions.right_padding;
+                    let available_width = if snapshot.buffer_snapshot().is_singleton()
+                        && line_number_width > px(0.)
+                    {
+                        line_number_width
+                    } else {
+                        gutter_dimensions.left_padding - git_gutter_width
+                    };
 
                     let max_line_number_length = self
                         .editor
@@ -10009,6 +10124,7 @@ impl Element for EditorElement {
                         &mut line_layouts,
                     );
 
+                    let gutter_indicator_rows = gutter.indicator_rows.into_inner();
                     let position_map = Rc::new(PositionMap {
                         size: bounds.size,
                         visible_row_range,
@@ -10063,11 +10179,13 @@ impl Element for EditorElement {
                         document_colors,
                         line_elements,
                         line_numbers,
+                        gutter_indicator_rows,
                         blamed_display_rows,
                         inline_diagnostics,
                         point_diagnostic_underline_offset,
                         inline_blame_layout,
                         inline_code_actions,
+                        gutter_ai_action,
                         blocks,
                         spacer_blocks,
                         cursors,
@@ -10176,6 +10294,11 @@ impl Element for EditorElement {
                         if layout.gutter_hitbox.size.width > Pixels::ZERO {
                             self.paint_gutter_highlights(layout, window, cx);
                             self.paint_gutter_indicators(layout, window, cx);
+                            window.paint_layer(layout.gutter_hitbox.bounds, |window| {
+                                if let Some(button) = layout.gutter_ai_action.as_mut() {
+                                    button.paint(window, cx);
+                                }
+                            });
                         }
 
                         if !layout.blocks.is_empty() {
@@ -10279,12 +10402,14 @@ pub struct EditorLayout {
     highlighted_rows: BTreeMap<DisplayRow, LineHighlight>,
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
+    gutter_indicator_rows: HashSet<DisplayRow>,
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
     blamed_display_rows: Option<Vec<AnyElement>>,
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
     point_diagnostic_underline_offset: Pixels,
     inline_blame_layout: Option<InlineBlameLayout>,
     inline_code_actions: Option<AnyElement>,
+    gutter_ai_action: Option<AnyElement>,
     blocks: Vec<BlockLayout>,
     spacer_blocks: Vec<BlockLayout>,
     highlighted_ranges: Vec<(Range<DisplayPoint>, Hsla)>,
@@ -10321,6 +10446,7 @@ impl EditorLayout {
 
 #[derive(Debug)]
 struct LineNumberSegment {
+    display_row: DisplayRow,
     shaped_line: ShapedLine,
     hitbox: Option<Hitbox>,
 }
@@ -11726,6 +11852,7 @@ mod tests {
             width: px(30.0),
             margin: Pixels::ZERO,
             git_blame_entries_width: None,
+            ai_width: Pixels::ZERO,
         };
         const EMPTY_ROW_INFO: RowInfo = RowInfo {
             buffer_id: None,
@@ -11754,6 +11881,7 @@ mod tests {
 
         const HITBOX: Hitbox = placeholder_hitbox();
         Gutter {
+            indicator_rows: RefCell::default(),
             line_height,
             range: DisplayRow(0)..DisplayRow(6),
             scroll_position: gpui::Point::default(),
@@ -12728,6 +12856,109 @@ mod tests {
             narrow_label_origin.x < wide_label_origin.x,
             "expected inline label to recompute its horizontal position for the wrapped row"
         );
+    }
+
+    #[gpui::test]
+    fn test_gutter_fold_and_ai_hitboxes_stay_outside_line_numbers(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("fn sample() {\n    let value = 1;\n}\n", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let editor = window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.draw(Default::default(), size(px(600.), px(240.)), |_, _| {
+            editor.clone().into_any_element()
+        });
+        cx.draw(Default::default(), size(px(600.), px(240.)), |_, _| {
+            gpui::canvas(
+                move |_, window, cx| {
+                    let dimensions = editor.read(cx).gutter_dimensions;
+                    assert!(dimensions.ai_width > px(0.));
+                    let mut fold = ui::Disclosure::new("test-fold", true)
+                        .shape(ui::IconButtonShape::Square)
+                        .into_any_element();
+                    let fold_size = fold.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let mut ai = editor.update(cx, |editor, cx| {
+                        let target = editor.snapshot(window, cx).display_point_to_anchor(
+                            DisplayPoint::new(DisplayRow(0), 0),
+                            Bias::Right,
+                        );
+                        editor.render_gutter_ai_action(target, DisplayRow(0), cx)
+                    });
+                    let ai_size = ai.layout_as_root(AvailableSpace::min_size(), window, cx);
+                    let number_end = dimensions.width - dimensions.right_padding;
+                    let fold_start =
+                        number_end + (dimensions.fold_area_width() - fold_size.width) / 2.;
+                    let ai_start = dimensions.width - dimensions.ai_width
+                        + (dimensions.ai_width - ai_size.width) / 2.;
+                    assert!(
+                        fold_start >= number_end,
+                        "fold hover overlaps the line number"
+                    );
+                    assert!(
+                        fold_start + fold_size.width <= ai_start,
+                        "fold and AI hover areas overlap"
+                    );
+                    assert!(
+                        ai_start + ai_size.width <= dimensions.width,
+                        "AI hover overlaps code"
+                    );
+                },
+                |_, _, _, _| {},
+            )
+            .size_full()
+        });
+    }
+
+    #[gpui::test]
+    fn test_inline_ai_selection_actions_without_language_server(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer =
+                MultiBuffer::build_simple("\n    let value = 1;\n    use_value(value);\n", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let editor = window.root(cx).unwrap();
+        window
+            .update(cx, |editor, window, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([Point::new(1, 4)..Point::new(2, 20)]);
+                });
+            })
+            .unwrap();
+        let style = editor.update(cx, |editor, cx| editor.style(cx).clone());
+        let element = EditorElement::new(&editor, style.clone());
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        cx.draw(Default::default(), size(px(600.), px(240.)), |_, _| {
+            gpui::canvas(
+                move |_, window, cx| {
+                    assert!(!editor.read(cx).has_available_code_actions_for_selection());
+                    let snapshot = editor.update(cx, |editor, cx| editor.snapshot(window, cx));
+                    let head = Point::new(2, 20).to_display_point(&snapshot.display_snapshot);
+                    let button = element.layout_inline_code_actions(
+                        head,
+                        point(px(100.), px(0.)),
+                        Default::default(),
+                        Default::default(),
+                        px(20.),
+                        &snapshot,
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        button.is_some(),
+                        "a selection must expose AI without LSP code actions"
+                    );
+                    assert_eq!(
+                        snapshot.display_row_for_inline_actions(Point::new(1, 4), 7),
+                        Some(DisplayRow(0))
+                    );
+                },
+                |_, _, _, _| {},
+            )
+            .size_full()
+        });
     }
 
     #[gpui::test]

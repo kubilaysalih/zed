@@ -37,6 +37,7 @@ pub struct Tab {
     close_side: TabCloseSide,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
+    content_padding: Option<Pixels>,
     children: SmallVec<[AnyElement; 2]>,
 }
 
@@ -52,6 +53,7 @@ impl Tab {
             close_side: TabCloseSide::End,
             start_slot: None,
             end_slot: None,
+            content_padding: None,
             children: SmallVec::new(),
         }
     }
@@ -78,6 +80,11 @@ impl Tab {
 
     pub fn content_height(cx: &App) -> Pixels {
         DynamicSpacing::Base32.px(cx) - px(1.)
+    }
+
+    pub fn content_padding(mut self, padding: Pixels) -> Self {
+        self.content_padding = Some(padding);
+        self
     }
 
     pub fn container_height(cx: &App) -> Pixels {
@@ -170,7 +177,7 @@ impl RenderOnce for Tab {
                     .group("")
                     .relative()
                     .h(Tab::content_height(cx))
-                    .px(DynamicSpacing::Base04.px(cx))
+                    .px(self.content_padding.unwrap_or_else(|| DynamicSpacing::Base04.px(cx)))
                     .gap(DynamicSpacing::Base04.rems(cx))
                     .text_color(text_color)
                     .child(start_slot)

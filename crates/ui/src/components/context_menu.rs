@@ -1242,6 +1242,7 @@ impl ContextMenu {
             this.close_submenu(false, cx);
 
             if should_dismiss_parent {
+                this.clicked = true;
                 cx.emit(DismissEvent);
             }
         });
@@ -2453,11 +2454,17 @@ mod tests {
         });
 
         for (left, opens_left) in [(px(40.), false), (px(460.), true)] {
+            let selections = Rc::new(Cell::new(0));
             let window = cx.open_window(size(px(700.), px(400.)), |window, cx| {
+                let selections = selections.clone();
                 let menu = ContextMenu::build(window, cx, |menu, _, _| {
-                    menu.submenu("First", |menu, _, _| {
-                        menu.submenu("Nested", |menu, _, _| {
-                            menu.entry("Submenu entry", None, |_, _| {})
+                    menu.submenu("First", move |menu, _, _| {
+                        let selections = selections.clone();
+                        menu.submenu("Nested", move |menu, _, _| {
+                            let selections = selections.clone();
+                            menu.entry("Submenu entry", None, move |_, _| {
+                                selections.set(selections.get() + 1);
+                            })
                         })
                     })
                 });
@@ -2468,6 +2475,13 @@ mod tests {
                 .update(cx, |view, _, _| view.menu.clone())
                 .expect("submenu window");
             let mut visual = VisualTestContext::from_window(window.into(), cx);
+            let dismiss_events = Rc::new(Cell::new(0));
+            let _subscription = visual.update(|_, cx| {
+                let dismiss_events = dismiss_events.clone();
+                cx.subscribe(&menu, move |_, _: &DismissEvent, _| {
+                    dismiss_events.set(dismiss_events.get() + 1);
+                })
+            });
 
             visual.update(|window, cx| window.draw(cx).clear(cx));
             let trigger = menu.read_with(&visual, |menu, _| {
@@ -2479,6 +2493,13 @@ mod tests {
             });
             visual.simulate_mouse_move(trigger.center(), None, Modifiers::default());
             visual.update(|window, cx| window.draw(cx).clear(cx));
+            visual.simulate_click(trigger.center(), Modifiers::default());
+            visual.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(
+                dismiss_events.get(),
+                0,
+                "Opening a submenu must keep its parent open"
+            );
 
             menu.read_with(&visual, |menu, _| {
                 let trigger = menu
@@ -2543,6 +2564,23 @@ mod tests {
                 assert!(submenu.left() >= px(8.));
                 assert!(submenu.right() <= px(692.));
             });
+            let option_center = child.read_with(&visual, |child, _| {
+                child
+                    .submenu_bounds
+                    .get()
+                    .expect("nested submenu bounds")
+                    .center()
+            });
+            visual.simulate_click(option_center, Modifiers::default());
+            assert_eq!(
+                selections.get(),
+                1,
+                "The submenu option must receive the click"
+            );
+            assert!(
+                dismiss_events.get() > 0,
+                "Selecting an option dismisses the menu"
+            );
         }
     }
 
