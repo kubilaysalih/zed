@@ -7,22 +7,24 @@ This fork extends Zed with a shared home for local **Codex and Claude Code conve
 
 The features below describe changes in this fork. The original Zed README follows afterward.
 
-## Latest updates — custom Windows build 1.28.0.33
+## Latest updates — custom Windows build 1.28.0.86
 
-- **Agent Mode** in the current workspace, preserving the open folders and showing their names and paths. Switch back through the command palette without going through General.
-- A shared compact sidebar in normal and Agent modes, with smaller date headings and separators. Project, agent, status, and grouping controls live in the top-right settings menu; filters use aligned native submenus.
-- Drag chat tabs between separate chat panes and the editor's tab bar while retaining the open conversation and its running/unread indicators.
-- Compact editor gutters with separate fold and AI hit areas, AI actions for hovered lines, and restored selection actions. Breakpoint indicators share the line-number area.
-- Correct workspace colors on initial opening and mode changes, readable **Sign In** text, and consistent outer spacing in separated pane layouts.
-- Improved background-task activity indicators, compact Claude continuation summaries, and local Markdown-link opening. Project Search results now include file icons, match highlights, counts, and a viewport scrollbar.
+- **Pane placement:** splits and tab drops follow the selected direction. Empty pane handles can move the existing pane; clicking a center pane selects it for newly opened files and chats. Stable pane IDs preserve custom layouts across restarts.
+- **Workspace layout:** the default is code on the left, agents on the right, and terminal below. Agent Mode hides the code area. Closing panes, switching the navigation sidebar, and running code blocks keep the remaining content accessible.
+- **Chat delivery:** local Codex writer conflicts can use the existing Desktop connection. Failed peer deliveries return a reason to the sender; explicit retries are not lost to duplicate detection. Retry is available in the message menu.
+- **Goals and activity:** goal creation and edits appear in history, with stalled, paused, completed, and limit states in the goal card. Codex owns goal continuations. Authentication errors, child-agent activity, and unconfirmed stale activity remain distinct.
+- **Conversation controls:** model and effort can be selected during work for the next turn. Local renames update the provider title; sidebar refreshes preserve scroll position. Mentions render as clickable provider-and-title chips.
+- **Remote Codex chats on Windows:** imported conversations show connection status and reconnect controls. Live messages, image-only inputs, attachments, and completed replies survive synchronization and reopening.
+- **Source Control:** a unified file tree uses colored status letters and tooltips. Fetch/Push and Commit share a footer that wraps in narrow panels; grouping remains optional.
+- **Terminal and browser behavior:** code-block controls hide the terminal startup handshake. Codex and Claude use their own browser integrations. The Windows launch helper starts Zed independently of the caller's process tree.
 
 ## Local Codex and Claude chats
 
 - Browse local histories across folders in a native **Chats** panel, with provider icons, search, provider filters, pins, and Active / Archived / Trash / Background views. Background sessions are hidden by default.
 - Start a new conversation, resume an existing one, or **Continue in a copy**. Replies stream directly into the chat; permission requests and questions have explicit response controls. Sessions owned by another application are not forcibly taken over.
 - Questions support selectable answers, free text, and skipping. Permission cards show the reason, command, and working directory, with technical details collapsed. Codex connections respect the installed client's approval and sandbox configuration.
-- Use **`/goal <objective>`** in Codex chats to start a goal, optionally with **`/goal --budget <tokens> <objective>`**. Status, pause, resume, and clear commands are supported; the goal indicator appears only when a goal exists.
-- Rename, pin, archive, restore, and move chats to manually created projects. Trash is reversible. These organization changes are stored locally in this fork; they do not rename, archive, or delete chats in the original applications.
+- Use **`/goal <objective>`** in Codex chats to start a goal, optionally with **`/goal --budget <tokens> <objective>`**. Status, pause, resume, and clear commands are supported. **Edit goal** changes the objective or budget without replacing the message draft or resuming a paused goal. The card displays provider-reported stalled and limit states; Zed does not generate extra goal-continuation prompts.
+- Rename, pin, archive, restore, and move chats to manually created projects. Local chat renames update Codex or Claude's stored title; remote renames must currently be made in Codex. Pins, project assignments, archive, and trash are stored locally in this fork. Trash is reversible.
 - Group chats by date, by your own projects, or **By status**: Pinned, In progress, Input required, Unread, and Ready. Each project supports **Newest first** or **Custom · drag to reorder** sorting. Project-grouped rows omit the redundant project subtitle.
 - Open the filter/settings button at the top right of **Chats** or **Agent Mode** to choose **Project**, **Agent**, and **Status**. Each opens a native submenu; the current selection appears in its label. Under **View**, **Chats** groups by date, **Projects** groups by project, and **By status** groups by activity. Date headings use smaller muted text, shortened dates, and separators.
 - Time-based ordering follows the latest human message, so streaming replies and background activity do not continually rearrange the sidebar.
@@ -59,7 +61,9 @@ The features below describe changes in this fork. The original Zed README follow
 
 - Local Codex and Claude agents can discover conversations through `zed_chats.list_chats`, read them with `zed_chats.read_chat`, and consult them with `zed_chats.send_message`. No manual linking is required; a conversation can consult multiple recipients, and Zed opens a recipient when needed.
 - Right-click a sidebar conversation and choose **Copy chat reference** to copy its title, provider, conversation identifiers, and working directory for another agent.
-- Each recipient has its own message queue. Delivery waits until that chat is ready, preserving its existing writer and leaving drafts, pending questions, and permissions undisturbed. Repeated message IDs are deduplicated, and another application's writer lock is never forcibly bypassed.
+- Each recipient has its own message queue. Delivery waits until that chat is ready, preserving its existing writer and leaving drafts, pending questions, and permissions undisturbed. Successful or pending message IDs are deduplicated; an explicitly retried failed delivery gets a new attempt identity. Zed never forcibly takes over another application's writer lock. On Windows, a local Codex chat may send through its existing Desktop owner instead.
+- A queued acknowledgement is not proof of delivery. Delivery errors return to the sending chat and appear beneath the failed message; **Retry** and **Send in a new copy** are in its menu. Ambiguous delivery failures are not automatically resent.
+- Claude Desktop-owned chats can call a scoped local helper for chat discovery, reading, and sending. The helper rejects disconnected capabilities; transport instructions stay out of message bubbles.
 - Peer messages display their source with a provider icon and a compact card instead of raw transport instructions. There is no fixed conversation-turn limit; agents send follow-ups when needed rather than automatically echoing every response.
 - Use **Fork conversation** in the sidebar menu to continue with the same earlier context in an independent conversation. Chats settings also includes a **Codex ↔ Claude demo** that creates two new chats for a design discussion.
 
@@ -86,15 +90,19 @@ Collaboration is local to the running app. Pending deliveries are held in memory
 
 - Choose **Editor tabs** or **Separate chat panel** in Chats settings. The separate panel can sit beside the code editor, with the file tree on the left and independent code-editor splits in the center.
 - Open multiple chats as distinct tabs with editor-style appearance. Drag tabs to reorder or move between chat panes, split right/down, resize dividers, and zoom a pane.
-- Drag a chat tab onto the editor's tab bar to place it alongside files, or drag it back into a chat pane. The same conversation view is moved, preserving its state; clicking it in the sidebar focuses its existing location.
+- Drag a chat tab onto the editor's tab bar to place it alongside files, or drag it back into a chat pane. The same conversation view is moved, preserving its state.
 - Splits can be nested independently, including two chats above one wider chat. Tab context menus provide closing controls, and the saved layout retains the split tree.
 - Move the chat panel between supported dock positions. Chat-only layouts fill the available area when the window resizes, while the left sidebar remains accessible and resizable.
+- The three-line pane handle detaches the active tab; drag it to choose a destination edge. When the pane is empty, the handle moves that existing pane. Dock-level **Move panel** handles move the dock. Moving a tab or pane preserves its terminal or conversation.
+- Click a center pane, including an empty one, to select where new files and chats open. This changes the opening target without an extra active-pane highlight.
+- Drag the separators to resize the resulting layout. Closed panels keep their saved location when reopened. Use **Ctrl+Shift+P → Reset Panel Layout** to return to the default arrangement.
 - The duplicate conversation header is removed. The project-directory shortcut and conversation options are available in the composer.
 
 ## Multi-repository Source Control
 
 - Repositories under an opened folder appear in separate collapsible sections, each with its own changes, history, staging controls, and commit draft. The **History** icon sits beside the view-options button and **Stage All**; a back button returns to changes without a permanent tab row.
 - Tree mode is the default, with file-type icons, folder disclosure arrows, compact rows, and sticky ancestor folders that track the scroll position. Explicit existing view preferences remain respected.
+- File rows show colored **U/M/A/D/R/C/T** status letters with tooltips. Tracked and untracked files share one tree by default; status grouping can be enabled in view options. Fetch/Push sits beside Commit with wrapping and bottom padding for narrow panels.
 - Repository sections use distinct backgrounds and readable headers with compact spacing. Duplicate entries are removed, and changed-file totals include nested folders and repositories in the Git activity badge.
 - Click a repository's branch name to switch branches for that repository. Changes lists grow with their contents and scroll through the panel rather than being clipped to a small fixed height.
 - Long multi-repository lists keep their vertical scrollbar attached to the panel viewport, so it remains reachable while scrolling through large change sets.
@@ -114,6 +122,16 @@ Collaboration is local to the running app. Pending deliveries are held in memory
 - Separated layouts use matching outer margins and pane separators in normal and Agent modes. Tab icons have additional leading space, and compact gutter controls keep their hover areas clear of line numbers and folding arrows.
 - Activity buttons have square corners and no gaps. Hover states, branch labels, diagnostic icons, and status-bar separators have been adjusted for colored bars. Resize handles remain usable with separated panes and chat-only layouts.
 
+## Local data and integration boundaries
+
+Chat histories, drafts, attachments, project assignments, runtime capability files, and signing material belong in the local application profile or build environment, not in this source repository or installer. Sending a prompt or attachment still sends that content to the selected provider under its account and permissions.
+
+The chat bridge listens only on the loopback interface and authenticates requests with per-chat capabilities. Connected agents can discover and read the local chats in its catalog and inspect retained terminal output in their Zed window; those capabilities are not a sandbox against other code running as the same OS user. Do not publish a profile directory or its capability files.
+
+Windows Desktop integration uses the installed Codex app's local IPC connection and its existing conversation owner. It requires a signed-in, running Desktop app; remote availability also depends on the other device. This compatibility layer depends on provider protocol versions and may require updates when the installed clients change. Remote chat titles must currently be edited in Codex. Pending cross-chat deliveries are not persisted across Zed restarts.
+
+Codex connections retain their configured approval and sandbox settings. Claude chats use automatic tool approval by default in this fork; choose **Use Claude's configured permissions for this chat** in the conversation menu to use that provider's permission configuration. Browser connections manage their own permissions.
+
 ## Windows builds
 
 Custom Windows builds are distributed separately as a signed **Zed Setup** executable, with Start menu integration and **Open with Zed** Explorer integration. The installer keeps application settings separate from its binaries; personal chat histories and profiles are not bundled for distribution. The custom signing certificate is not Zed Industries' certificate.
@@ -123,6 +141,8 @@ For a local optimized build, first follow the [Windows development prerequisites
 ```powershell
 pwsh -File script/build-windows-update.ps1
 ```
+
+When launching Zed from an installer or an agent's shell, use `script/start-windows-app.ps1 -FilePath <zed.exe> -ArgumentString '<arguments>'`. It asks the existing Windows desktop shell to start the app independently, so terminating the caller's process tree does not also terminate Zed. It fails if the desktop shell is unavailable rather than falling back to a child process.
 
 The resulting executables are in `target/release-fast`. A standalone distribution also needs the Windows terminal support files and license notices; an EXE alone is not the full installer.
 

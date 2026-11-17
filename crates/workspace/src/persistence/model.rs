@@ -246,6 +246,7 @@ pub(crate) enum SerializedPaneGroup {
 impl Default for SerializedPaneGroup {
     fn default() -> Self {
         Self::Pane(SerializedPane {
+            layout_id: None,
             children: vec![SerializedItem::default()],
             active: false,
             pinned_count: 0,
@@ -313,7 +314,7 @@ impl SerializedPaneGroup {
                     .log_err()?;
 
                 if pane
-                    .read_with(cx, |pane, _| pane.items_len() != 0)
+                    .read_with(cx, |pane, _| pane.items_len() != 0 || pane.layout_id.is_some())
                     .log_err()?
                 {
                     let pane = pane.upgrade()?;
@@ -338,6 +339,7 @@ impl SerializedPaneGroup {
 
 #[derive(Debug, PartialEq, Eq, Default, Clone)]
 pub struct SerializedPane {
+    pub(crate) layout_id: Option<Uuid>,
     pub(crate) active: bool,
     pub(crate) children: Vec<SerializedItem>,
     pub(crate) pinned_count: usize,
@@ -346,6 +348,7 @@ pub struct SerializedPane {
 impl SerializedPane {
     pub fn new(children: Vec<SerializedItem>, active: bool, pinned_count: usize) -> Self {
         SerializedPane {
+            layout_id: None,
             children,
             active,
             pinned_count,
@@ -360,6 +363,7 @@ impl SerializedPane {
         workspace: WeakEntity<Workspace>,
         cx: &mut AsyncWindowContext,
     ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
+        pane.update_in(cx, |pane, _, _| pane.layout_id = self.layout_id)?;
         let mut item_tasks = Vec::new();
         let mut active_item_index = None;
         let mut preview_item_index = None;

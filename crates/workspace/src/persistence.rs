@@ -1065,6 +1065,7 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        sql!(ALTER TABLE panes ADD COLUMN layout_id TEXT;),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -2259,6 +2260,7 @@ impl WorkspaceDb {
             .next()
             .unwrap_or_else(|| {
                 SerializedPaneGroup::Pane(SerializedPane {
+                    layout_id: None,
                     active: true,
                     children: vec![],
                     pinned_count: 0,
@@ -2279,9 +2281,10 @@ impl WorkspaceDb {
             Option<bool>,
             Option<usize>,
             Option<String>,
+            Option<String>,
         );
         self.select_bound::<GroupKey, GroupOrPane>(sql!(
-            SELECT group_id, axis, pane_id, active, pinned_count, flexes
+            SELECT group_id, axis, pane_id, active, pinned_count, flexes, layout_id
                 FROM (SELECT
                         group_id,
                         axis,
@@ -2291,7 +2294,8 @@ impl WorkspaceDb {
                         position,
                         parent_group_id,
                         workspace_id,
-                        flexes
+                        flexes,
+                        NULL as layout_id
                       FROM pane_groups
                     UNION
                       SELECT
@@ -2303,14 +2307,15 @@ impl WorkspaceDb {
                         position,
                         parent_group_id,
                         panes.workspace_id as workspace_id,
-                        NULL
+                        NULL,
+                        panes.layout_id
                       FROM center_panes
                       JOIN panes ON center_panes.pane_id = panes.pane_id)
                 WHERE parent_group_id IS ? AND workspace_id = ?
                 ORDER BY position
         ))?((group_id, workspace_id))?
         .into_iter()
-        .map(|(group_id, axis, pane_id, active, pinned_count, flexes)| {
+        .map(|(group_id, axis, pane_id, active, pinned_count, flexes, layout_id)| {
             let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
             if let Some((group_id, axis)) = group_id.zip(axis) {
                 let layout = flexes
@@ -2337,11 +2342,9 @@ impl WorkspaceDb {
                     flexes,
                 })
             } else if let Some((pane_id, active, pinned_count)) = maybe_pane {
-                Ok(SerializedPaneGroup::Pane(SerializedPane::new(
-                    self.get_items(pane_id)?,
-                    active,
-                    pinned_count,
-                )))
+                let mut pane = SerializedPane::new(self.get_items(pane_id)?, active, pinned_count);
+                pane.layout_id = layout_id.map(|id| Uuid::parse_str(&id)).transpose()?;
+                Ok(SerializedPaneGroup::Pane(pane))
             } else {
                 bail!("Pane Group Child was neither a pane group or a pane");
             }
@@ -2349,7 +2352,7 @@ impl WorkspaceDb {
         // Filter out panes and pane groups which don't have any children or items
         .filter(|pane_group| match pane_group {
             Ok(SerializedPaneGroup::Group { children, .. }) => !children.is_empty(),
-            Ok(SerializedPaneGroup::Pane(pane)) => !pane.children.is_empty(),
+            Ok(SerializedPaneGroup::Pane(pane)) => !pane.children.is_empty() || pane.layout_id.is_some(),
             _ => true,
         })
         .collect::<Result<_>>()
@@ -2423,10 +2426,10 @@ impl WorkspaceDb {
         parent: Option<(GroupId, usize)>,
     ) -> Result<PaneId> {
         let pane_id = conn.select_row_bound::<_, i64>(sql!(
-            INSERT INTO panes(workspace_id, active, pinned_count)
-            VALUES (?, ?, ?)
+            INSERT INTO panes(workspace_id, active, pinned_count, layout_id)
+            VALUES (?, ?, ?, ?)
             RETURNING pane_id
-        ))?((workspace_id, pane.active, pane.pinned_count))?
+        ))?((workspace_id, pane.active, pane.pinned_count, pane.layout_id.map(|id| id.to_string())))?
         .context("Could not retrieve inserted pane_id")?;
 
         let (parent_id, order) = parent.unzip();
@@ -3516,6 +3519,13 @@ mod tests {
             Some(framed_workspace),
             db.workspace_for_roots(&["/tmp", "/tmp2"])
         );
+
+        let mut empty_framed = workspace.clone();
+        let mut pane = SerializedPane::default();
+        pane.layout_id = Some(Uuid::new_v4());
+        empty_framed.center_group = SerializedPaneGroup::Pane(pane);
+        db.save_workspace(empty_framed.clone()).await;
+        assert_eq!(Some(empty_framed), db.workspace_for_roots(&["/tmp", "/tmp2"]));
 
         assert!(db.delete_workspace_by_id(workspace.id).await.is_ok());
         assert!(db.recent_navigation_history(workspace.id).is_empty());

@@ -37,7 +37,7 @@ pub mod thread_worktree_archive;
 
 pub mod threads_archive_view;
 mod ui;
-pub use ui::{AgentNotification, AgentNotificationEvent};
+pub use ui::{AgentNotification, AgentNotificationEvent, MentionCrease};
 mod unicode_confusables;
 
 use std::rc::Rc;

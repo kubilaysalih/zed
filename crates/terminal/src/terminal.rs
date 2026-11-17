@@ -2318,6 +2318,10 @@ impl Terminal {
         }
         // Readline tracks the prompt's screen coordinates. Clearing only the
         // terminal grid here leaves that state stale and shifts pasted text.
+        // Let the shell clear the handshake and redraw its own prompt before
+        // reading the supplied code (including code pasted without Enter).
+        let shell_kind = self.template.shell.shell_kind(self.path_style.is_windows());
+        self.write_to_pty(format!("{}\r", shell_kind.clear_screen_command()).into_bytes());
         self.write_init_command(input);
         true
     }
@@ -3796,7 +3800,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
@@ -4743,10 +4746,118 @@ mod tests {
             assert_eq!(terminal.term.lock_unfair().grid().cursor.point, before);
             assert_eq!(terminal.get_content(), content);
             assert_eq!(terminal.take_input_log(), vec![b"echo hello".to_vec()]);
+            let shell_kind = terminal
+                .template
+                .shell
+                .shell_kind(terminal.path_style.is_windows());
+            assert_eq!(
+                terminal.take_pty_write_log(),
+                vec![
+                    format!("{}\r", shell_kind.clear_screen_command()).into_bytes(),
+                    b"echo hello".to_vec(),
+                ]
+            );
             terminal.input(b"user typed".to_vec());
             assert!(!terminal.write_input_after_startup(b"another command".to_vec()));
             assert_eq!(terminal.take_input_log(), vec![b"user typed".to_vec()]);
         });
+    }
+
+    #[cfg(windows)]
+    async fn check_code_block_startup_is_clean(cx: &mut TestAppContext, execute: bool) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    TerminalMode::interactive(),
+                    Shell::WithArguments {
+                        program: "pwsh.exe".into(),
+                        args: vec!["-NoLogo".into(), "-NoProfile".into()],
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    SettingsCursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    Duration::ZERO,
+                    false,
+                    0,
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .expect("start test PowerShell");
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&terminal, |terminal, _, cx| {
+                terminal.update(cx, |_, cx| cx.notify());
+            })
+        });
+        terminal
+            .update(cx, |terminal, _| {
+                terminal.start_init_command_startup_handshake()
+            })
+            .await;
+        let command = "Write-Output ('ZED_' + 'PASTE_EXECUTED')";
+        terminal.update(cx, |terminal, _| {
+            let mut input = command.as_bytes().to_vec();
+            if execute {
+                input.push(b'\r');
+            }
+            assert!(terminal.write_input_after_startup(input));
+        });
+        cx.condition(&terminal, |terminal, _| {
+            let content = terminal.get_content();
+            content.contains(if execute {
+                "ZED_PASTE_EXECUTED"
+            } else {
+                command
+            }) && !content.contains(INIT_COMMAND_STARTUP_MARKER_PREFIX)
+        })
+        .await;
+        if !execute {
+            terminal.update(cx, |terminal, _| {
+                assert!(!terminal.get_content().contains("ZED_PASTE_EXECUTED"));
+                terminal.input(b"\r".to_vec());
+            });
+            cx.condition(&terminal, |terminal, _| {
+                terminal.get_content().contains("ZED_PASTE_EXECUTED")
+            })
+            .await;
+        }
+        terminal.update(cx, |terminal, _| {
+            let content = terminal.get_content();
+            assert!(
+                !content.contains(INIT_COMMAND_STARTUP_MARKER_PREFIX),
+                "{content}"
+            );
+            assert!(content.contains(command), "{content}");
+            assert_eq!(
+                content.matches("ZED_PASTE_EXECUTED").count(),
+                1,
+                "{content}"
+            );
+            terminal.input(b"exit\r".to_vec());
+        });
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn test_code_block_startup_play_hides_handshake(cx: &mut TestAppContext) {
+        check_code_block_startup_is_clean(cx, true).await;
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    async fn test_code_block_startup_paste_hides_handshake_without_executing(
+        cx: &mut TestAppContext,
+    ) {
+        check_code_block_startup_is_clean(cx, false).await;
     }
 
     #[gpui::test]

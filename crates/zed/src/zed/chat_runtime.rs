@@ -1,10 +1,10 @@
-use super::chat_history_store::{Chat, Message, Provider, SessionMetrics};
+use super::chat_history_store::{Chat, ClaudePermissions, Message, Provider, SessionMetrics};
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -32,8 +32,11 @@ pub struct Approval {
     pub questions: Vec<Question>,
 }
 pub enum Event {
+    DesktopAccepted(String),
     Accepted,
+    SteerResult(uuid::Uuid, Option<String>),
     Goal(Option<Goal>),
+    GoalEdited(std::result::Result<Goal, String>),
     CommandError(String),
     Metrics(SessionMetrics),
     Quota(Vec<QuotaWindow>),
@@ -58,18 +61,19 @@ pub struct Goal {
 
 impl Goal {
     pub fn visible(&self) -> bool {
-        !self.objective.trim().is_empty() && self.status != "complete"
+        !self.objective.trim().is_empty()
     }
 
     pub fn can_continue(&self, working: bool) -> bool {
-        self.visible() && (self.status != "active" || !working)
+        self.visible() && self.status != "complete" && (self.status != "active" || !working)
     }
 
     pub fn label(&self) -> &'static str {
         match self.status.as_str() {
             "active" => "Pursuing goal",
             "paused" => "Goal paused",
-            "blocked" => "Goal blocked",
+            "blocked" | "stalled" => "Goal stalled",
+            "complete" => "Goal completed",
             "usageLimited" => "Usage limit reached",
             "budgetLimited" => "Goal budget reached",
             _ => "Goal",
@@ -86,16 +90,35 @@ impl Goal {
     }
 }
 
-struct GoalReader {
+fn codex_notification_belongs_to_thread(value: &Value, thread_id: &str) -> bool {
+    // Server requests still need a reply, including approvals from child agents.
+    if value.get("method").is_none() || value.get("id").is_some() {
+        return true;
+    }
+    value["params"]["threadId"].as_str()
+        .or_else(|| value["params"]["thread_id"].as_str())
+        .or_else(|| value["params"]["thread"]["id"].as_str())
+        .is_none_or(|id| id == thread_id)
+}
+
+struct CodexMetadataClient {
     _child: OwnedChild,
     input: std::process::ChildStdin,
     output: Receiver<String>,
     sequence: i64,
 }
 
-impl GoalReader {
+impl CodexMetadataClient {
+    fn rename(&mut self, thread_id: &str, name: &str) -> Result<()> {
+        self.request("thread/name/set", json!({"threadId":thread_id,"name":name}))?;
+        Ok(())
+    }
+
     fn new() -> Result<Self> {
-        let mut command = Command::new(executable(Provider::Codex)?);
+        Self::spawn(Command::new(executable(Provider::Codex)?))
+    }
+
+    fn spawn(mut command: Command) -> Result<Self> {
         command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
@@ -111,12 +134,12 @@ impl GoalReader {
             .0
             .stdin
             .take()
-            .context("Goal reader stdin unavailable")?;
+            .context("Codex metadata client stdin unavailable")?;
         let stdout = child
             .0
             .stdout
             .take()
-            .context("Goal reader stdout unavailable")?;
+            .context("Codex metadata client stdout unavailable")?;
         let (send, output) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
@@ -127,7 +150,7 @@ impl GoalReader {
                         }
                     }
                     Err(error) => {
-                        log::warn!("Goal reader closed: {error}");
+                        log::warn!("Codex metadata client closed: {error}");
                         break;
                     }
                 }
@@ -159,7 +182,7 @@ impl GoalReader {
             let line = self
                 .output
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .context("Goal status request timed out or closed")?;
+                .context("Codex metadata request timed out or closed")?;
             let value: Value = serde_json::from_str(&line)?;
             if value.get("method").is_some() && value.get("id").is_some() {
                 write_json(
@@ -178,17 +201,17 @@ impl GoalReader {
 
 pub fn goal_status(thread_id: &str) -> Result<Option<Goal>> {
     // A shared read-only connection avoids acquiring a writer or starting a server per tab.
-    static READER: OnceLock<Mutex<Option<GoalReader>>> = OnceLock::new();
+    static READER: OnceLock<Mutex<Option<CodexMetadataClient>>> = OnceLock::new();
     let mut reader = READER
         .get_or_init(Default::default)
         .lock()
         .map_err(|_| anyhow::anyhow!("Goal status reader unavailable"))?;
     if reader.is_none() {
-        *reader = Some(GoalReader::new()?);
+        *reader = Some(CodexMetadataClient::new()?);
     }
     let result = reader
         .as_mut()
-        .context("Goal reader unavailable")?
+        .context("Codex metadata client unavailable")?
         .request("thread/goal/get", json!({"threadId":thread_id}));
     match result {
         Ok(value) => Ok(serde_json::from_value(value["goal"].clone())?),
@@ -196,6 +219,35 @@ pub fn goal_status(thread_id: &str) -> Result<Option<Goal>> {
             *reader = None;
             Err(error)
         }
+    }
+}
+
+pub fn edit_goal(thread_id: &str, objective: String, budget: Option<i64>) -> Result<Goal> {
+    let request = goal_edit_params(thread_id, &objective, budget)?;
+    let value = CodexMetadataClient::new()?.request("thread/goal/set", request)?;
+    serde_json::from_value(value["goal"].clone()).context("Codex did not return the updated goal")
+}
+
+pub(super) fn goal_edit_params(thread_id: &str, objective: &str, budget: Option<i64>) -> Result<Value> {
+    let objective = objective.trim();
+    anyhow::ensure!(!objective.is_empty() && objective.chars().count() <= 4000,
+        "Goal must contain between 1 and 4,000 characters");
+    anyhow::ensure!(budget.is_none_or(|budget| budget > 0), "Token budget must be a positive integer");
+    // Omitting status preserves a paused/blocked goal instead of implicitly resuming it.
+    Ok(json!({"threadId":thread_id,"origin":"user","objective":objective,"tokenBudget":budget}))
+}
+
+pub fn rename_chat(chat: &Chat, name: &str) -> Result<()> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "Please enter a name.");
+    anyhow::ensure!(!chat.is_remote_codex(), "This remote connection does not support renaming yet. Rename this chat in Codex.");
+    uuid::Uuid::parse_str(&chat.id).context("Invalid conversation ID")?;
+    match chat.provider {
+        Provider::Codex => {
+            // Updating metadata does not resume the thread or acquire its active writer.
+            CodexMetadataClient::new()?.rename(&chat.id, name)
+        }
+        Provider::Claude => super::chat_history_store::rename_claude_chat(chat, name),
     }
 }
 
@@ -357,6 +409,23 @@ impl Drop for ActiveRun {
     }
 }
 
+fn is_resume_writer_conflict(response: &Value) -> bool {
+    response["id"] == 1
+        && response["error"]["message"].as_str()
+            .is_some_and(|message| message.contains("already has an active writer"))
+}
+
+#[cfg(test)]
+#[test]
+fn only_definite_resume_writer_conflicts_can_relay() {
+    let error = json!({"message":"thread already has an active writer"});
+    assert!(is_resume_writer_conflict(&json!({"id":1,"error":error})));
+    assert!(!is_resume_writer_conflict(&json!({"id":2,"error":error})));
+    assert!(!is_resume_writer_conflict(&json!({"method":"error","error":error})));
+    assert!(!is_resume_writer_conflict(&json!({"id":1,"error":{"message":"timed out"}})));
+    assert!(!is_resume_writer_conflict(&json!({"id":1,"result":{}})));
+}
+
 fn connection_error(provider: Provider, error: &str) -> String {
     if provider == Provider::Codex && error.contains("already has an active writer") {
         WRITER_CONFLICT.into()
@@ -371,8 +440,10 @@ fn connection_error(provider: Provider, error: &str) -> String {
     }
 }
 pub enum Control {
+    Steer { id: uuid::Uuid, prompt: String, attachments: Vec<PathBuf> },
     Reply(Value),
     Goal(GoalCommand),
+    EditGoal { objective: String, budget: Option<i64> },
     Stop,
 }
 pub struct Run {
@@ -382,6 +453,7 @@ pub struct Run {
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
+    pub claude_permissions: ClaudePermissions,
     pub inline_preview: bool,
     pub inline_images: Vec<String>,
     pub bridge: Option<super::chat_bridge::Connection>,
@@ -402,6 +474,7 @@ pub struct Model {
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderInfo {
+    pub slash_commands: Vec<String>,
     pub models: Vec<Model>,
     pub quota: Vec<QuotaWindow>,
     pub quota_error: Option<String>,
@@ -633,6 +706,7 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
     }
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut models = Vec::new();
+    let mut slash_commands = Vec::new();
     let mut claude_usage_requested = false;
     let mut claude_quota = Vec::new();
     loop {
@@ -641,6 +715,7 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
             Err(_) if claude_usage_requested => {
                 return Ok(ProviderInfo {
                     models,
+                    slash_commands,
                     quota: claude_quota,
                     quota_error: Some("Claude usage request timed out. Try refreshing.".into()),
                 });
@@ -657,6 +732,7 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
                 let quota_error = claude_quota.is_empty().then(|| "Claude did not report account usage for this login. Try /usage in Claude Code.".into());
                 return Ok(ProviderInfo {
                     models,
+                    slash_commands,
                     quota: claude_quota,
                     quota_error,
                 });
@@ -666,6 +742,7 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
             if value["id"] == 3 {
                 return Ok(ProviderInfo {
                     models,
+                    slash_commands,
                     quota: quota_windows(&value["result"]["rateLimits"]),
                     quota_error: value
                         .get("error")
@@ -701,13 +778,15 @@ pub fn provider_info(provider: Provider) -> Result<ProviderInfo> {
                 bail!("{}", value["response"]["error"]);
             }
             models = parse_models(provider, &value["response"]["response"]["models"]);
+            slash_commands = value["response"]["response"]["commands"].as_array().into_iter().flatten()
+                .filter_map(|command| command["name"].as_str()).map(|name| format!("/{name}")).collect();
             let supported = value["response"]["response"]["commands"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .any(|command| command["name"] == "usage");
             if !supported {
-                return Ok(ProviderInfo { models, quota_error: Some("This Claude version does not expose /usage. Update Claude Code to read account usage.".into()), ..Default::default() });
+                return Ok(ProviderInfo { models, slash_commands, quota_error: Some("This Claude version does not expose /usage. Update Claude Code to read account usage.".into()), ..Default::default() });
             }
             claude_usage_requested = true;
             write_json(
@@ -766,7 +845,12 @@ pub fn user_input(provider: Provider, prompt: &str, attachments: &[PathBuf]) -> 
             prompt
         )
     };
-    content.insert(0, json!({"type":"text","text":text}));
+    let mut text_input = json!({"type":"text","text":text});
+    if provider == Provider::Codex {
+        // The desktop owner renders this input before the app server supplies defaults.
+        text_input["text_elements"] = json!([]);
+    }
+    content.insert(0, text_input);
     Ok(json!(content))
 }
 impl Drop for Run {
@@ -876,6 +960,46 @@ pub fn executable(provider: Provider) -> Result<PathBuf> {
         "{} is not installed. Install its official CLI and sign in, then retry.",
         provider.name()
     )
+}
+
+fn default_browser_is_chrome() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        windows_registry::CURRENT_USER
+            .open(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice")
+            .and_then(|key| key.get_string("ProgId"))
+            .is_ok_and(|id| id.to_ascii_lowercase().starts_with("chromehtml"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn configure_external_browser(
+    command: &mut Command,
+    provider: Provider,
+    chrome: Option<&Path>,
+) -> Result<()> {
+    match provider {
+        Provider::Claude => {
+            command.arg(if chrome.is_some() {
+                "--chrome"
+            } else {
+                "--no-chrome"
+            });
+            command.args([
+                "--append-system-prompt",
+                super::chat_bridge::BROWSER_INSTRUCTIONS,
+            ]);
+        }
+        Provider::Codex => {
+            command.args(["-c", r#"plugins."browser@openai-bundled".enabled=false"#]);
+            // Codex inherits its own external-browser plugins and their permissions.
+            // Routing it through Claude's extension misidentifies the requesting agent.
+        }
+    }
+    Ok(())
 }
 
 pub fn inline_response_schema() -> Value {
@@ -1018,6 +1142,42 @@ pub fn approval(request: &Value, provider: Provider) -> Option<Approval> {
         directory,
         questions,
     })
+}
+
+pub fn can_offer_auto(approval: &Approval) -> bool {
+    let req = &approval.request["request"];
+    req["subtype"] == "can_use_tool" && approval.questions.is_empty()
+        && ["suppressAlwaysAllowRule","suppress_always_allow_rule"].iter().all(|k| req[*k] != true)
+}
+
+/// Offer scoped rules supplied by Claude for this prompt. Preserve its chosen
+/// destination so the same command or domain can be recognized on later turns.
+pub fn remembered_permission(approval: &Approval) -> Option<(String, Value)> {
+    let req = &approval.request["request"];
+    if !can_offer_auto(approval) {
+        return None;
+    }
+    let tool = req["tool_name"].as_str()?;
+    let mut updates = Vec::new();
+    let mut labels = Vec::new();
+    for update in req["permission_suggestions"].as_array().into_iter().flatten() {
+        if update["type"] != "addRules" || update["behavior"] != "allow" || update["destination"] != "localSettings" { continue; }
+        let Some(rules) = update["rules"].as_array() else { continue };
+        if rules.is_empty() || !rules.iter().all(|r| r["toolName"] == tool && r["ruleContent"].as_str().is_some_and(|v| !v.is_empty())) { continue; }
+        for rule in rules { labels.push(rule["ruleContent"].as_str()?.to_string()); }
+        updates.push(update.clone());
+    }
+    if updates.is_empty() && tool == "WebFetch" {
+        let url = url::Url::parse(req["input"]["url"].as_str()?).ok()?;
+        if !matches!(url.scheme(), "http" | "https") { return None; }
+        let domain = url.domain()?;
+        if !domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') { return None; }
+        let scope = format!("domain:{domain}");
+        updates.push(json!({"type":"addRules","behavior":"allow","destination":"localSettings","rules":[{"toolName":tool,"ruleContent":scope}]}));
+        labels.push(scope);
+    }
+    if updates.is_empty() { return None; }
+    Some((format!("Always allow in project · {}", labels.join(", ")), Value::Array(updates)))
 }
 
 pub fn approval_reply(
@@ -1571,6 +1731,81 @@ impl PendingPrediction {
     }
 }
 
+#[cfg(test)]
+fn send_to_desktop(session: &str, prompt: &str, attachments: &[PathBuf], cwd: &str) -> Result<()> {
+    send_to_desktop_with_updates(session, prompt, attachments, cwd, || {})
+}
+
+fn send_to_desktop_with_updates(session: &str, prompt: &str, attachments: &[PathBuf], cwd: &str, mut refresh: impl FnMut()) -> Result<()> {
+    if !attachments.is_empty() {
+        bail!("Claude Desktop accepts text through this connection. Attach files in the Desktop chat.");
+    }
+    let mut command = Command::new(executable(Provider::Claude)?);
+    command.args(["--cloud", session, "--print", "--output-format", "json"])
+        .current_dir(cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command.spawn()?;
+    child.stdin.take().context("Claude Desktop message input unavailable")?.write_all(prompt.as_bytes())?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let output = loop {
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(result) => break result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => refresh(),
+            Err(error) => return Err(error.into()),
+        }
+    };
+    refresh();
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    if !output.status.success() || reply["ok"] != true || reply["session_id"] != session {
+        bail!("Claude Desktop delivery failed: {}", reply["error"].as_str()
+            .unwrap_or(String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    Ok(())
+}
+
+// The CLI acknowledges Desktop delivery independently of the owner's transcript.
+struct DesktopTail {
+    file: std::fs::File,
+    offset: u64,
+    state: StreamState,
+}
+
+impl DesktopTail {
+    fn start(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let offset = file.metadata()?.len();
+        Ok(Self { file, offset, state: StreamState::default() })
+    }
+
+    fn refresh(&mut self, sender: &Sender<Event>) -> Result<()> {
+        let length = self.file.metadata()?.len();
+        if length < self.offset { self.offset = 0; }
+        if length == self.offset { return Ok(()); }
+        self.file.seek(SeekFrom::Start(self.offset))?;
+        let mut reader = BufReader::new((&self.file).take(length - self.offset));
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line)? > 0 {
+            if line.last() != Some(&b'\n') { break; }
+            self.offset += line.len() as u64;
+            if let Ok(record) = serde_json::from_slice::<Value>(&line)
+                && matches!(record["type"].as_str(), Some("assistant" | "user" | "stream_event" | "system"))
+                && record["isSidechain"] != true && record["entrypoint"] != "sdk-cli"
+            {
+                for (id, item) in self.state.ingest(Provider::Claude, &record) {
+                    if item.role != "user" { emit(sender, Event::Item(id, item))?; }
+                }
+            }
+            line.clear();
+        }
+        Ok(())
+    }
+}
+
 fn run(
     mut chat: Chat,
     prompt: String,
@@ -1592,6 +1827,40 @@ fn run(
         bail!(
             "Create a conversation before managing its goal. Use /goal <objective> to create one."
         );
+    }
+    if !new && !fork && chat.provider == Provider::Claude
+        && let Some(owner) = super::chat_history_store::claude_desktop_owner(&chat)?
+    {
+        if options.inline_preview { bail!("Use a new chat for an inline request while Claude Desktop owns this session."); }
+        let session = owner.bridge_id.context("Enable Remote Control in this Claude Desktop chat to send to its active session.")?;
+        let mut tail = DesktopTail::start(&chat.path).ok();
+        let mut send = |prompt: &str, attachments: &[PathBuf]| -> Result<()> {
+            let desktop_prompt = options.bridge.as_ref().map(|bridge| bridge.desktop_prompt(prompt)).transpose()?;
+            send_to_desktop_with_updates(&session, desktop_prompt.as_deref().unwrap_or(prompt), attachments, &chat.cwd, || {
+                if let Some(tail) = &mut tail
+                    && let Err(error) = tail.refresh(sender) {
+                    log::debug!("Desktop transcript update: {error}");
+                }
+            })?;
+            if super::chat_bridge::linked_message(prompt).is_some() {
+                emit(sender, Event::DesktopAccepted(prompt.into()))?;
+            }
+            Ok(())
+        };
+        send(&prompt, &options.attachments)?;
+        emit(sender, Event::Accepted)?;
+        while let Ok(control) = controls.recv_timeout(Duration::from_millis(200)) {
+            match control {
+                Control::Steer { id, prompt, attachments } => {
+                    let error = send(&prompt, &attachments)
+                        .err().map(|error| error.to_string());
+                    emit(sender, Event::SteerResult(id, error))?;
+                }
+                Control::Stop => break,
+                _ => bail!("Manage this running session in Claude Desktop."),
+            }
+        }
+        return Ok(None);
     }
     let mut user_input = user_input(chat.provider, &prompt, &options.attachments)?;
     if let Some(content) = user_input.as_array_mut() {
@@ -1643,11 +1912,13 @@ fn run(
             "stream-json",
             "--verbose",
             "--include-partial-messages",
+            "--replay-user-messages",
             "--permission-prompt-tool",
             "stdio",
-            "--permission-mode",
-            "manual",
         ]);
+        if let Some(mode) = options.claude_permissions.cli_mode() {
+            command.args(["--permission-mode", mode]);
+        }
         if options.inline_preview {
             command.args([
                 "--tools",
@@ -1672,6 +1943,12 @@ fn run(
             command.arg("--fork-session");
         }
     }
+    if !options.inline_preview {
+        let chrome = (chat.provider == Provider::Claude && default_browser_is_chrome())
+            .then(|| executable(Provider::Claude).ok())
+            .flatten();
+        configure_external_browser(&mut command, chat.provider, chrome.as_deref())?;
+    }
     if let Some(bridge) = &options.bridge
         && !options.inline_preview
     {
@@ -1693,7 +1970,7 @@ fn run(
             );
             command.args([
                 "--allowedTools",
-                "mcp__zed_chats__list_chats,mcp__zed_chats__read_chat,mcp__zed_chats__send_message,mcp__zed_chats__list_terminals,mcp__zed_chats__read_terminal",
+                "mcp__zed_chats__open_browser_url,mcp__zed_chats__list_chats,mcp__zed_chats__read_chat,mcp__zed_chats__send_message,mcp__zed_chats__list_terminals,mcp__zed_chats__read_terminal",
             ]);
         }
     }
@@ -1743,13 +2020,22 @@ fn run(
     let mut turn_id = String::new();
     let mut errors = VecDeque::new();
     let mut begun = false;
+    let mut queued_steers = VecDeque::new();
+    let mut awaiting_steers = HashSet::new();
     let mut goal_running = goal_command.as_ref().is_some_and(GoalCommand::starts_work);
     let started = Instant::now();
     let mut stopping = None;
     loop {
         while let Ok(control) = controls.try_recv() {
             match control {
+                Control::Steer { id, prompt, attachments } => queued_steers.push_back((id, prompt, attachments)),
                 Control::Reply(value) => write_json(&mut input, &value)?,
+                Control::EditGoal { objective, budget } => {
+                    match goal_edit_params(&chat.id, &objective, budget) {
+                        Ok(params) => write_json(&mut input, &json!({"id":32,"method":"thread/goal/set","params":params}))?,
+                        Err(error) => emit(sender, Event::GoalEdited(Err(error.to_string())))?,
+                    }
+                }
                 Control::Goal(command) => {
                     write_json(&mut input, &command.request(&chat.id, 30))?;
                     if command.starts_work() {
@@ -1790,6 +2076,25 @@ fn run(
                 }
             }
         }
+        if begun && stopping.is_none() && (chat.provider == Provider::Claude || !turn_id.is_empty()) {
+            while let Some((id, prompt, attachments)) = queued_steers.pop_front() {
+                let content = match self::user_input(chat.provider, &prompt, &attachments) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        emit(sender, Event::SteerResult(id, Some(error.to_string())))?;
+                        continue;
+                    }
+                };
+                let request = match chat.provider {
+                    Provider::Claude => json!({"type":"user","uuid":id,"session_id":chat.id,
+                        "parent_tool_use_id":null,"message":{"role":"user","content":content}}),
+                    Provider::Codex => json!({"id":id,"method":"turn/steer","params":{
+                        "threadId":chat.id,"expectedTurnId":turn_id,"input":content}}),
+                };
+                write_json(&mut input, &request)?;
+                awaiting_steers.insert(id);
+            }
+        }
         if stopping.is_some_and(|time| time.elapsed() > Duration::from_secs(5)) {
             bail!("Stopped");
         }
@@ -1808,6 +2113,26 @@ fn run(
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                // App-server also publishes child-agent turns on this connection.
+                // Their messages, completion and goal status do not belong to the parent.
+                if chat.provider == Provider::Codex
+                    && !codex_notification_belongs_to_thread(&value, &chat.id)
+                {
+                    continue;
+                }
+                let ack = match chat.provider {
+                    Provider::Claude if value["isReplay"] == true && value["type"] == "user" => value["uuid"].as_str(),
+                    Provider::Codex if value.get("method").is_none() => value["id"].as_str(),
+                    _ => None,
+                };
+                if let Some(id) = ack.and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    && awaiting_steers.remove(&id)
+                {
+                    let error = value.get("error").filter(|err| !err.is_null())
+                        .map(|err| err["message"].as_str().unwrap_or("Steer rejected").to_owned());
+                    emit(sender, Event::SteerResult(id, error))?;
+                    continue;
+                }
                 let previous_metrics = metrics.clone();
                 metrics.observe(chat.provider, &value);
                 if metrics != previous_metrics {
@@ -1837,7 +2162,30 @@ fn run(
                         }
                         continue;
                     }
+                    if value["id"] == 32 {
+                        let result = if !value["error"].is_null() {
+                            Err(value["error"]["message"].as_str().unwrap_or("Cannot update goal").to_owned())
+                        } else {
+                            serde_json::from_value(value["result"]["goal"].clone()).map_err(|error| error.to_string())
+                        };
+                        emit(sender, Event::GoalEdited(result))?;
+                        continue;
+                    }
                     if !value["error"].is_null() {
+                        #[cfg(windows)]
+                        if !new && !fork && !begun && goal_command.is_none() && !options.inline_preview
+                            && is_resume_writer_conflict(&value)
+                        {
+                            // Resume was rejected before turn/start. Only this definite
+                            // non-delivery can be routed to the existing desktop writer.
+                            drop(child);
+                            tokio::runtime::Builder::new_current_thread().enable_all().build()?
+                                .block_on(super::remote_codex::send_to_local_owner(
+                                    &chat, user_input, uuid::Uuid::new_v4(),
+                                ))?;
+                            emit(sender, Event::Accepted)?;
+                            return Ok(None);
+                        }
                         if value["id"] == 30 {
                             emit(
                                 sender,
@@ -1875,23 +2223,17 @@ fn run(
                             .as_ref()
                             .is_some_and(|goal: &Goal| goal.status == "active");
                         emit(sender, Event::Goal(goal))?;
+                        if begun && !active && goal_running && turn_id.is_empty() && value.get("method").is_some() {
+                            break;
+                        }
                         if value["id"] == 3 || value["id"] == 4 {
                             if value["id"] == 3 {
                                 emit(sender, Event::Accepted)?;
+                                begun = true;
                             }
-                            if goal_running && active {
-                                let mut params = json!({"threadId":chat.id,"input":[{"type":"text","text":"Continue working towards the active goal. Update its status when the objective is complete or genuinely blocked."}]});
-                                if let Some(model) = &options.model {
-                                    params["model"] = json!(model);
-                                }
-                                if let Some(effort) = &options.effort {
-                                    params["effort"] = json!(effort);
-                                }
-                                write_json(
-                                    &mut input,
-                                    &json!({"id":2,"method":"turn/start","params":params}),
-                                )?;
-                            } else {
+                            // Codex owns goal continuations. Starting another turn here
+                            // races its native scheduler and adds fake user messages.
+                            if !goal_running || !active {
                                 break;
                             }
                         }
@@ -1915,6 +2257,12 @@ fn run(
                                 "thread/resume"
                             };
                             let mut params = json!({"cwd":chat.cwd});
+                            if let Some(model) = &options.model {
+                                params["model"] = json!(model);
+                            }
+                            if let Some(effort) = &options.effort {
+                                params["config"] = json!({"model_reasoning_effort":effort});
+                            }
                             if options.inline_preview {
                                 params["sandbox"] = json!("read-only");
                                 params["approvalPolicy"] = json!("never");
@@ -1989,6 +2337,7 @@ fn run(
                             bail!("Stopped");
                         }
                         if goal_running {
+                            turn_id.clear();
                             write_json(&mut input, &GoalCommand::Status.request(&chat.id, 4))?;
                         } else {
                             if goal_command.is_none()
@@ -2054,10 +2403,13 @@ fn run(
                             .chars()
                             .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
                             .collect();
-                        chat.path = home
-                            .join("projects")
-                            .join(directory)
-                            .join(format!("{}.jsonl", chat.id));
+                        let filename = format!("{}.jsonl", chat.id);
+                        if chat.path.file_name() != Some(std::ffi::OsStr::new(&filename))
+                            || !chat.path.is_file()
+                        {
+                            chat.path = home.join("projects").join(directory).join(filename);
+                            chat.repair_claude_transcript_path();
+                        }
                         chat.modified = std::time::SystemTime::now();
                         emit(sender, Event::Session(chat.clone()))?;
                     }
@@ -2075,7 +2427,7 @@ fn run(
                         }
                         // Claude may finish its parent turn while an async Agent is still
                         // running. Keep its process (and event stream) alive for the report.
-                        if state.subtasks.pending() == 0 {
+                        if state.subtasks.pending() == 0 && awaiting_steers.is_empty() {
                             break;
                         }
                     }
@@ -2093,6 +2445,12 @@ fn run(
             }
         }
     }
+    if chat.provider == Provider::Claude && !chat.path.is_file() {
+        chat.repair_claude_transcript_path();
+        if chat.path.is_file() {
+            emit(sender, Event::Session(chat.clone()))?;
+        }
+    }
     drop(input);
     for _ in 0..20 {
         if child.0.try_wait()?.is_some() {
@@ -2105,6 +2463,95 @@ fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_child_notifications_do_not_change_parent_messages_or_lifecycle() {
+        let mut stream = super::StreamState::default();
+        for (thread, message) in [("child", "English child report"), ("parent", "Parent reply")] {
+            let event = serde_json::json!({"method":"item/completed","params":{"threadId":thread,
+                "item":{"id":thread,"type":"agentMessage","text":message,"phase":"final_answer"}}});
+            if super::codex_notification_belongs_to_thread(&event, "parent") {
+                stream.ingest(super::Provider::Codex, &event);
+            }
+        }
+        assert_eq!(stream.items.len(), 1);
+        assert_eq!(stream.items["parent"].text, "Parent reply");
+        for method in ["turn/started", "turn/completed", "thread/goal/updated", "thread/tokenUsage/updated", "item/agentMessage/delta"] {
+            assert!(!super::codex_notification_belongs_to_thread(&serde_json::json!({"method":method,"params":{"threadId":"child"}}), "parent"));
+            assert!(super::codex_notification_belongs_to_thread(&serde_json::json!({"method":method,"params":{"threadId":"parent"}}), "parent"));
+        }
+        assert!(super::codex_notification_belongs_to_thread(&serde_json::json!({"id":4,"result":{"goal":null}}), "parent"));
+        assert!(super::codex_notification_belongs_to_thread(&serde_json::json!({"id":5,"method":"item/commandExecution/requestApproval","params":{"threadId":"child"}}), "parent"));
+        assert!(super::codex_notification_belongs_to_thread(&serde_json::json!({"method":"account/rateLimits/updated","params":{}}), "parent"));
+    }
+
+    #[test]
+    #[ignore = "requires installed Codex; uses a temporary CODEX_HOME and never sends a prompt"]
+    fn rename_codex_chat_persists_in_provider() -> anyhow::Result<()> {
+        use super::*;
+        let home = tempfile::tempdir()?;
+        let connect = || -> Result<CodexMetadataClient> {
+            let mut command = Command::new(executable(Provider::Codex)?);
+            command.env("CODEX_HOME", home.path()).current_dir(home.path());
+            CodexMetadataClient::spawn(command)
+        };
+        let mut client = connect()?;
+        let created = client.request("thread/start", json!({"cwd":home.path(),"ephemeral":false,"approvalPolicy":"never"}))?;
+        let id = created["thread"]["id"].as_str().context("test thread ID")?;
+        client.rename(id, "Rename test — Türkçe")?;
+        let mut reader = connect()?;
+        let thread = reader.request("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        assert_eq!(thread["thread"]["name"], "Rename test — Türkçe");
+        client.rename(id, "Second name")?;
+        let thread = reader.request("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        assert_eq!(thread["thread"]["name"], "Second name");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "uses the signed-in agent CLI and an isolated test conversation"]
+    fn steer_two_messages_into_the_same_live_turn() {
+        let provider = match std::env::var("ZED_TEST_STEER_PROVIDER").as_deref() {
+            Ok("codex") => Provider::Codex, Ok("claude") => Provider::Claude,
+            _ => panic!("choose a test provider"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let chat = Chat { id: id.to_string(), provider, title: "Zed isolated steer test".into(),
+            cwd: dir.path().to_string_lossy().into_owned(), path: Default::default(),
+            modified: std::time::SystemTime::now(), archived: false, internal: false };
+        let run = start(chat, "Reply briefly. Include any follow-up tokens you receive.".into(), false, true, RunOptions::default());
+        let mut expected = HashSet::new();
+        for token in ["ZED-STEER-FIRST", "ZED-STEER-SECOND"] {
+            let id = uuid::Uuid::new_v4();
+            expected.insert(id);
+            run.commands.send(Control::Steer { id, prompt: token.into(), attachments: vec![] }).unwrap();
+        }
+        let mut replies = std::collections::HashMap::new();
+        loop {
+            match run.events.recv_timeout(Duration::from_secs(90)).unwrap() {
+                Event::SteerResult(id, error) => { assert_eq!(error, None); assert!(expected.remove(&id)); }
+                Event::Item(id, message) if message.role == "assistant" => { replies.insert(id, message.text); }
+                Event::Finished(error) => { assert_eq!(error, None); break; }
+                _ => {}
+            }
+        }
+        assert!(expected.is_empty(), "both messages must be acknowledged");
+        let reply = replies.into_values().collect::<Vec<_>>().join("\n");
+        for token in ["ZED-STEER-FIRST", "ZED-STEER-SECOND"] {
+            assert!(reply.contains(token), "provider response omitted {token}: {reply}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a separately created disposable Claude Remote Control receiver"]
+    fn send_two_messages_to_disposable_desktop_bridge() {
+        let session = std::env::var("ZED_TEST_DISPOSABLE_CLAUDE_BRIDGE").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        send_to_desktop(&session, "Record ZED-DESKTOP-ONE.", &[], cwd).unwrap();
+        send_to_desktop(&session, "Reply ZED-DESKTOP-TWO.", &[], cwd).unwrap();
+    }
+
     #[test]
     fn predictions_use_a_completed_source_and_never_start_a_user_turn() {
         let request = prediction_request("thread-one", "turn-one");
@@ -2261,7 +2708,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn goal_strip_uses_native_time_and_hides_finished_goals() {
+    fn goal_strip_uses_native_time_and_shows_completion() {
         let mut goal: Goal = serde_json::from_value(json!({
             "objective": "Finish the migration", "status": "active",
             "tokensUsed": 1250, "tokenBudget": null, "timeUsedSeconds": 102
@@ -2276,7 +2723,9 @@ mod tests {
         goal.time_used_seconds = 3723;
         assert_eq!(goal.elapsed_label(), "1h 2m");
         goal.status = "complete".into();
-        assert!(!goal.visible());
+        assert!(goal.visible());
+        assert_eq!(goal.label(), "Goal completed");
+        assert!(!goal.can_continue(false));
         goal.status = "active".into();
         goal.objective = "  ".into();
         assert!(!goal.visible());
@@ -2290,7 +2739,10 @@ mod tests {
         .expect("legacy goal");
         assert_eq!(goal.elapsed_label(), "0m 0s");
         assert!(goal.visible());
-        assert_eq!(goal.label(), "Goal blocked");
+        assert_eq!(goal.label(), "Goal stalled");
+        goal.status = "stalled".into();
+        assert_eq!(goal.label(), "Goal stalled");
+        assert!(goal.can_continue(false));
         goal.status = "usageLimited".into();
         assert_eq!(goal.label(), "Usage limit reached");
         goal.status = "budgetLimited".into();
@@ -2333,6 +2785,26 @@ mod tests {
                 .expect("normal message")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn desktop_tail_publishes_complete_records_once_while_delivery_is_pending() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("desktop.jsonl");
+        let mut file = std::fs::File::create(&path)?;
+        writeln!(file, "{}", json!({"type":"assistant","message":{"id":"old","content":[{"type":"text","text":"Old"}]}}))?;
+        let mut tail = DesktopTail::start(&path)?;
+        let (tx, rx) = mpsc::channel();
+        let row = json!({"type":"assistant","entrypoint":"claude-desktop","message":{"id":"new","content":[{"type":"text","text":"Visible now"}]}}).to_string();
+        write!(file, "{row}")?;
+        tail.refresh(&tx)?;
+        assert!(rx.try_iter().next().is_none());
+        writeln!(file)?;
+        tail.refresh(&tx)?;
+        tail.refresh(&tx)?;
+        let items = rx.try_iter().filter_map(|event| match event { Event::Item(_, msg) => Some(msg.text), _ => None }).collect::<Vec<_>>();
+        assert_eq!(items, ["Visible now"]);
+        Ok(())
     }
 
     #[test]
@@ -2434,6 +2906,7 @@ mod tests {
         std::fs::write(&file, "report data").expect("fixture");
         let attachments = vec![image.clone(), file.clone()];
         let codex = user_input(Provider::Codex, "Review", &attachments).expect("codex input");
+        assert_eq!(codex[0]["text_elements"], json!([]));
         assert_eq!(codex[1]["type"], "localImage");
         assert_eq!(codex[1]["path"], image.to_string_lossy().as_ref());
         assert!(
@@ -2443,6 +2916,7 @@ mod tests {
                 .contains("report.txt")
         );
         let claude = user_input(Provider::Claude, "", &attachments).expect("claude input");
+        assert!(claude[0].get("text_elements").is_none());
         assert_eq!(claude[1]["source"]["media_type"], "image/png");
         assert_eq!(claude[1]["source"]["data"], "AQID");
         assert!(!claude[0]["text"].as_str().expect("text").is_empty());
@@ -2528,6 +3002,21 @@ mod tests {
     }
 
     #[test]
+    fn remember_uses_scoped_claude_rules_and_honors_suppression() {
+        let mut request = json!({"request_id":"r","request":{"subtype":"can_use_tool","tool_name":"WebFetch","input":{"url":"https://test.example/path"}}});
+        let card = approval(&request,Provider::Claude).unwrap();
+        let (_,updates) = remembered_permission(&card).unwrap();
+        assert_eq!(updates[0]["rules"][0]["ruleContent"],"domain:test.example");
+        assert_eq!(updates[0]["destination"],"localSettings");
+        request["request"]["suppress_always_allow_rule"] = json!(true);
+        assert!(remembered_permission(&approval(&request,Provider::Claude).unwrap()).is_none());
+        request["request"] = json!({"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"permission_suggestions":[
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls"}],"behavior":"allow","destination":"localSettings"}
+        ]});
+        assert_eq!(remembered_permission(&approval(&request,Provider::Claude).unwrap()).unwrap().1,request["request"]["permission_suggestions"]);
+    }
+
+    #[test]
     fn approval_decisions_are_explicit_and_do_not_grant_session_permissions() {
         let request = json!({"id":7,"method":"item/permissions/requestApproval","params":{"permissions":{"network":{"enabled":true}}}});
         let pending = approval(&request, Provider::Codex).expect("approval");
@@ -2596,4 +3085,60 @@ mod tests {
         assert_ne!(started[0].0, next[0].0);
         assert!(claude.ingest(Provider::Claude, &json!({"type":"system","subtype":"compact_boundary","parent_tool_use_id":"child"})).is_empty());
     }
+    #[test]
+    fn native_browser_connections_keep_provider_identity_and_external_browser_preference() {
+        let mut codex = Command::new("codex");
+        configure_external_browser(&mut codex, Provider::Codex, Some(Path::new("claude.exe"))).unwrap();
+        let args = codex.get_args().map(|arg| arg.to_string_lossy().to_string()).collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == r#"plugins."browser@openai-bundled".enabled=false"#));
+        assert!(!args.iter().any(|arg| arg.contains("zed_chrome") || arg.contains("claude")));
+        assert!(!args.iter().any(|arg| arg.contains("chrome@openai-bundled")), "preserve native plugin configuration");
+        let mut claude = Command::new("claude");
+        configure_external_browser(&mut claude, Provider::Claude, Some(Path::new("claude.exe"))).unwrap();
+        assert!(claude.get_args().any(|arg| arg == "--chrome"));
+        let mut unsupported = Command::new("claude");
+        configure_external_browser(&mut unsupported, Provider::Claude, None).unwrap();
+        assert!(unsupported.get_args().any(|arg| arg == "--no-chrome"));
+    }
+
+    #[test]
+    fn goal_edit_validates_without_resuming_or_resetting_usage() {
+        let params = goal_edit_params("test", " Updated goal ", None).unwrap();
+        assert_eq!(params["objective"], "Updated goal");
+        assert!(params["tokenBudget"].is_null());
+        assert!(params.get("status").is_none());
+        assert!(params.get("tokensUsed").is_none());
+        assert!(goal_edit_params("test", " ", None).is_err());
+        assert!(goal_edit_params("test", "goal", Some(0)).is_err());
+    }
+
+    #[test]
+    #[ignore = "uses the installed Codex app-server with an isolated temporary CODEX_HOME; sends no prompts"]
+    fn goal_edit_preserves_paused_status_in_provider() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut command = Command::new(executable(Provider::Codex)?);
+        command.env("CODEX_HOME", home.path()).current_dir(home.path());
+        let mut client = CodexMetadataClient::spawn(command)?;
+        let created = client.request("thread/start", json!({"cwd":home.path(),"ephemeral":false,"approvalPolicy":"never"}))?;
+        let id = created["thread"]["id"].as_str().context("test thread ID")?;
+        client.request("thread/goal/set", json!({"threadId":id,"origin":"user","objective":"Original test goal","status":"paused","tokenBudget":1000}))?;
+        let updated = client.request("thread/goal/set", goal_edit_params(id, "Updated test goal", Some(2000))?)?;
+        assert_eq!(updated["goal"]["objective"], "Updated test goal");
+        assert_eq!(updated["goal"]["status"], "paused");
+        assert_eq!(updated["goal"]["tokenBudget"], 2000);
+        assert_eq!(updated["goal"]["tokensUsed"], 0);
+        drop(client);
+        let mut editor_command = Command::new(executable(Provider::Codex)?);
+        editor_command.env("CODEX_HOME", home.path()).current_dir(home.path());
+        let mut editor = CodexMetadataClient::spawn(editor_command)?;
+        let cleared = editor.request("thread/goal/set", goal_edit_params(id, "Updated test goal", None)?)?;
+        assert!(cleared["goal"]["tokenBudget"].is_null());
+        let path = created["thread"]["path"].as_str().context("test transcript path")?;
+        let history = super::super::chat_history_store::transcript(&Chat { provider: Provider::Codex, id: id.into(),
+            title: "test".into(), cwd: home.path().to_string_lossy().into_owned(), path: path.into(),
+            modified: std::time::SystemTime::now(), archived: false, internal: false }, 100)?;
+        assert!(history.messages.iter().any(|message| message.text.contains("Updated test goal")));
+        Ok(())
+    }
+
 }

@@ -14,9 +14,7 @@ use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
 use crate::{branch_picker, picker_prompt, render_remote_button};
-use crate::{
-    git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
-};
+use crate::{git_panel_settings::GitPanelSettings, repository_selector::RepositorySelector};
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
@@ -7685,6 +7683,8 @@ impl GitPanel {
         }
         Some(
             h_flex()
+                .id("git-remote-action")
+                .debug_selector(|| "git-remote-action".into())
                 .gap_1()
                 .flex_shrink_0()
                 .when_some(branch, |this, branch| {
@@ -7824,12 +7824,6 @@ impl GitPanel {
                     Some(git_panel),
                 ))
             })
-            .when(self.pinned_repository.is_some(), |this| {
-                this.children(
-                    self.render_remote_button(cx)
-                        .map(|button| h_flex().justify_end().px_2().child(button)),
-                )
-            })
             .when(title_exceeds_limit, |this| {
                 this.child(
                     h_flex()
@@ -7898,8 +7892,12 @@ impl GitPanel {
                     .child(
                         h_flex()
                             .id("commit-footer")
+                            .debug_selector(|| "commit-footer".into())
                             .w_full()
-                            .p_1p5()
+                            .gap_2()
+                            .px_2()
+                            .pt_1p5()
+                            .pb_2()
                             .border_t_1()
                             .when(editor_is_long, |el| {
                                 el.border_color(cx.theme().colors().border_variant)
@@ -7913,8 +7911,13 @@ impl GitPanel {
                             )
                             .child(
                                 h_flex()
-                                    .gap_0p5()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .justify_end()
+                                    .gap_1p5()
                                     .children(enable_coauthors)
+                                    .children(self.render_remote_button(cx))
                                     .child(self.render_commit_button(cx)),
                             ),
                     ),
@@ -7940,6 +7943,7 @@ impl GitPanel {
 
         h_flex()
             .id("commit-wrapper")
+            .debug_selector(|| "git-commit-action".into())
             .on_hover(cx.listener(move |this, hovered, _, cx| {
                 this.show_placeholders =
                     *hovered && !this.has_staged_changes() && !this.has_unstaged_conflicts();
@@ -9697,10 +9701,6 @@ impl GitPanel {
                     this.child(icon)
                 }
             })
-            .when(
-                !settings.file_icons && status_style != StatusStyle::LabelColor,
-                |el| el.child(git_status_icon(status)),
-            )
             .map(|this| {
                 if tree_view {
                     this.pl(px(depth as f32 * TREE_INDENT)).child(
@@ -9749,10 +9749,9 @@ impl GitPanel {
                     ))
                 })
             })
-            .when(
-                settings.file_icons && status_style != StatusStyle::LabelColor,
-                |el| el.child(git_status_icon(status)),
-            )
+            .when(status_style != StatusStyle::LabelColor, |el| {
+                el.child(git_file_status_badge(status, cx))
+            })
             .child(
                 div()
                     .id(checkbox_wrapper_id)
@@ -10874,11 +10873,6 @@ impl RenderOnce for PanelRepoFooter {
                     })
                     .child(div().child(branch_selector).min_w_0()),
             )
-            .children(if let Some(git_panel) = self.git_panel {
-                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
-            } else {
-                None
-            })
     }
 }
 
@@ -11142,6 +11136,50 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
     max_length > 0 && title.chars().count() > max_length
 }
 
+fn git_file_status_badge(status: FileStatus, cx: &App) -> impl IntoElement {
+    use git::status::StatusCode;
+    let colors = cx.theme().colors();
+    let (label, description, color) = match status {
+        FileStatus::Untracked => ("U", "Untracked", colors.version_control_added),
+        FileStatus::Ignored => ("I", "Ignored", colors.text_muted),
+        FileStatus::Unmerged(_) => ("!", "Conflict", colors.version_control_conflict),
+        FileStatus::Tracked(tracked) => {
+            let status = if tracked.worktree_status != StatusCode::Unmodified {
+                tracked.worktree_status
+            } else {
+                tracked.index_status
+            };
+            match status {
+                StatusCode::Added => ("A", "Added (tracked)", colors.version_control_added),
+                StatusCode::Deleted => ("D", "Deleted (tracked)", colors.version_control_deleted),
+                StatusCode::Renamed => ("R", "Renamed (tracked)", colors.version_control_modified),
+                StatusCode::Copied => ("C", "Copied (tracked)", colors.version_control_added),
+                StatusCode::TypeChanged => (
+                    "T",
+                    "Type changed (tracked)",
+                    colors.version_control_modified,
+                ),
+                StatusCode::Modified => {
+                    ("M", "Modified (tracked)", colors.version_control_modified)
+                }
+                StatusCode::Unmodified => ("", "Unmodified (tracked)", colors.text_muted),
+            }
+        }
+    };
+    h_flex()
+        .id("git-file-status")
+        .flex_none()
+        .w(IconSize::Small.rems())
+        .justify_center()
+        .tooltip(Tooltip::text(description))
+        .child(
+            Label::new(label)
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::SEMIBOLD)
+                .color(Color::Custom(color)),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use editor::SplittableEditor;
@@ -11173,6 +11211,14 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+            // Legacy list fixtures use flat, grouped entries; tree tests opt in explicitly.
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    let git_panel = settings.git_panel.get_or_insert_default();
+                    git_panel.group_by = Some(GitPanelGroupBy::Status);
+                    git_panel.tree_view = Some(false);
+                });
+            });
             theme_settings::init(LoadThemes::JustBase, cx);
             language_model::init(cx);
             editor::init(cx);
@@ -13905,6 +13951,153 @@ mod tests {
                 .unwrap(),
             "working b\n"
         );
+    }
+
+    #[gpui::test]
+    async fn test_commit_footer_actions_fit_narrow_panels(cx: &mut TestAppContext) {
+        struct FooterView {
+            panel: Entity<GitPanel>,
+            width: Pixels,
+            font_size: Pixels,
+        }
+        impl Render for FooterView {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                window.set_rem_size(self.font_size);
+                div()
+                    .w(self.width)
+                    .child(self.panel.update(cx, |panel, cx| {
+                        panel.render_footer(window, cx).unwrap().into_any_element()
+                    }))
+            }
+        }
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({".git": {}, "file.txt": "changed"}),
+        )
+        .await;
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", StatusCode::Modified.worktree())],
+        );
+        fs.set_branch_name(Path::new(path!("/project/.git")), Some("main"));
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let workspace_window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut workspace_cx = VisualTestContext::from_window(workspace_window.into(), cx);
+        let panel = workspace.update_in(&mut workspace_cx, GitPanel::new);
+        await_git_panel_entries(&panel, &mut workspace_cx).await;
+        let repository = panel.read_with(&workspace_cx, |panel, _| {
+            panel.active_repository.clone().unwrap()
+        });
+        let footer_window = workspace_cx.add_window(|_, _| FooterView {
+            panel: panel.clone(),
+            width: px(420.),
+            font_size: px(16.),
+        });
+        let mut cx = VisualTestContext::from_window(footer_window.into(), &mut workspace_cx);
+        for (ahead, behind) in [(0, 0), (12, 0), (12, 34)] {
+            fs.with_git_state(Path::new(path!("/project/.git")), true, |state| {
+                state.branch_upstreams.insert(
+                    "main".into(),
+                    Upstream {
+                        ref_name: "origin/main".into(),
+                        tracking: UpstreamTrackingStatus { ahead, behind }.into(),
+                    },
+                );
+            })
+            .unwrap();
+            cx.condition(&repository, |repository, _| {
+                repository
+                    .branch
+                    .as_ref()
+                    .and_then(|branch| branch.upstream.as_ref())
+                    .is_some_and(|upstream| {
+                        upstream.tracking == UpstreamTrackingStatus { ahead, behind }.into()
+                    })
+            })
+            .await;
+            for pinned in [false, true] {
+                panel.update(&mut cx, |panel, _| {
+                    panel.pinned_repository = pinned.then(|| repository.clone());
+                });
+                for collapsed in [false, true] {
+                    panel.update(&mut cx, |panel, _| {
+                        panel.commit_editor_collapsed = collapsed
+                    });
+                    for font_size in [16., 20.] {
+                        let mut natural_sizes = None;
+                        for width in [420., 320., 280., 240., 200., 180.] {
+                            footer_window
+                                .update(&mut cx, |view, _, cx| {
+                                    view.width = px(width);
+                                    view.font_size = px(font_size);
+                                    cx.notify();
+                                })
+                                .unwrap();
+                            cx.update(|window, cx| window.draw(cx).clear(cx));
+                            let footer = cx
+                                .debug_bounds("commit-footer")
+                                .expect("commit footer rendered");
+                            assert_eq!(
+                                footer.size.width,
+                                px(width),
+                                "footer must not grow beyond panel width"
+                            );
+                            let remote = cx
+                                .debug_bounds("git-remote-action")
+                                .expect("remote button rendered");
+                            let commit = cx
+                                .debug_bounds("git-commit-action")
+                                .expect("commit button rendered");
+                            if let Some((remote_size, commit_size)) = natural_sizes {
+                                assert_eq!(
+                                    remote.size, remote_size,
+                                    "remote button must not shrink at width {width}"
+                                );
+                                assert_eq!(
+                                    commit.size, commit_size,
+                                    "commit button must not shrink at width {width}"
+                                );
+                            } else {
+                                natural_sizes = Some((remote.size, commit.size));
+                            }
+                            for bounds in [remote, commit] {
+                                assert!(
+                                    bounds.size.width > px(20.) && bounds.size.height > px(10.)
+                                );
+                                assert!(
+                                    bounds.left() >= footer.left()
+                                        && bounds.right() <= footer.right(),
+                                    "width={width}, font={font_size}, ahead={ahead}, behind={behind}, collapsed={collapsed}: action {bounds:?} overflows footer {footer:?}"
+                                );
+                                assert!(
+                                    bounds.top() >= footer.top()
+                                        && bounds.bottom() <= footer.bottom() - px(4.),
+                                    "footer must retain bottom padding"
+                                );
+                            }
+                            assert!(
+                                !remote.intersects(&commit),
+                                "action buttons overlap: {remote:?}, {commit:?}"
+                            );
+                            if width >= 420. {
+                                assert_eq!(
+                                    remote.top(),
+                                    commit.top(),
+                                    "wide panels keep actions on one row: width={width}, font={font_size}, ahead={ahead}, behind={behind}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[gpui::test]

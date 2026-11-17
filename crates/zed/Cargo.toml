@@ -128,6 +128,7 @@ gpui_platform = { workspace = true, features = [
     "x11",
 ] }
 gpui_tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
 hang_telemetry.workspace = true
 image.workspace = true
 itertools.workspace = true
@@ -168,6 +169,7 @@ miniprofiler_ui.workspace = true
 node_runtime.workspace = true
 notifications.workspace = true
 onboarding.workspace = true
+open = { workspace = true, features = ["shellexecute-on-windows"] }
 outline.workspace = true
 outline_panel.workspace = true
 parking_lot.workspace = true
@@ -241,6 +243,8 @@ ztracing.workspace = true
 nix = { workspace = true, features = ["user"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+tokio-util = { version = "0.7", features = ["io-util"] }
+windows-registry.workspace = true
 etw_tracing.workspace = true
 windows = { workspace = true, features = ["Win32_System_Console", "Win32_System_Pipes"] }
 gpui = { workspace = true, features = ["profiler", "windows-manifest"] }
@@ -261,6 +265,7 @@ image.workspace = true
 pkg-config = "0.3.22"
 
 [dev-dependencies]
+tempfile.workspace = true
 activity_indicator = { workspace = true, features = ["test-support"] }
 call = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }

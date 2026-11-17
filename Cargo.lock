@@ -12147,6 +12147,7 @@ version = "5.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2483562e62ea94312f3576a7aca397306df7990b8d89033e18766744377ef95"
 dependencies = [
+ "dunce",
  "is-wsl",
  "libc",
  "pathdiff",
@@ -22479,6 +22480,7 @@ dependencies = [
  "node_runtime",
  "notifications",
  "onboarding",
+ "open",
  "outline",
  "outline_panel",
  "parking_lot",
@@ -22532,6 +22534,8 @@ dependencies = [
  "time",
  "time_format",
  "title_bar",
+ "tokio",
+ "tokio-util",
  "toml 0.9.8",
  "toolchain_selector",
  "tracing",
@@ -22548,6 +22552,7 @@ dependencies = [
  "web_search_providers",
  "which_key",
  "windows 0.62.2",
+ "windows-registry 0.6.1",
  "windows_resources",
  "workspace",
  "zed-reqwest",

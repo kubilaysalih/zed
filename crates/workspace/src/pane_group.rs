@@ -30,6 +30,7 @@ const VERTICAL_MIN_SIZE: f32 = 100.;
 pub struct PaneGroup {
     pub root: Member,
     pub is_center: bool,
+    pub(crate) outer_bounds: Arc<Mutex<HashMap<gpui::EntityId, Bounds<Pixels>>>>,
 }
 
 pub struct PaneRenderResult {
@@ -44,6 +45,7 @@ impl PaneGroup {
         Self {
             root,
             is_center: false,
+            outer_bounds: Default::default(),
         }
     }
 
@@ -51,6 +53,7 @@ impl PaneGroup {
         Self {
             root: Member::Pane(pane),
             is_center: false,
+            outer_bounds: Default::default(),
         }
     }
 
@@ -94,6 +97,9 @@ impl PaneGroup {
     }
 
     pub fn bounding_box_for_pane(&self, pane: &Entity<Pane>) -> Option<Bounds<Pixels>> {
+        if let Some(bounds) = self.outer_bounds.lock().get(&pane.entity_id()) {
+            return Some(*bounds);
+        }
         match &self.root {
             Member::Pane(_) => None,
             Member::Axis(axis) => axis.bounding_box_for_pane(pane),
@@ -116,6 +122,14 @@ impl PaneGroup {
     }
 
     pub fn pane_at_pixel_position(&self, coordinate: Point<Pixels>) -> Option<&Entity<Pane>> {
+        let bounds = self.outer_bounds.lock();
+        if !bounds.is_empty() {
+            return self.panes().into_iter().find(|pane| {
+                bounds
+                    .get(&pane.entity_id())
+                    .is_some_and(|bounds| bounds.contains(&coordinate))
+            });
+        }
         match &self.root {
             Member::Pane(pane) => Some(pane),
             Member::Axis(axis) => axis.pane_at_pixel_position(coordinate),
@@ -246,6 +260,7 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
+        self.outer_bounds.lock().clear();
         let content = self
             .root
             .render(0, zoomed, maximized, render_cx, window, cx)

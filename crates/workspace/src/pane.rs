@@ -414,6 +414,7 @@ pub struct Pane {
     last_focus_handle_by_item: HashMap<EntityId, WeakFocusHandle>,
     nav_history: NavHistory,
     toolbar: Entity<Toolbar>,
+    pub(crate) layout_id: Option<uuid::Uuid>,
     pub(crate) workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     pub drag_split_direction: Option<SplitDirection>,
@@ -423,6 +424,7 @@ pub struct Pane {
     can_toggle_zoom: bool,
     should_display_tab_bar: Rc<dyn Fn(&Window, &mut Context<Pane>) -> bool>,
     should_display_welcome_page: bool,
+    display_tab_bar_when_empty: bool,
     render_tab_bar_buttons: Rc<
         dyn Fn(
             &mut Pane,
@@ -532,6 +534,26 @@ pub struct DraggedTab {
 }
 
 #[derive(Clone)]
+pub struct DetachedTab(pub DraggedTab, pub EntityId);
+
+impl Render for DetachedTab {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.0.item.tab_content(
+            TabContentParams {
+                detail: Some(self.0.detail),
+                selected: true,
+                preview: false,
+                deemphasized: false,
+                max_title_len: None,
+                truncate_title_middle: false,
+            },
+            window,
+            cx,
+        )
+    }
+}
+
+#[derive(Clone)]
 pub struct DraggedPanelTab {
     pub panel: EntityId,
     pub index: usize,
@@ -622,6 +644,7 @@ impl Pane {
             toolbar: cx.new(|_| Toolbar::new()),
             tab_bar_scroll_handle: ScrollHandle::new(),
             suppress_scroll: false,
+            layout_id: None,
             drag_split_direction: None,
             workspace,
             project: project.downgrade(),
@@ -630,6 +653,7 @@ impl Pane {
             can_toggle_zoom: true,
             should_display_tab_bar: Rc::new(|_, cx| TabBarSettings::get_global(cx).show),
             should_display_welcome_page: false,
+            display_tab_bar_when_empty: false,
             render_tab_bar_buttons: Rc::new(default_render_tab_bar_buttons),
             render_tab_bar: Rc::new(Self::render_tab_bar),
             show_tab_bar_buttons: TabBarSettings::get_global(cx).show_tab_bar_buttons,
@@ -857,6 +881,10 @@ impl Pane {
         F: 'static + Fn(&Window, &mut Context<Pane>) -> bool,
     {
         self.should_display_tab_bar = Rc::new(should_display_tab_bar);
+    }
+
+    pub fn set_display_tab_bar_when_empty(&mut self, display: bool) {
+        self.display_tab_bar_when_empty = display;
     }
 
     pub fn set_should_display_welcome_page(&mut self, should_display_welcome_page: bool) {
@@ -2630,6 +2658,117 @@ impl Pane {
         }
     }
 
+    pub fn render_detach_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let source = cx.entity();
+        let item = self.active_item();
+        let empty_drag = if item.is_none() {
+            self.workspace.read_with(cx, |workspace, cx| {
+                workspace.panel_drag_source_with_id(&source, self.layout_id, cx)
+            }).log_err().flatten().map(|mut drag| {
+                if self.in_center_group {
+                    drag.pane = Some(source.downgrade());
+                }
+                drag
+            })
+        } else {
+            None
+        };
+        let workspace = self.workspace.clone();
+        div()
+            .id("detach-tab-handle")
+            .debug_selector(move || format!("detach-tab-handle-{}", source.entity_id()))
+            .cursor(gpui::CursorStyle::OpenHand)
+            .tooltip(Tooltip::text(
+                if item.is_some() { "Click to detach tab into a pane; drag to choose an edge" }
+                else { "Drag to move this pane" },
+            ))
+            .when_some(empty_drag, |handle, drag| {
+                handle.on_drag(drag, move |drag, _, _, cx| {
+                    if drag.pane.is_some() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.materialize_panel_panes(cx);
+                            cx.notify();
+                        }).log_err();
+                    }
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                })
+            })
+            .when_some(item, |handle, item| {
+                handle.on_drag(
+                    DetachedTab(
+                        DraggedTab {
+                            pane: cx.entity(),
+                            item,
+                            ix: self.active_item_index,
+                            detail: 0,
+                            is_active: true,
+                        },
+                        self.workspace.entity_id(),
+                    ),
+                    |tab, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| tab.clone())
+                    },
+                )
+            })
+            .on_click(cx.listener(|pane, _, window, cx| {
+                let Some(item) = pane.active_item() else {
+                    return;
+                };
+                let source = cx.entity();
+                let workspace = pane.workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.detach_item_to_group(
+                                &source,
+                                item.item_id(),
+                                &source,
+                                SplitDirection::Right,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })
+                        .log_err();
+                });
+            }))
+            .child(Icon::new(IconName::Menu).size(IconSize::Small))
+            .p_1()
+            .into_any_element()
+    }
+
+    fn handle_detached_tab_drop(
+        &mut self,
+        tab: &DetachedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tab.0.pane != cx.entity()
+            && tab.0.pane.read(cx).workspace.entity_id() != self.workspace.entity_id()
+        {
+            return;
+        }
+        let source = tab.0.pane.clone();
+        let target = cx.entity();
+        let item = tab.0.item.item_id();
+        let direction = self
+            .drag_split_direction
+            .take()
+            .unwrap_or(SplitDirection::Right);
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .detach_item_to_group(&source, item, &target, direction, false, window, cx);
+                })
+                .log_err();
+        });
+        cx.stop_propagation();
+    }
+
     pub fn toolbar(&self) -> &Entity<Toolbar> {
         &self.toolbar
     }
@@ -3045,7 +3184,7 @@ impl Pane {
                 tab.bg(cx.theme().colors().drop_target_background)
             })
             .when_some(self.can_drop_predicate.clone(), |this, p| {
-                this.can_drop(move |a, window, cx| p(a, window, cx))
+                this.can_drop(move |a, window, cx| a.is::<DetachedTab>() || p(a, window, cx))
             })
             .on_drop(
                 cx.listener(move |this, dragged_tab: &DraggedTab, window, cx| {
@@ -3292,6 +3431,12 @@ impl Pane {
                                     pane.close_all_items(&close_all_items_action, window, cx)
                                         .detach_and_log_err(cx)
                                 }),
+                            )
+                            .separator()
+                            .entry(
+                                "Close Pane",
+                                None,
+                                window.handler_for(&pane, Self::request_close_pane),
                             );
 
                         let pin_tab_entries = |menu: ContextMenu| {
@@ -3656,8 +3801,14 @@ impl Pane {
                     let render_tab_buttons = self.render_tab_bar_buttons.clone();
                     let (left_children, right_children) = render_tab_buttons(self, window, cx);
                     tab_bar
-                        .start_children(left_children)
-                        .end_children(right_children)
+                        .start_children(
+                            left_children
+                                .map(|child| Self::pane_header_menu("pane-start-menu", child, cx)),
+                        )
+                        .end_children(
+                            right_children
+                                .map(|child| Self::pane_header_menu("pane-end-menu", child, cx)),
+                        )
                 } else {
                     tab_bar
                 }
@@ -3761,6 +3912,56 @@ impl Pane {
             .child(self.render_tab_bar_drop_target(tab_count, cx))
     }
 
+    fn request_close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = cx.entity();
+        let workspace = self.workspace.clone();
+        let close = if self.items.is_empty() {
+            cx.emit(Event::Remove {
+                focus_on_pane: None,
+            });
+            Task::ready(Ok(()))
+        } else {
+            self.close_all_items(
+                &CloseAllItems {
+                    close_pinned: true,
+                    save_intent: None,
+                },
+                window,
+                cx,
+            )
+        };
+        cx.spawn_in(window, async move |_, cx| {
+            close.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.collapse_closed_center_pane(&pane, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn pane_header_menu(id: &'static str, child: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        let pane = cx.entity();
+        right_click_menu(id)
+            .trigger(move |_, _, _| child)
+            .menu(move |window, cx| {
+                ContextMenu::build(window, cx, |menu, window, _| {
+                    menu.entry("Split Right", None, window.handler_for(&pane, |pane, window, cx| {
+                        pane.split(SplitDirection::Right, SplitMode::EmptyPane, window, cx);
+                    }))
+                    .entry("Split Down", None, window.handler_for(&pane, |pane, window, cx| {
+                        pane.split(SplitDirection::Down, SplitMode::EmptyPane, window, cx);
+                    }))
+                    .separator()
+                    .entry(
+                        "Close Pane",
+                        None,
+                        window.handler_for(&pane, Self::request_close_pane),
+                    )
+                })
+            })
+            .into_any_element()
+    }
+
     fn render_tab_bar_drop_target(
         &self,
         tab_count: usize,
@@ -3768,12 +3969,31 @@ impl Pane {
     ) -> impl IntoElement {
         div()
             .id("tab_bar_drop_target")
+            .when_some(
+                self.workspace
+                    .upgrade()
+                    .and_then(|workspace| workspace.read(cx).panel_drag_source_with_id(&cx.entity(), self.layout_id, cx)),
+                |bar, source| {
+                    bar.cursor(gpui::CursorStyle::OpenHand)
+                        .on_drag(source, |source, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| source.clone())
+                        })
+                },
+            )
             .min_w_6()
             .h(Tab::container_height(cx))
             .flex_grow_1()
             // HACK: This empty child is currently necessary to force the drop target to appear
             // despite us setting a min width above.
-            .child("")
+            .child(Self::pane_header_menu(
+                "pane-empty-bar-menu",
+                div()
+                    .w_full()
+                    .h(Tab::container_height(cx))
+                    .into_any_element(),
+                cx,
+            ))
             .drag_over::<DraggedTab>(|bar, _, _, cx| {
                 bar.bg(cx.theme().colors().drop_target_background)
             })
@@ -3890,7 +4110,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let can_split_predicate = self.can_split_predicate.take();
-        let can_split = match &can_split_predicate {
+        let can_split = event.dragged_item().is::<DetachedTab>() || match &can_split_predicate {
             Some(can_split_predicate) => {
                 can_split_predicate(self, event.dragged_item(), window, cx)
             }
@@ -4419,12 +4639,9 @@ impl Pane {
 
 pub fn default_render_tab_bar_buttons(
     pane: &mut Pane,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
-        return (None, None);
-    }
     let (can_clone, can_split_move) = match pane.active_item() {
         Some(active_item) if active_item.can_split(cx) => (true, false),
         Some(_) => (false, pane.items_len() > 1),
@@ -4436,6 +4653,9 @@ pub fn default_render_tab_bar_buttons(
     let right_children = h_flex()
         // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
         .gap(DynamicSpacing::Base04.rems(cx))
+        .when(pane.in_center_group, |row| {
+            row.child(pane.render_detach_handle(cx))
+        })
         .child(
             PopoverMenu::new("pane-tab-bar-popover-menu")
                 .trigger_with_tooltip(
@@ -4555,7 +4775,26 @@ impl Render for Pane {
 
         v_flex()
             .key_context(key_context)
+            .debug_selector({
+                let id = cx.entity().entity_id();
+                move || format!("pane-{id}")
+            })
             .track_focus(&self.focus_handle(cx))
+            .capture_any_mouse_down(cx.listener(|pane, event: &gpui::MouseDownEvent, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if pane.items.is_empty() {
+                    window.focus(&pane.focus_handle, cx);
+                }
+                let selected = cx.entity();
+                let workspace = pane.workspace.clone();
+                window.defer(cx, move |window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.select_pane_for_opening(selected, window, cx);
+                    }).log_err();
+                });
+            }))
             .size_full()
             .flex_none()
             .bg(cx.theme().colors().editor_background)
@@ -4717,7 +4956,10 @@ impl Render for Pane {
                 }
             }))
             .when(
-                (self.active_item().is_some() || self.in_center_group) && display_tab_bar,
+                (self.active_item().is_some()
+                    || self.in_center_group
+                    || self.display_tab_bar_when_empty)
+                    && display_tab_bar,
                 |pane| pane.child((self.render_tab_bar.clone())(self, window, cx)),
             )
             .child({
@@ -4728,6 +4970,7 @@ impl Render for Pane {
                     .relative()
                     .group("")
                     .overflow_hidden()
+                    .on_drag_move::<DetachedTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedPanelTab>(cx.listener(Self::handle_drag_move))
                     .on_drag_move::<DraggedSelection>(cx.listener(Self::handle_drag_move))
@@ -4780,6 +5023,7 @@ impl Render for Pane {
                             .invisible()
                             .absolute()
                             .bg(cx.theme().colors().drop_target_background)
+                            .group_drag_over::<DetachedTab>("", |style| style.visible())
                             .group_drag_over::<DraggedTab>("", |style| style.visible())
                             .group_drag_over::<DraggedPanelTab>("", |style| style.visible())
                             .group_drag_over::<DraggedSelection>("", |style| style.visible())
@@ -4787,8 +5031,9 @@ impl Render for Pane {
                                 div.group_drag_over::<ExternalPaths>("", |style| style.visible())
                             })
                             .when_some(self.can_drop_predicate.clone(), |this, p| {
-                                this.can_drop(move |a, window, cx| p(a, window, cx))
+                                this.can_drop(move |a, window, cx| a.is::<DetachedTab>() || p(a, window, cx))
                             })
+                            .on_drop(cx.listener(Self::handle_detached_tab_drop))
                             .on_drop(cx.listener(move |this, tab: &DraggedPanelTab, window, cx| {
                                 this.handle_panel_tab_drop(tab, this.items.len(), window, cx);
                             }))
@@ -6267,6 +6512,113 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(source.read_with(cx, |pane, _| pane.index_for_item_id(item_id).is_none()));
+    }
+
+    #[gpui::test]
+    async fn detach_handle_click_and_drag_create_framed_groups(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update_global(|store: &mut settings::SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.pane_layout = Some(settings::PaneLayout::Separated)
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let source = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let keep = add_labeled_item(&source, "keep", false, cx);
+        let moved = add_labeled_item(&source, "move", false, cx);
+        source.update_in(cx, |pane, window, cx| {
+            pane.set_pinned_count(2);
+            pane.activate_item(1, true, true, window, cx);
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let selector: &'static str =
+            Box::leak(format!("detach-tab-handle-{}", source.entity_id()).into_boxed_str());
+        let handle = cx.debug_bounds(selector).unwrap().center();
+        cx.simulate_click(handle, Modifiers::default());
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes.len(), 2);
+            assert!(
+                matches!(&workspace.center.root, Member::Axis(axis) if axis.is_group_separator)
+            );
+            assert_eq!(source.read(cx).items_len(), 1);
+            assert_eq!(workspace.active_pane.read(cx).pinned_count(), 1);
+            assert_eq!(
+                source.read(cx).active_item().unwrap().item_id(),
+                keep.item_id()
+            );
+            assert_eq!(
+                workspace
+                    .active_pane
+                    .read(cx)
+                    .active_item()
+                    .unwrap()
+                    .item_id(),
+                moved.item_id()
+            );
+        });
+        // A second click on a standalone, single-tab pane must not cancel its own split.
+        let single = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let single_selector: &'static str =
+            Box::leak(format!("detach-tab-handle-{}", single.entity_id()).into_boxed_str());
+        let click = cx.debug_bounds(single_selector).unwrap().center();
+        cx.simulate_click(click, Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let regions = workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.panes.len(), 3);
+            assert_eq!(single.read(cx).items_len(), 0);
+            workspace
+                .panes
+                .iter()
+                .map(|pane| workspace.panel_drag_source(pane, cx).unwrap().region)
+                .collect::<Vec<_>>()
+        });
+        for region in regions {
+            let selector: &'static str =
+                Box::leak(format!("panel-region-{region:?}").into_boxed_str());
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("each independent pane is actually rendered");
+            assert!(bounds.size.width > px(50.) && bounds.size.height > px(50.));
+        }
+        source.update_in(cx, |pane, window, cx| {
+            pane.focus_handle(cx).focus(window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let handle = cx.debug_bounds(selector).unwrap().center();
+        let edge = gpui::point(handle.x - px(80.), px(760.));
+        cx.simulate_mouse_down(handle, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            handle + gpui::point(px(0.), px(20.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(edge, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(edge, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panes.len(),
+                4,
+                "dropping onto the source edge must leave a visible split"
+            );
+            assert_eq!(
+                workspace
+                    .panes
+                    .iter()
+                    .map(|pane| pane.read(cx).items_len())
+                    .sum::<usize>(),
+                2
+            );
+            assert!(source.read(cx).items_len() == 0);
+        });
     }
 
     #[gpui::test]

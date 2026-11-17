@@ -206,6 +206,13 @@ fn main() {
         }
         return;
     }
+    if std::env::args().nth(1).as_deref() == Some("--chat-bridge-call") {
+        if let Err(error) = zed::chat_bridge::run_call_helper() {
+            eprintln!("Chat bridge: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     STARTUP_TIME.get_or_init(|| Instant::now());
 
     // If this process was re-executed as a Linux sandbox helper, run that mode

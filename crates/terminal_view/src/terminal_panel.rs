@@ -152,24 +152,15 @@ impl TerminalPanel {
     ) {
         let assistant_enabled = self.assistant_enabled;
         terminal_pane.update(cx, |pane, cx| {
-            pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
+            pane.set_render_tab_bar_buttons(cx, move |pane, _window, cx| {
                 let split_context = pane
                     .active_item()
                     .and_then(|item| item.downcast::<TerminalView>())
                     .map(|terminal_view| terminal_view.read(cx).focus_handle.clone());
-                let has_focused_rename_editor = pane
-                    .active_item()
-                    .and_then(|item| item.downcast::<TerminalView>())
-                    .is_some_and(|view| view.read(cx).rename_editor_is_focused(window, cx));
-                if !pane.has_focus(window, cx)
-                    && !pane.context_menu_focused(window, cx)
-                    && !has_focused_rename_editor
-                {
-                    return (None, None);
-                }
                 let focus_handle = pane.focus_handle(cx);
                 let right_children = h_flex()
-                    .gap(DynamicSpacing::Base02.rems(cx))
+                    .gap(DynamicSpacing::Base04.rems(cx))
+                    .child(pane.render_detach_handle(cx))
                     .child(
                         PopoverMenu::new("terminal-tab-bar-popover-menu")
                             .trigger_with_tooltip(
@@ -1862,6 +1853,10 @@ impl Panel for TerminalPanel {
         Box::new(Toggle)
     }
 
+    fn panes(&self) -> Vec<Entity<Pane>> {
+        self.center.panes().into_iter().cloned().collect()
+    }
+
     fn pane(&self) -> Option<Entity<Pane>> {
         Some(self.active_pane.clone())
     }
@@ -2584,6 +2579,109 @@ mod tests {
             result.is_ok(),
             "local terminal should successfully create in local project"
         );
+    }
+
+    #[gpui::test]
+    async fn detach_real_terminal_keeps_session_and_other_regions(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.pane_layout = Some(settings::PaneLayout::Separated)
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = workspace
+            .update_in(cx, |workspace, window, cx| {
+                let workspace = workspace.weak_handle();
+                window.spawn(cx, async move |cx| {
+                    TerminalPanel::load(workspace, cx.clone()).await
+                })
+            })
+            .await
+            .unwrap();
+        panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(true, None, RevealStrategy::Always, window, cx)
+            })
+            .await
+            .unwrap();
+        let (file_pane, terminal_pane, terminal_id) =
+            workspace.update_in(cx, |workspace, window, cx| {
+                let file = cx.new(workspace::item::test::TestItem::new);
+                let file_pane = workspace.panes().first().unwrap().clone();
+                file_pane.update(cx, |pane, cx| pane.add_item(Box::new(file), true, true, None, window, cx));
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_panel::<TerminalPanel>(window, cx);
+                let terminal_pane = panel.read(cx).active_pane.clone();
+                let terminal_id = terminal_pane.read(cx).active_item().unwrap().item_id();
+                (file_pane, terminal_pane, terminal_id)
+            });
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        terminal_pane.read_with(cx, |pane, _| assert_eq!(pane.items_len(), 1, "fixture starts with exactly one terminal"));
+        let before = cx.debug_bounds("panel-region-Editor").unwrap();
+        let handle: &'static str =
+            Box::leak(format!("detach-tab-handle-{}", terminal_pane.entity_id()).into_boxed_str());
+        let click = cx.debug_bounds(handle).unwrap().center();
+        cx.simulate_click(click, Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (file_region, moved_region, moved_pane) = workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .dock_at_position(DockPosition::Bottom)
+                    .read(cx)
+                    .is_open()
+            );
+            assert_eq!(terminal_pane.read(cx).items_len(), 0, "after click: center panes {}, active {:?}, source items {:?}", workspace.panes().len(), workspace.active_pane().read(cx).active_item().map(|item| item.item_id()), terminal_pane.read(cx).items().map(|item| item.item_id()).collect::<Vec<_>>());
+            let moved_pane = workspace.active_pane().clone();
+            assert_eq!(
+                moved_pane.read(cx).active_item().unwrap().item_id(),
+                terminal_id
+            );
+            assert_eq!(workspace.panes().len(), 2);
+            (
+                workspace.panel_drag_source(&file_pane, cx).unwrap().region,
+                workspace.panel_drag_source(&moved_pane, cx).unwrap().region,
+                moved_pane,
+            )
+        });
+        let file_selector: &'static str =
+            Box::leak(format!("panel-region-{file_region:?}").into_boxed_str());
+        let moved_selector: &'static str =
+            Box::leak(format!("panel-region-{moved_region:?}").into_boxed_str());
+        let after = cx.debug_bounds(file_selector).unwrap();
+        assert!((before.origin.x - after.origin.x).abs() < px(1.));
+        assert!((before.origin.y - after.origin.y).abs() < px(1.));
+        assert!((before.size.height - after.size.height).abs() < px(1.));
+        assert!((before.size.width - after.size.width).abs() < px(1.));
+        assert!(cx.debug_bounds(moved_selector).unwrap().size.width > px(100.));
+        let moved_handle: &'static str =
+            Box::leak(format!("detach-tab-handle-{}", moved_pane.entity_id()).into_boxed_str());
+        let click = cx.debug_bounds(moved_handle).unwrap().center();
+        cx.simulate_click(click, Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.panes().len(),
+                3,
+                "a single-tab terminal must visibly split again"
+            );
+            assert_eq!(
+                workspace
+                    .active_pane()
+                    .read(cx)
+                    .active_item()
+                    .unwrap()
+                    .item_id(),
+                terminal_id
+            );
+        });
     }
 
     struct FocusOnlyModal {

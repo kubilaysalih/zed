@@ -15,6 +15,8 @@ pub(crate) mod move_to_applications;
 mod open_listener;
 mod open_url_modal;
 mod quick_action_bar;
+#[cfg(windows)]
+mod remote_codex;
 pub mod remote_debug;
 pub mod telemetry_log;
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
@@ -198,6 +200,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    chat_history::init(cx);
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
@@ -3276,7 +3279,7 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     assert_eq!(workspace.worktrees(cx).count(), 2);
-                    assert!(workspace.right_dock().read(cx).is_open());
+                    assert!(!workspace.right_dock().read(cx).is_open());
                     assert!(
                         workspace
                             .active_pane()
@@ -3306,7 +3309,7 @@ mod tests {
         multi_workspace_1
             .update(cx, |multi_workspace, _window, cx| {
                 assert_eq!(multi_workspace.workspaces().count(), 2);
-                assert!(multi_workspace.sidebar_open());
+                assert!(!multi_workspace.sidebar_open(), "opening a project preserves the closed sidebar");
                 let workspace = multi_workspace.workspace().read(cx);
                 assert_eq!(
                     workspace
@@ -5187,8 +5190,6 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*window, cx);
 
-        let mouse_position = point(px(250.), px(250.));
-
         let event_modifiers = {
             #[cfg(target_os = "macos")]
             {
@@ -5207,7 +5208,7 @@ mod tests {
             }
         };
 
-        workspace
+        let editor = workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_abs_path(
                     PathBuf::from(path!("/root/file.txt")),
@@ -5223,6 +5224,10 @@ mod tests {
 
         cx.update(|window, cx| {
             window.draw(cx).clear(cx);
+        });
+
+        let mouse_position = editor.read_with(cx, |editor, _| {
+            editor.last_bounds().expect("editor rendered").center()
         });
 
         // mouse_wheel_zoom is disabled by default — zoom should not work.
@@ -6260,6 +6265,7 @@ mod tests {
                 "buffer_search",
                 "call_hierarchy",
                 "channel_modal",
+                "chat_history",
                 "cli",
                 "client",
                 "collab",

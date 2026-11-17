@@ -86,6 +86,9 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn pane(&self) -> Option<Entity<Pane>> {
         None
     }
+    fn panes(&self) -> Vec<Entity<Pane>> {
+        self.pane().into_iter().collect()
+    }
     fn remote_id() -> Option<proto::PanelId> {
         None
     }
@@ -116,6 +119,7 @@ pub trait PanelHandle: Send + Sync {
     fn set_active(&self, active: bool, window: &mut Window, cx: &mut App);
     fn remote_id(&self) -> Option<proto::PanelId>;
     fn pane(&self, cx: &App) -> Option<Entity<Pane>>;
+    fn panes(&self, cx: &App) -> Vec<Entity<Pane>>;
     fn default_size(&self, window: &Window, cx: &App) -> Pixels;
     fn min_size(&self, window: &Window, cx: &App) -> Option<Pixels>;
     fn initial_size_state(&self, window: &Window, cx: &App) -> PanelSizeState;
@@ -191,6 +195,10 @@ where
 
     fn set_active(&self, active: bool, window: &mut Window, cx: &mut App) {
         self.update(cx, |this, cx| this.set_active(active, window, cx))
+    }
+
+    fn panes(&self, cx: &App) -> Vec<Entity<Pane>> {
+        self.read(cx).panes()
     }
 
     fn pane(&self, cx: &App) -> Option<Entity<Pane>> {
@@ -1139,8 +1147,7 @@ impl Dock {
         cx: &mut Context<Self>,
     ) {
         if size.is_some_and(|size| size <= RESIZE_HANDLE_SIZE) {
-            self.set_open(false, window, cx);
-            self.collapsed_by_drag = true;
+            self.collapse_by_drag(window, cx);
             return;
         }
         if self.collapsed_by_drag {
@@ -1290,6 +1297,11 @@ impl Dock {
 }
 
 impl Dock {
+    pub(crate) fn collapse_by_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_open(false, window, cx);
+        self.collapsed_by_drag = true;
+    }
+
     pub(crate) fn collapsed_by_drag(&self) -> bool {
         self.collapsed_by_drag
     }
@@ -1417,6 +1429,10 @@ impl Render for Dock {
                 )
                 .when(
                     self.resizable(cx)
+                        && !self
+                            .workspace
+                            .upgrade()
+                            .is_some_and(|workspace| workspace.read(cx).has_custom_panel_layout())
                         && WorkspaceSettings::get_global(cx).pane_layout
                             == settings::PaneLayout::Flat,
                     |this| this.child(self.resize_handle(false, cx)),
